@@ -1,0 +1,29 @@
+# .github/workflows/trufflehog.yml
+name: TruffleHog Secret Scan
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: "0 15 * * *" # Daily at 11 PM SGT (15:00 UTC)
+
+jobs:
+  trufflehog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@8ade135a41bc03ea1535316c604d676b6cb55ada # v4.1.6
+        with:
+          fetch-depth: 0
+
+      - name: TruffleHog OSS
+        uses: trufflesecurity/trufflehog@116e717 # v3.92.5
+        with:
+          path: ./
+          extra_args: --only-verified
+
+      - name: Check for secrets
+        if: failure()
+        run: echo "TruffleHog detected secrets or encountered a configuration error." && exit 1
