@@ -1,8 +1,4 @@
-Here is the revised Product Requirements Document. The architecture has been pivoted away from containerization toward a native, locally executed Windows environment utilizing an Object-Oriented Programming (OOP) design pattern, which will ensure the codebase remains modular and easily maintainable.
-
-
-
- Product Requirements Document (PRD): music-download-code (Standalone Version)
+Product Requirements Document (PRD): music-download-code (Standalone Version)
 
 Project Name: music-download-code
 Objective: To build a fully automated, locally executed pipeline that synchronizes a target Spotify playlist with a local offline storage directory, extracting native audio streams (M4A/Opus) via YouTube Music. 
@@ -64,7 +60,3 @@ To maintain a clean architecture, the codebase will be divided into specific cla
  Matching Algorithm Reference: The track-resolution logic in the `YTMResolver` module should heavily reference the open-source project `spotify_to_ytmusic` by linsomniac.
  Repository URL: [https://github.com/linsomniac/spotify_to_ytmusic](https://github.com/linsomniac/spotify_to_ytmusic)
  Specific Focus: Review their implementation of `ytmusicapi` search parameters (specifically the `s2yt_search` fallback logic) to build the Resolution phase of this pipeline.
-
-
-
-Would you like me to generate the `run.bat` script that handles the automatic virtual environment creation and FFmpeg checks?
