@@ -1,0 +1,13 @@
+spotipy>=2.23.0
+ytmusicapi>=1.3.0
+yt-dlp[default]@git+https://github.com/yt-dlp/yt-dlp.git@master
+SQLAlchemy>=2.0.0
+mutagen>=1.47.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+urllib3>=2.0.0
+python-dateutil>=2.8.0
+rich>=13.0.0
+ruff>=0.9.0
+mypy>=1.11.0
+pylint>=3.3.0

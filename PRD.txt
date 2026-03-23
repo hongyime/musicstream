@@ -1,0 +1,70 @@
+Here is the revised Product Requirements Document. The architecture has been pivoted away from containerization toward a native, locally executed Windows environment utilizing an Object-Oriented Programming (OOP) design pattern, which will ensure the codebase remains modular and easily maintainable.
+
+
+
+ Product Requirements Document (PRD): music-download-code (Standalone Version)
+
+Project Name: music-download-code
+Objective: To build a fully automated, locally executed pipeline that synchronizes a target Spotify playlist with a local offline storage directory, extracting native audio streams (M4A/Opus) via YouTube Music. 
+
+
+
+ 1. System Architecture & Workflow
+
+StreamCollector will operate as a standalone desktop application initialized via a Windows Batch (`.bat`) script. The script will handle the virtual environment setup, dependency installation, and execution of the Python orchestrator. State management will rely on a local SQLite database to ensure idempotency.
+
+The operational flow consists of three primary phases executed sequentially by the orchestrator:
+
+ Phase 1: Ingestion (Spotify API): The script authenticates via OAuth, fetches the target Spotify playlist, and compares the track URIs against the local SQLite database to identify net-new additions.
+ Phase 2: Resolution (YouTube Music API): New tracks are queried against YouTube Music. An algorithm parses the top results, matching artist and track name to extract the exact YouTube `videoId`.
+ Phase 3: Extraction (yt-dlp Engine): The `videoId` is passed to the embedded `yt-dlp` Python module. It extracts the raw audio stream, embeds ID3 metadata utilizing a local FFmpeg binary, and writes the file to the user's designated Windows directory. The SQLite database is then updated.
+
+ 2. Technical Specifications
+
+ Core Language: Python 3.11+
+ Primary Libraries: `spotipy` (Spotify OAuth & data fetching), `ytmusicapi` (YouTube Music search resolution), `yt-dlp` (Stream extraction), `SQLAlchemy` (Database ORM), `mutagen` (Alternative to FFmpeg for ID3 metadata tagging, if desired).
+ State Management: SQLite3 (Local `.db` file managed via SQLAlchemy ORM).
+ Execution & Deployment: A `run.bat` script that bootstraps a Python virtual environment (`venv`), installs requirements from `requirements.txt`, and executes `main.py`.
+ External Dependencies: FFmpeg must be present in the system's PATH or bundled in the project directory for audio processing and metadata embedding.
+
+ 3. Core Modules (OOP Design)
+
+To maintain a clean architecture, the codebase will be divided into specific classes:
+
+ `DatabaseManager` (`models.py`): Handles the SQLAlchemy engine, session creation, and defines the `Track` entity (attributes: `id`, `spotify_uri`, `track_name`, `artist_name`, `yt_video_id`, `status`).
+ `SpotifyIngestor` (`spotify_client.py`): Encapsulates the `spotipy` client, handling token caching and pagination of playlist results.
+ `YTMResolver` (`ytm_client.py`): Encapsulates the `ytmusicapi` logic, executing the strict and fuzzy matching algorithms to return a valid video ID.
+ `AudioExtractor` (`downloader.py`): Wraps the `yt-dlp` configuration dictionary and execution logic, handling the file output and FFmpeg post-processing.
+ `Orchestrator` (`main.py`): The entry point that instantiates the above classes and manages the high-level control flow.
+
+ 4. Forward-Looking Error Matrix & Mitigation Strategies
+
+ 4.1 Missing System Dependencies (FFmpeg)
+ Anticipated Error / Symptom: `yt-dlp` fails to convert or tag the file, throwing a `FileNotFoundError` for FFmpeg.
+ Mitigation & Resolution Strategy: The `run.bat` script or the Python initialization phase should perform a pre-flight check for `ffmpeg.exe`. If missing, the script should automatically download the static Windows binary or alert the user with a direct download link before proceeding.
+
+ 4.2 Spotify API Rate Limits
+ Anticipated Error / Symptom: HTTP 429: Too Many Requests.
+ Mitigation & Resolution Strategy: Implement an exponential backoff algorithm in the `SpotifyIngestor` class. Parse the `Retry-After` header and use `time.sleep()` for the required duration.
+
+ 4.3 YouTube Extraction Blocks
+ Anticipated Error / Symptom: HTTP 403: Forbidden or bot-detection blocks from YouTube.
+ Mitigation & Resolution Strategy: Use the `yt-dlp` nightly build in `requirements.txt` (`yt-dlp[default]@git+https://github.com/yt-dlp/yt-dlp.git@master`). Add functionality to pass an exported `cookies.txt` file from the user's browser into the `AudioExtractor` configuration.
+
+ 4.4 Resolution Mismatches
+ Anticipated Error / Symptom: Downloading live performances or acoustic covers instead of the studio track.
+ Mitigation & Resolution Strategy: The `YTMResolver` must compare the duration of the Spotify track against the YouTube video. If the delta exceeds +/- 3 seconds, flag the track status as `failed_validation` in the database and skip to the next item.
+
+ 4.5 Network Interruptions
+ Anticipated Error / Symptom: The user closes the terminal window mid-download, or the Wi-Fi drops, resulting in corrupted `.part` files.
+ Mitigation & Resolution Strategy: Rely on `yt-dlp`'s native ability to resume downloads. Ensure the `DatabaseManager` only flags a track as `downloaded` after the final post-processing step successfully completes.
+
+ 5. References & Inspiration
+
+ Matching Algorithm Reference: The track-resolution logic in the `YTMResolver` module should heavily reference the open-source project `spotify_to_ytmusic` by linsomniac.
+ Repository URL: [https://github.com/linsomniac/spotify_to_ytmusic](https://github.com/linsomniac/spotify_to_ytmusic)
+ Specific Focus: Review their implementation of `ytmusicapi` search parameters (specifically the `s2yt_search` fallback logic) to build the Resolution phase of this pipeline.
+
+
+
+Would you like me to generate the `run.bat` script that handles the automatic virtual environment creation and FFmpeg checks?
