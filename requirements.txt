@@ -1,4 +1,4 @@
-spotipy>=2.23.0
+spotipy>=2.26.0
 ytmusicapi>=1.11.5
 yt-dlp[default]@git+https://github.com/yt-dlp/yt-dlp.git@master
 SQLAlchemy>=2.0.49
