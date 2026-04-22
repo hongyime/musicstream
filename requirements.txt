@@ -4,7 +4,7 @@ yt-dlp[default]@git+https://github.com/yt-dlp/yt-dlp.git@master
 SQLAlchemy>=2.0.49
 mutagen>=1.47.0
 python-dotenv>=1.2.2
-requests>=2.31.0
+requests>=2.33.1
 urllib3>=2.0.0
 python-dateutil>=2.9.0.post0
 rich>=13.0.0
