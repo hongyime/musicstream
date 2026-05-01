@@ -8,7 +8,7 @@ python-dotenv==1.2.2
 # Download pipeline
 yt-dlp[default]@git+https://github.com/yt-dlp/yt-dlp.git@master
 ytmusicapi==1.12.0
-spotdl==4.2.10
+spotdl==4.4.4
 
 # Metadata & tagging
 mutagen==1.47.0
