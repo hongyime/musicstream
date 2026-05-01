@@ -1,31 +1,33 @@
+"""
+musicstream/models.py — SQLAlchemy 2.0 ORM models (PostgreSQL)
+
+All models use Mapped/mapped_column syntax with PostgreSQL as the backend.
+The DatabaseManager class from the prototype has been removed; session
+management lives in db.py.
+"""
+
 from __future__ import annotations
 
 import enum
-import logging
-from datetime import datetime
-from typing import List, Optional, Sequence
+from datetime import datetime, timezone
+from typing import List, Optional
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
-    Enum,
+    Float,
     ForeignKey,
     Integer,
     String,
     Table,
-    create_engine,
-    select,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
-    Session,
     mapped_column,
     relationship,
-    sessionmaker,
 )
-
-logger = logging.getLogger(__name__)
 
 
 # ── ORM Base ──────────────────────────────────────────────────────────────────
@@ -34,20 +36,24 @@ class Base(DeclarativeBase):
     pass
 
 
-# ── Enums ─────────────────────────────────────────────────────────────────────
+# ── String Enums (str + enum.Enum — NOT SQLAlchemy Enum type) ─────────────────
 
-class TrackStatus(enum.Enum):
-    PENDING = "pending"
-    RESOLVED = "resolved"
-    DOWNLOADING = "downloading"
-    DOWNLOADED = "downloaded"
-    FAILED = "failed"
+class TrackStatus(str, enum.Enum):
+    """Valid values for Track.status.  Stored as plain VARCHAR in PostgreSQL."""
+    PENDING           = "pending"
+    RESOLVING         = "resolving"
+    DOWNLOADING       = "downloading"
+    DOWNLOADED        = "downloaded"
+    FAILED            = "failed"
     FAILED_VALIDATION = "failed_validation"
+    MISSING           = "missing"
 
 
-class SourceType(enum.Enum):
-    PLAYLIST = "playlist"
-    LIKED = "liked"
+class SourceType(str, enum.Enum):
+    """Valid values for Source.source_type.  Stored as plain VARCHAR in PostgreSQL."""
+    PLAYLIST     = "playlist"
+    LIKED        = "liked"
+    LISTENBRAINZ = "listenbrainz"
 
 
 # ── Association table (Track <-> Source many-to-many) ─────────────────────────
@@ -55,288 +61,193 @@ class SourceType(enum.Enum):
 track_sources = Table(
     "track_sources",
     Base.metadata,
-    Column("track_id", Integer, ForeignKey("tracks.id"), primary_key=True),
+    Column("track_id",  Integer, ForeignKey("tracks.id"),  primary_key=True),
     Column("source_id", Integer, ForeignKey("sources.id"), primary_key=True),
 )
 
 
-# ── Source Model (playlist or liked-songs collection) ─────────────────────────
-
-class Source(Base):
-    __tablename__ = "sources"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    spotify_id: Mapped[str] = mapped_column(String, unique=True, nullable=False)
-    name: Mapped[str] = mapped_column(String, nullable=False)
-    source_type: Mapped[SourceType] = mapped_column(
-        Enum(SourceType), nullable=False
-    )
-    last_scraped_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, default=None
-    )
-
-    tracks: Mapped[List[Track]] = relationship(
-        secondary=track_sources, back_populates="sources"
-    )
-
-    def __repr__(self) -> str:
-        return f"<Source(id={self.id}, name={self.name!r}, type={self.source_type.value})>"
-
-
 # ── Track Model ───────────────────────────────────────────────────────────────
 
+def _utcnow() -> datetime:
+    """Return the current UTC time as a timezone-aware datetime."""
+    return datetime.now(timezone.utc)
+
+
 class Track(Base):
+    """Represents a single music track ingested from Spotify or ListenBrainz."""
+
     __tablename__ = "tracks"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    spotify_uri: Mapped[str] = mapped_column(String, unique=True, nullable=False)
-    track_name: Mapped[str] = mapped_column(String, nullable=False)
-    artist_name: Mapped[str] = mapped_column(String, nullable=False)
-    album_name: Mapped[Optional[str]] = mapped_column(String, default=None)
-    track_number: Mapped[Optional[int]] = mapped_column(default=None)
-    duration_ms: Mapped[Optional[int]] = mapped_column(default=None)
-    yt_video_id: Mapped[Optional[str]] = mapped_column(String, default=None)
-    status: Mapped[TrackStatus] = mapped_column(
-        Enum(TrackStatus), default=TrackStatus.PENDING
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
-    )
+    # Primary key
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
-    sources: Mapped[List[Source]] = relationship(
-        secondary=track_sources, back_populates="tracks"
-    )
+    # Spotify identifiers
+    spotify_uri:      Mapped[str]           = mapped_column(String, unique=True, nullable=False)
+    spotify_id:       Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    spotify_album_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    # Music identifiers
+    isrc: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    # Core metadata
+    title:        Mapped[str]           = mapped_column(String, nullable=False)
+    artist:       Mapped[str]           = mapped_column(String, nullable=False)
+    album_artist: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    album:        Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    year:         Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    # Track position
+    track_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    disc_number:  Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    duration_ms:  Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Cover art
+    cover_art_url:    Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    cover_art_source: Mapped[str]           = mapped_column(String, nullable=False, default="none")
+
+    # MusicBrainz / AcoustID
+    mb_recording_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    mb_release_id:   Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    acoustid_id:     Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    # Pipeline state — stored as plain String (see TrackStatus enum)
+    status:          Mapped[str]           = mapped_column(String, nullable=False, default=TrackStatus.PENDING.value)
+    download_method: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    # File info
+    format:          Mapped[Optional[str]] = mapped_column(String, nullable=True)   # 'flac' | 'mp3'
+    file_path:       Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    file_size_bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    file_sha256:     Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    # Plex
+    plex_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Timestamps (timezone-aware)
+    created_at:      Mapped[datetime]           = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    updated_at:      Mapped[datetime]           = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow)
+    last_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Relationships
+    sources:           Mapped[List["Source"]]          = relationship(secondary=track_sources, back_populates="tracks")
+    download_attempts: Mapped[List["DownloadAttempt"]] = relationship(back_populates="track", cascade="all, delete-orphan")
+    lb_recommendations: Mapped[List["LbRecommendation"]] = relationship(back_populates="track")
 
     def __repr__(self) -> str:
         return (
-            f"<Track(id={self.id}, name={self.track_name!r}, "
-            f"artist={self.artist_name!r}, status={self.status.value})>"
+            f"<Track(id={self.id}, spotify_uri={self.spotify_uri!r}, "
+            f"title={self.title!r}, artist={self.artist!r}, status={self.status!r})>"
         )
 
 
-# ── Database Manager ──────────────────────────────────────────────────────────
+# ── Source Model ──────────────────────────────────────────────────────────────
 
-class DatabaseManager:
-    def __init__(self, db_path: str = "music-download-code.db") -> None:
-        self.db_path = db_path
-        self.engine = create_engine(f"sqlite:///{db_path}", echo=False)
-        self.SessionFactory = sessionmaker(bind=self.engine)
-        self._create_tables()
+class Source(Base):
+    """Represents a Spotify playlist, liked-songs collection, or ListenBrainz source."""
 
-    def _create_tables(self) -> None:
-        Base.metadata.create_all(self.engine)
+    __tablename__ = "sources"
 
-    def get_session(self) -> Session:
-        return self.SessionFactory()
+    id:         Mapped[int] = mapped_column(Integer, primary_key=True)
+    spotify_id: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    name:       Mapped[str] = mapped_column(String, nullable=False)
 
-    # ── Source operations ─────────────────────────────────────────────────
+    # Stored as plain String (see SourceType enum)
+    source_type: Mapped[str] = mapped_column(String, nullable=False)
 
-    def upsert_source(
-        self, spotify_id: str, name: str, source_type: SourceType
-    ) -> Source:
-        with self.get_session() as session:
-            session.expire_on_commit = False
-            source = session.execute(
-                select(Source).where(Source.spotify_id == spotify_id)
-            ).scalar_one_or_none()
-            if source:
-                source.name = name
-                session.commit()
-                return source
-            source = Source(
-                spotify_id=spotify_id, name=name, source_type=source_type
-            )
-            session.add(source)
-            session.commit()
-            return source
+    snapshot_id:     Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    track_count:     Mapped[int]           = mapped_column(Integer, nullable=False, default=0)
+    last_scraped_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    def mark_source_scraped(self, spotify_id: str) -> None:
-        with self.get_session() as session:
-            source = session.execute(
-                select(Source).where(Source.spotify_id == spotify_id)
-            ).scalar_one_or_none()
-            if source:
-                source.last_scraped_at = datetime.utcnow()
-                session.commit()
+    # Relationships
+    tracks: Mapped[List["Track"]] = relationship(secondary=track_sources, back_populates="sources")
 
-    def get_all_sources(self) -> Sequence[Source]:
-        with self.get_session() as session:
-            session.expire_on_commit = False
-            return session.execute(select(Source)).scalars().all()
+    def __repr__(self) -> str:
+        return (
+            f"<Source(id={self.id}, spotify_id={self.spotify_id!r}, "
+            f"name={self.name!r}, source_type={self.source_type!r})>"
+        )
 
-    # ── Track reads ───────────────────────────────────────────────────────
 
-    def get_track_by_spotify_uri(self, spotify_uri: str) -> Optional[Track]:
-        with self.get_session() as session:
-            session.expire_on_commit = False
-            return session.execute(
-                select(Track).where(Track.spotify_uri == spotify_uri)
-            ).scalar_one_or_none()
+# ── LbRecommendation Model ────────────────────────────────────────────────────
 
-    def get_pending_tracks(self) -> Sequence[Track]:
-        with self.get_session() as session:
-            session.expire_on_commit = False
-            return session.execute(
-                select(Track).where(Track.status == TrackStatus.PENDING)
-            ).scalars().all()
+class LbRecommendation(Base):
+    """A music recommendation fetched from the ListenBrainz Collaborative Filtering API."""
 
-    def get_tracks_by_status(self, status: TrackStatus) -> Sequence[Track]:
-        with self.get_session() as session:
-            session.expire_on_commit = False
-            return session.execute(
-                select(Track).where(Track.status == status)
-            ).scalars().all()
+    __tablename__ = "lb_recommendations"
 
-    # ── Track writes ──────────────────────────────────────────────────────
+    id:             Mapped[int] = mapped_column(Integer, primary_key=True)
+    recording_mbid: Mapped[str] = mapped_column(String, unique=True, nullable=False)
 
-    def add_track(
-        self,
-        spotify_uri: str,
-        track_name: str,
-        artist_name: str,
-        album_name: Optional[str] = None,
-        track_number: Optional[int] = None,
-        duration_ms: Optional[int] = None,
-        source_spotify_id: Optional[str] = None,
-    ) -> Track:
-        with self.get_session() as session:
-            session.expire_on_commit = False
-            existing = session.execute(
-                select(Track).where(Track.spotify_uri == spotify_uri)
-            ).scalar_one_or_none()
+    title:  Mapped[Optional[str]]   = mapped_column(String, nullable=True)
+    artist: Mapped[Optional[str]]   = mapped_column(String, nullable=True)
+    score:  Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
-            if existing:
-                if source_spotify_id:
-                    self._link_track_source(session, existing.id, source_spotify_id)
-                return existing
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
-            track = Track(
-                spotify_uri=spotify_uri,
-                track_name=track_name,
-                artist_name=artist_name,
-                album_name=album_name,
-                track_number=track_number,
-                duration_ms=duration_ms,
-            )
-            session.add(track)
-            session.flush()
+    # Optional FK to a Track that was created from this recommendation
+    track_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("tracks.id"), nullable=True)
+    track:    Mapped[Optional["Track"]] = relationship(back_populates="lb_recommendations")
 
-            if source_spotify_id:
-                self._link_track_source(session, track.id, source_spotify_id)
+    # Stored as plain String; expected values: pending | ingested | failed | skipped
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
 
-            session.commit()
-            return track
+    def __repr__(self) -> str:
+        return (
+            f"<LbRecommendation(id={self.id}, recording_mbid={self.recording_mbid!r}, "
+            f"title={self.title!r}, status={self.status!r})>"
+        )
 
-    def _link_track_source(
-        self, session: Session, track_id: int, source_spotify_id: str
-    ) -> None:
-        source = session.execute(
-            select(Source).where(Source.spotify_id == source_spotify_id)
-        ).scalar_one_or_none()
-        if not source:
-            return
-        exists = session.execute(
-            select(track_sources).where(
-                track_sources.c.track_id == track_id,
-                track_sources.c.source_id == source.id,
-            )
-        ).first()
-        if not exists:
-            session.execute(
-                track_sources.insert().values(
-                    track_id=track_id, source_id=source.id
-                )
-            )
 
-    def update_track_video_id(
-        self, spotify_uri: str, yt_video_id: str
-    ) -> Optional[Track]:
-        with self.get_session() as session:
-            session.expire_on_commit = False
-            track = session.execute(
-                select(Track).where(Track.spotify_uri == spotify_uri)
-            ).scalar_one_or_none()
-            if track:
-                track.yt_video_id = yt_video_id
-                track.status = TrackStatus.RESOLVED
-                session.commit()
-                return track
-            return None
+# ── DownloadAttempt Model ─────────────────────────────────────────────────────
 
-    def update_track_status(
-        self, spotify_uri: str, status: TrackStatus
-    ) -> Optional[Track]:
-        with self.get_session() as session:
-            session.expire_on_commit = False
-            track = session.execute(
-                select(Track).where(Track.spotify_uri == spotify_uri)
-            ).scalar_one_or_none()
-            if track:
-                track.status = status
-                session.commit()
-                return track
-            return None
+class DownloadAttempt(Base):
+    """Audit record for every individual tier attempt made for a track download."""
 
-    def reset_tracks_for_fresh_scrape(self) -> int:
-        """Reset all non-DOWNLOADED tracks for a fresh scrape.
-        Sets PENDING/RESOLVED/FAILED/FAILED_VALIDATION/DOWNLOADING tracks back to PENDING.
-        Clears yt_video_id on reset tracks.
-        Returns count of tracks reset.
-        """
-        with self.get_session() as session:
-            session.expire_on_commit = False
-            tracks = session.execute(
-                select(Track).where(Track.status != TrackStatus.DOWNLOADED)
-            ).scalars().all()
-            count = len(tracks)
-            for track in tracks:
-                track.status = TrackStatus.PENDING
-                track.yt_video_id = None
-            session.commit()
-            return count
+    __tablename__ = "download_attempts"
 
-    def reset_interrupted_downloads(self) -> int:
-        """Reset DOWNLOADING tracks back to RESOLVED so they can be re-downloaded.
-        Returns count of tracks reset.
-        """
-        with self.get_session() as session:
-            session.expire_on_commit = False
-            tracks = session.execute(
-                select(Track).where(Track.status == TrackStatus.DOWNLOADING)
-            ).scalars().all()
-            count = len(tracks)
-            for track in tracks:
-                track.status = TrackStatus.RESOLVED
-            session.commit()
-            return count
+    id:           Mapped[int]      = mapped_column(Integer, primary_key=True)
+    track_id:     Mapped[int]      = mapped_column(Integer, ForeignKey("tracks.id", ondelete="CASCADE"), nullable=False)
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
-    def get_interrupted_download_count(self) -> int:
-        """Return count of tracks stuck in DOWNLOADING status (from interrupted runs)."""
-        with self.get_session() as session:
-            return session.execute(
-                select(Track).where(Track.status == TrackStatus.DOWNLOADING)
-            ).scalars().all().__len__()
+    method:  Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    error:   Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    success: Mapped[bool]          = mapped_column(Boolean, nullable=False, default=False)
 
-    def get_track_counts(self) -> dict[str, int]:
-        """Return a dict of {status_value: count} for all statuses plus 'total'.
-        Example: {'pending': 5, 'resolved': 10, 'downloaded': 100, 'failed': 2, ...., 'total': 117}
-        """
-        with self.get_session() as session:
-            counts: dict[str, int] = {}
-            total = 0
-            for status in TrackStatus:
-                count = len(
-                    session.execute(
-                        select(Track).where(Track.status == status)
-                    ).scalars().all()
-                )
-                counts[status.value] = count
-                total += count
-            counts["total"] = total
-            return counts
+    # Relationship
+    track: Mapped["Track"] = relationship(back_populates="download_attempts")
 
-    def close(self) -> None:
-        self.engine.dispose()
+    def __repr__(self) -> str:
+        return (
+            f"<DownloadAttempt(id={self.id}, track_id={self.track_id}, "
+            f"method={self.method!r}, success={self.success})>"
+        )
+
+
+# ── DaemonRun Model ───────────────────────────────────────────────────────────
+
+class DaemonRun(Base):
+    """History record for each daemon pipeline execution."""
+
+    __tablename__ = "daemon_runs"
+
+    id:           Mapped[int]      = mapped_column(Integer, primary_key=True)
+    started_at:   Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Stored as plain String; expected values: scheduled | manual | integrity | discovery
+    run_type: Mapped[str] = mapped_column(String, nullable=False)
+
+    # Counters
+    tracks_scraped:     Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tracks_downloaded:  Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tracks_failed:      Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tracks_requeued:    Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    notes: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+    def __repr__(self) -> str:
+        return (
+            f"<DaemonRun(id={self.id}, run_type={self.run_type!r}, "
+            f"started_at={self.started_at!r}, downloaded={self.tracks_downloaded}, "
+            f"failed={self.tracks_failed})>"
+        )

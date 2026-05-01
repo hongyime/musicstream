@@ -1,237 +1,459 @@
 @echo off
-setlocal EnableExtensions
-echo ========================================
-echo music-download-code - Setup ^& Installation
-echo ========================================
+setlocal enabledelayedexpansion
 
-REM Check for administrator privileges
+:: ============================================================
+:: MUSICSTREAM SETUP — One-time initialisation
+:: PRD v3.0 §15.1
+:: ============================================================
+
+title MUSICSTREAM SETUP
+
+echo.
+echo ============================================================
+echo   MUSICSTREAM SETUP — One-time initialisation
+echo ============================================================
+echo.
+
+:: ── Elevation check ──────────────────────────────────────────
 net session >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [WARN] Running without administrator privileges
-    echo Some operations may fail. Consider running as administrator.
+    echo [WARN] Not running as Administrator.
+    echo        Firewall configuration will be skipped.
+    echo        Re-run as Administrator to configure firewall rules.
     echo.
+    set ADMIN=0
+) else (
+    set ADMIN=1
 )
 
-REM Check Python installation
-echo [INFO] Checking Python installation...
+:: ============================================================
+:: STEP 1 — Check prerequisites
+:: ============================================================
+echo [STEP 1/9] Checking prerequisites...
+echo.
+
+:: ── Python 3.12+ ─────────────────────────────────────────────
 python --version >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [ERROR] Python not found in PATH
-    echo.
-    echo Please install Python 3.11+ from:
-    echo https://www.python.org/downloads/
-    echo.
-    echo Make sure to check "Add Python to PATH" during installation
+    echo [ERROR] Python not found in PATH.
+    echo         Install Python 3.12+ from https://www.python.org/downloads/
+    echo         and ensure "Add Python to PATH" is checked.
+    exit /b 1
+)
+for /f "tokens=2" %%v in ('python --version 2^>^&1') do set PY_VER=%%v
+echo [OK]   Python %PY_VER% found.
+
+python -c "import sys; exit(0 if sys.version_info >= (3, 12) else 1)" >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [ERROR] Python 3.12+ required. Found %PY_VER%.
+    echo         Upgrade from https://www.python.org/downloads/
     exit /b 1
 )
 
-REM Get Python version
-for /f "tokens=2" %%i in ('python --version') do set PYTHON_VERSION=%%i
-echo [OK] Found Python %PYTHON_VERSION%
-
-REM Check Python version (minimum 3.11)
-python -c "import sys; exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>&1
+:: ── Docker Desktop ────────────────────────────────────────────
+docker info >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [ERROR] Python 3.11+ required, found %PYTHON_VERSION%
-    echo Please upgrade Python from https://www.python.org/downloads/
+    echo [ERROR] Docker Desktop is not running or not installed.
+    echo         Install from https://www.docker.com/products/docker-desktop/
+    echo         and start Docker Desktop before running setup.
     exit /b 1
 )
+echo [OK]   Docker Desktop is running.
 
-REM Check pip
-echo [INFO] Checking pip...
-python -m pip --version >nul 2>&1
+:: ── Tailscale ─────────────────────────────────────────────────
+tailscale ip -4 >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [ERROR] pip not found
-    echo Installing pip...
-    python -m ensurepip --upgrade
-)
-
-REM Upgrade pip
-echo [INFO] Upgrading pip...
-python -m pip install --upgrade pip >nul 2>&1
-
-REM Check Git (optional but recommended)
-echo [INFO] Checking Git installation...
-where git >nul 2>&1
-if %errorlevel% equ 0 (
-    echo [OK] Git found
+    echo [WARN] Tailscale not found or not connected.
+    echo        Install from https://tailscale.com/download/windows
+    echo        TAILSCALE_IP will need to be set manually in .env
+    set TAILSCALE_IP=127.0.0.1
 ) else (
-    echo [WARN] Git not found ^(optional^)
-    echo Git is recommended for better yt-dlp installation
-    echo Download from: https://git-scm.com/download/win
+    for /f %%i in ('tailscale ip -4 2^>nul') do set TAILSCALE_IP=%%i
+    echo [OK]   Tailscale connected. IP: !TAILSCALE_IP!
 )
 
-REM Check FFmpeg
-echo [INFO] Checking FFmpeg...
-where ffmpeg >nul 2>&1
-if %errorlevel% equ 0 (
-    echo [OK] FFmpeg found in PATH
-) else (
-    if exist "ffmpeg.exe" (
-        echo [OK] FFmpeg found in local directory
-        set "PATH=%CD%;%PATH%"
-    ) else (
-        echo [WARN] FFmpeg not found
-        echo [INFO] Downloading FFmpeg...
-        
-        REM Download FFmpeg (latest build)
-        echo Downloading FFmpeg Windows build...
-        powershell -Command "Invoke-WebRequest -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile 'ffmpeg.zip'" >nul 2>&1
-        
-        if %errorlevel% equ 0 (
-            echo [INFO] Extracting FFmpeg...
-            powershell -Command "Expand-Archive -Path 'ffmpeg.zip' -DestinationPath '.' -Force" >nul 2>&1
-            
-            REM Find and move ffmpeg.exe
-            for /d %%d in (ffmpeg-*) do (
-                if exist "%%d\bin\ffmpeg.exe" (
-                    copy "%%d\bin\ffmpeg.exe" "ffmpeg.exe" >nul 2>&1
-                )
-            )
-            
-            REM Cleanup
-            del ffmpeg.zip >nul 2>&1
-            for /d %%i in (ffmpeg-*) do rmdir /s /q "%%i" >nul 2>&1
-            
-            if exist "ffmpeg.exe" (
-                echo [OK] FFmpeg downloaded successfully
-                set "PATH=%CD%;%PATH%"
-            ) else (
-                echo [ERROR] Failed to download FFmpeg
-                echo Please download manually from:
-                echo https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
-                echo Extract ffmpeg.exe to this folder
-            )
-        ) else (
-            echo [ERROR] Failed to download FFmpeg
-            echo Please download manually from:
-            echo https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
-        )
-    )
-)
-
-REM Verify FFmpeg works
+:: ── FFmpeg ────────────────────────────────────────────────────
 ffmpeg -version >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [ERROR] FFmpeg verification failed
-    echo Please check FFmpeg installation
+    echo [ERROR] FFmpeg not found in PATH.
+    echo         Download from https://www.gyan.dev/ffmpeg/builds/
+    echo         and add the bin/ folder to your PATH.
+    exit /b 1
+)
+echo [OK]   FFmpeg found.
+
+:: ── Chromaprint (fpcalc) ──────────────────────────────────────
+fpcalc -version >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [WARN] fpcalc (chromaprint) not found in PATH.
+    echo        AcoustID fingerprinting will be unavailable.
+    echo        Download from https://acoustid.org/chromaprint
 ) else (
-    echo [OK] FFmpeg working correctly
+    echo [OK]   fpcalc (chromaprint) found.
 )
 
-REM Check if virtual environment exists and is functional
-if exist "venv\Scripts\activate.bat" (
-    echo [INFO] Virtual environment already exists and is functional
-    echo To recreate it, delete the venv folder manually and run setup again.
-) else (
-    echo [INFO] Creating virtual environment...
-    python -m venv venv
-    if %errorlevel% neq 0 (
-        echo [ERROR] Failed to create virtual environment
-        exit /b 1
-    )
-    echo [OK] Virtual environment created
-)
+echo.
+echo [STEP 1/9] Prerequisites check complete.
+echo.
 
-REM Activate virtual environment
-echo [INFO] Activating virtual environment...
-call venv\Scripts\activate.bat
+:: ============================================================
+:: STEP 2 — Prompt for .env values
+:: ============================================================
+echo [STEP 2/9] Configuring .env...
+echo.
 
-REM Upgrade pip in virtual environment
-echo [INFO] Upgrading pip in virtual environment...
-python -m pip install --upgrade pip >nul 2>&1
-
-REM Install requirements
-echo [INFO] Installing Python dependencies...
-if exist "requirements.txt" (
-    echo Installing from requirements.txt...
-    pip install -r requirements.txt
-    if %errorlevel% neq 0 (
-        echo [ERROR] Failed to install some dependencies
-        echo Trying individual installations...
-        
-        REM Try installing core packages individually
-        echo Installing core packages...
-        pip install "spotipy>=2.23.0"
-        pip install "ytmusicapi>=1.3.0"
-        pip install "SQLAlchemy>=2.0.0"
-        pip install "mutagen>=1.47.0"
-        pip install "requests>=2.31.0"
-        pip install "python-dateutil>=2.8.0"
-        
-        REM Install yt-dlp from GitHub
-        echo Installing yt-dlp...
-        pip install yt-dlp[default]@git+https://github.com/yt-dlp/yt-dlp.git@master
-    )
-) else (
-    echo [ERROR] requirements.txt not found
-    echo Installing core packages manually...
-    pip install spotipy ytmusicapi SQLAlchemy mutagen requests python-dateutil
-    pip install yt-dlp[default]@git+https://github.com/yt-dlp/yt-dlp.git@master
-)
-
-REM Write dependency marker for run.bat incremental checks
-copy /y nul "venv\.deps_installed" >nul 2>&1
-
-REM Verify installations
-echo [INFO] Verifying installations...
-python -c "import spotipy; print('spotipy:', spotipy.__version__)" 2>nul
-python -c "import ytmusicapi; print('ytmusicapi')" 2>nul
-python -c "import sqlalchemy; print('SQLAlchemy:', sqlalchemy.__version__)" 2>nul
-python -c "import mutagen; print('mutagen')" 2>nul
-python -c "import yt_dlp; print('yt-dlp')" 2>nul
-
-REM Test basic functionality
-echo [INFO] Testing basic functionality...
-python -c "import spotipy; from spotipy.oauth2 import SpotifyOAuth; print('Spotify API import successful')" >nul 2>&1
-python -c "from ytmusicapi import YTMusic; ytm = YTMusic(); print('YouTube Music API import successful')" >nul 2>&1
-
-REM Create directories
-echo [INFO] Creating directories...
-if not exist "downloads" mkdir downloads
-if not exist "logs" mkdir logs
-
-REM Create sample .env file if it doesn't exist
-if not exist ".env" (
-    echo [INFO] Creating sample .env file...
-    echo # Spotify API Client ID (get from developer.spotify.com/dashboard) > .env
-    echo SPOTIFY_CLIENT_ID= >> .env
-    echo. >> .env
-)
-
-REM Ensure .env ends with newline to prevent append issues
 if exist ".env" (
-    echo. >> .env 2>nul
+    echo [INFO] Existing .env found. Values will be updated.
+    echo        Press Enter to keep the current value for each prompt.
+    echo.
 )
 
-REM Create cookies.txt placeholder
-if not exist "cookies.txt" (
-    echo [INFO] Creating cookies.txt placeholder...
-    echo # Export your YouTube Music cookies here to avoid blocks > cookies.txt
-    echo # Use a browser extension like "Get cookies.txt LOCALLY" >> cookies.txt
+:: Helper: read existing value from .env
+:: Usage: call :read_env VAR_NAME
+:: Sets %VAR_NAME% to the current value or empty string
+
+call :read_env SPOTIFY_CLIENT_ID
+call :read_env LISTENBRAINZ_TOKEN
+call :read_env LISTENBRAINZ_USERNAME
+call :read_env POSTGRES_PASSWORD
+call :read_env EXTERNAL_MEDIA_DRIVE
+call :read_env PLEX_CLAIM_TOKEN
+call :read_env PLEX_USERNAME
+call :read_env PLEX_TOKEN
+call :read_env PLEX_LIBRARY_SECTION_ID
+call :read_env ACOUSTID_API_KEY
+
+:: ── Prompt each value ─────────────────────────────────────────
+
+echo SPOTIFY_CLIENT_ID
+echo   Get from: https://developer.spotify.com/dashboard
+if defined SPOTIFY_CLIENT_ID (
+    echo   Current: !SPOTIFY_CLIENT_ID!
+)
+set /p "INPUT_SPOTIFY_CLIENT_ID=  Enter value (Enter to keep): "
+if not "!INPUT_SPOTIFY_CLIENT_ID!"=="" set SPOTIFY_CLIENT_ID=!INPUT_SPOTIFY_CLIENT_ID!
+echo.
+
+echo LISTENBRAINZ_TOKEN
+echo   Get from: https://listenbrainz.org/profile/
+if defined LISTENBRAINZ_TOKEN (
+    echo   Current: !LISTENBRAINZ_TOKEN!
+)
+set /p "INPUT_LB_TOKEN=  Enter value (Enter to keep): "
+if not "!INPUT_LB_TOKEN!"=="" set LISTENBRAINZ_TOKEN=!INPUT_LB_TOKEN!
+echo.
+
+echo LISTENBRAINZ_USERNAME
+echo   Your ListenBrainz username
+if defined LISTENBRAINZ_USERNAME (
+    echo   Current: !LISTENBRAINZ_USERNAME!
+)
+set /p "INPUT_LB_USER=  Enter value (Enter to keep): "
+if not "!INPUT_LB_USER!"=="" set LISTENBRAINZ_USERNAME=!INPUT_LB_USER!
+echo.
+
+echo POSTGRES_PASSWORD
+echo   Password for the musicstream PostgreSQL user
+if defined POSTGRES_PASSWORD (
+    echo   Current: [set]
+)
+set /p "INPUT_PG_PASS=  Enter value (Enter to keep): "
+if not "!INPUT_PG_PASS!"=="" set POSTGRES_PASSWORD=!INPUT_PG_PASS!
+echo.
+
+echo EXTERNAL_MEDIA_DRIVE
+echo   Path to your external HDD (e.g. E:\Music)
+echo   This is where Plex will serve music from.
+if defined EXTERNAL_MEDIA_DRIVE (
+    echo   Current: !EXTERNAL_MEDIA_DRIVE!
+)
+set /p "INPUT_MEDIA=  Enter value (Enter to keep): "
+if not "!INPUT_MEDIA!"=="" set EXTERNAL_MEDIA_DRIVE=!INPUT_MEDIA!
+echo.
+
+echo PLEX_CLAIM_TOKEN
+echo   Get from: https://www.plex.tv/claim/ (valid for 4 minutes)
+if defined PLEX_CLAIM_TOKEN (
+    echo   Current: !PLEX_CLAIM_TOKEN!
+)
+set /p "INPUT_PLEX_CLAIM=  Enter value (Enter to keep): "
+if not "!INPUT_PLEX_CLAIM!"=="" set PLEX_CLAIM_TOKEN=!INPUT_PLEX_CLAIM!
+echo.
+
+echo PLEX_USERNAME
+echo   Your Plex account username / email
+if defined PLEX_USERNAME (
+    echo   Current: !PLEX_USERNAME!
+)
+set /p "INPUT_PLEX_USER=  Enter value (Enter to keep): "
+if not "!INPUT_PLEX_USER!"=="" set PLEX_USERNAME=!INPUT_PLEX_USER!
+echo.
+
+echo PLEX_TOKEN
+echo   Get from: https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/
+if defined PLEX_TOKEN (
+    echo   Current: [set]
+)
+set /p "INPUT_PLEX_TOKEN=  Enter value (Enter to keep): "
+if not "!INPUT_PLEX_TOKEN!"=="" set PLEX_TOKEN=!INPUT_PLEX_TOKEN!
+echo.
+
+echo PLEX_LIBRARY_SECTION_ID
+echo   Numeric ID of your Plex music library section (usually 1 or 2)
+if defined PLEX_LIBRARY_SECTION_ID (
+    echo   Current: !PLEX_LIBRARY_SECTION_ID!
+)
+set /p "INPUT_PLEX_SECTION=  Enter value (Enter to keep): "
+if not "!INPUT_PLEX_SECTION!"=="" set PLEX_LIBRARY_SECTION_ID=!INPUT_PLEX_SECTION!
+echo.
+
+echo ACOUSTID_API_KEY
+echo   Get from: https://acoustid.org/api-key
+if defined ACOUSTID_API_KEY (
+    echo   Current: !ACOUSTID_API_KEY!
+)
+set /p "INPUT_ACOUSTID=  Enter value (Enter to keep): "
+if not "!INPUT_ACOUSTID!"=="" set ACOUSTID_API_KEY=!INPUT_ACOUSTID!
+echo.
+
+:: ── Write .env ────────────────────────────────────────────────
+echo # musicstream .env — generated by setup.bat > .env
+echo # DO NOT COMMIT THIS FILE >> .env
+echo. >> .env
+echo # Spotify API (no client secret needed — uses PKCE) >> .env
+echo # Get from: https://developer.spotify.com/dashboard >> .env
+echo SPOTIFY_CLIENT_ID=!SPOTIFY_CLIENT_ID! >> .env
+echo. >> .env
+echo # ListenBrainz >> .env
+echo # Get token from: https://listenbrainz.org/profile/ >> .env
+echo LISTENBRAINZ_TOKEN=!LISTENBRAINZ_TOKEN! >> .env
+echo LISTENBRAINZ_USERNAME=!LISTENBRAINZ_USERNAME! >> .env
+echo. >> .env
+echo # PostgreSQL >> .env
+echo POSTGRES_PASSWORD=!POSTGRES_PASSWORD! >> .env
+echo DATABASE_URL=postgresql://musicstream:!POSTGRES_PASSWORD!@localhost:5432/musicstream >> .env
+echo. >> .env
+echo # External media drive (no trailing slash) >> .env
+echo # Example: E:\Music >> .env
+echo EXTERNAL_MEDIA_DRIVE=!EXTERNAL_MEDIA_DRIVE! >> .env
+echo. >> .env
+echo # Plex Media Server >> .env
+echo # Claim token: https://www.plex.tv/claim/ (valid 4 min) >> .env
+echo PLEX_CLAIM_TOKEN=!PLEX_CLAIM_TOKEN! >> .env
+echo PLEX_USERNAME=!PLEX_USERNAME! >> .env
+echo # Token: https://support.plex.tv/articles/204059436 >> .env
+echo PLEX_TOKEN=!PLEX_TOKEN! >> .env
+echo PLEX_LIBRARY_SECTION_ID=!PLEX_LIBRARY_SECTION_ID! >> .env
+echo. >> .env
+echo # Tailscale (auto-detected) >> .env
+echo TAILSCALE_IP=!TAILSCALE_IP! >> .env
+echo. >> .env
+echo # AcoustID fingerprinting >> .env
+echo # Get from: https://acoustid.org/api-key >> .env
+echo ACOUSTID_API_KEY=!ACOUSTID_API_KEY! >> .env
+
+echo [OK]   .env written.
+echo.
+
+:: ============================================================
+:: STEP 3 — Create directories
+:: ============================================================
+echo [STEP 3/9] Creating directories...
+
+for %%d in (backups logs "plex\config" "plex\transcode" "scrobbler\config" downloads temp) do (
+    if not exist %%d (
+        mkdir %%d >nul 2>&1
+        echo [OK]   Created %%d
+    ) else (
+        echo [OK]   %%d already exists
+    )
+)
+echo.
+
+:: ============================================================
+:: STEP 4 — Generate scrobbler/config/config.yaml
+:: ============================================================
+echo [STEP 4/9] Generating scrobbler/config/config.yaml...
+
+(
+    echo sources:
+    echo   - name: musicstream-plex
+    echo     type: plex
+    echo     polling:
+    echo       interval: 10
+    echo     data:
+    echo       user: !PLEX_USERNAME!
+    echo       token: !PLEX_TOKEN!
+    echo.
+    echo scrobbles:
+    echo   - name: musicstream-lb
+    echo     type: listenbrainz
+    echo     data:
+    echo       token: !LISTENBRAINZ_TOKEN!
+) > scrobbler\config\config.yaml
+
+echo [OK]   scrobbler/config/config.yaml generated.
+echo.
+
+:: ============================================================
+:: STEP 5 — Configure Windows Defender Firewall
+:: ============================================================
+echo [STEP 5/9] Configuring Windows Defender Firewall...
+
+if "%ADMIN%"=="0" (
+    echo [SKIP] Not running as Administrator — firewall rules skipped.
+    echo        Re-run setup.bat as Administrator to configure firewall.
+    echo.
+    goto :step6
 )
 
+:: Get the Tailscale interface name
+for /f "tokens=*" %%i in ('powershell -NoProfile -Command "Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*Tailscale*'} | Select-Object -ExpandProperty Name" 2^>nul') do set TAILSCALE_IF=%%i
+
+if "!TAILSCALE_IF!"=="" (
+    echo [WARN] Could not detect Tailscale network adapter name.
+    echo        Firewall rules will allow TCP 32400 on all interfaces.
+    powershell -NoProfile -Command ^
+        "New-NetFirewallRule -DisplayName 'Plex TCP 32400' -Direction Inbound -Protocol TCP -LocalPort 32400 -Action Allow -Profile Any -ErrorAction SilentlyContinue" >nul 2>&1
+) else (
+    echo [INFO] Tailscale adapter: !TAILSCALE_IF!
+
+    :: Remove any existing Plex rules to avoid duplicates
+    powershell -NoProfile -Command ^
+        "Remove-NetFirewallRule -DisplayName 'Plex TCP 32400*' -ErrorAction SilentlyContinue" >nul 2>&1
+
+    :: Allow TCP 32400 on Tailscale interface only
+    powershell -NoProfile -Command ^
+        "New-NetFirewallRule -DisplayName 'Plex TCP 32400 Tailscale Allow' -Direction Inbound -Protocol TCP -LocalPort 32400 -Action Allow -InterfaceAlias '!TAILSCALE_IF!' -Profile Any" >nul 2>&1
+
+    :: Block TCP 32400 on all other interfaces
+    powershell -NoProfile -Command ^
+        "New-NetFirewallRule -DisplayName 'Plex TCP 32400 Block Others' -Direction Inbound -Protocol TCP -LocalPort 32400 -Action Block -Profile Any" >nul 2>&1
+
+    echo [OK]   Firewall: TCP 32400 allowed on Tailscale (!TAILSCALE_IF!), blocked elsewhere.
+)
 echo.
-echo ========================================
-echo [OK] Setup Complete!
-echo ========================================
+
+:step6
+:: ============================================================
+:: STEP 6 — docker-compose pull
+:: ============================================================
+echo [STEP 6/9] Pulling Docker images (docker-compose pull)...
+docker-compose pull
+if %errorlevel% neq 0 (
+    echo [WARN] docker-compose pull reported errors. Check your internet connection.
+) else (
+    echo [OK]   Docker images pulled.
+)
 echo.
-echo Next steps:
-echo 1. Set up your Spotify API credentials:
-echo    - Visit: https://developer.spotify.com/dashboard/applications
-echo    - Create a new app
-echo    - Add redirect URI: http://127.0.0.1:8888/callback
-echo    - Copy Client ID to .env file (no Client Secret needed)
+
+:: ============================================================
+:: STEP 7 — Start postgres, wait for healthcheck, run migrations
+:: ============================================================
+echo [STEP 7/9] Starting PostgreSQL and running Alembic migrations...
+
+:: Start only the postgres service
+docker-compose up -d postgres
+if %errorlevel% neq 0 (
+    echo [ERROR] Failed to start postgres container.
+    exit /b 1
+)
+
+:: Wait for postgres healthcheck (up to 60 seconds)
+echo [INFO] Waiting for PostgreSQL to be ready...
+set /a WAIT_COUNT=0
+:wait_loop
+timeout /t 3 /nobreak >nul
+docker-compose exec -T postgres pg_isready -U musicstream >nul 2>&1
+if %errorlevel% equ 0 (
+    echo [OK]   PostgreSQL is ready.
+    goto :run_migrations
+)
+set /a WAIT_COUNT+=1
+if !WAIT_COUNT! geq 20 (
+    echo [ERROR] PostgreSQL did not become ready after 60 seconds.
+    echo         Check: docker-compose logs postgres
+    exit /b 1
+)
+echo [INFO] Still waiting... (!WAIT_COUNT!/20)
+goto :wait_loop
+
+:run_migrations
+:: Run Alembic migrations
+echo [INFO] Running Alembic migrations (alembic upgrade head)...
+python -m alembic upgrade head
+if %errorlevel% neq 0 (
+    echo [ERROR] Alembic migrations failed.
+    echo         Check your DATABASE_URL in .env and try again.
+    exit /b 1
+)
+echo [OK]   Alembic migrations complete.
 echo.
-echo 2. (Optional) Export YouTube Music cookies:
-echo    - Install "Get cookies.txt LOCALLY" browser extension
-echo    - Visit music.youtube.com while logged in
-echo    - Export cookies to cookies.txt file
+
+:: ============================================================
+:: STEP 8 — Validate .gitignore completeness
+:: ============================================================
+echo [STEP 8/9] Validating .gitignore...
+
+set GITIGNORE_OK=1
+set REQUIRED_ENTRIES=.env backups/ logs/ downloads/ temp/ *.sql cookies.txt
+
+for %%e in (%REQUIRED_ENTRIES%) do (
+    findstr /i /c:"%%e" .gitignore >nul 2>&1
+    if !errorlevel! neq 0 (
+        echo [WARN] .gitignore may be missing entry: %%e
+        set GITIGNORE_OK=0
+    )
+)
+
+if "%GITIGNORE_OK%"=="1" (
+    echo [OK]   .gitignore looks complete.
+) else (
+    echo [WARN] Some .gitignore entries may be missing. Review .gitignore before committing.
+)
 echo.
-echo 3. Run music-download-code:
-echo    run.bat scrape      (discover Spotify tracks only)
-echo    run.bat download    (download resolved tracks)
+
+:: ============================================================
+:: STEP 9 — Completion summary
+:: ============================================================
+echo [STEP 9/9] Setup complete!
 echo.
-echo For troubleshooting, check README.md
+echo ============================================================
+echo   MUSICSTREAM SETUP — Complete
+echo ============================================================
 echo.
+echo   Tailscale IP:  !TAILSCALE_IP!
+echo   Plex URL:      http://!TAILSCALE_IP!:32400/web
+echo   Daemon API:    http://localhost:9079/health
+echo.
+echo   Next steps:
+echo     1. Run startup.bat to start the full stack
+echo     2. Open Plex at http://!TAILSCALE_IP!:32400/web to complete setup
+echo     3. The daemon will run Spotify sync automatically every 15 minutes
+echo.
+echo   Useful commands:
+echo     startup.bat          — Day-to-day operations menu
+echo     python main.py scrape    — Manual Spotify scrape
+echo     python main.py download  — Manual download run
+echo     python main.py status    — Show DB status
+echo.
+echo ============================================================
+echo.
+
+endlocal
+exit /b 0
+
+:: ============================================================
+:: Subroutine: read a value from .env into a variable
+:: Usage: call :read_env VAR_NAME
+:: ============================================================
+:read_env
+set "_VAR=%~1"
+set "%_VAR%="
+if not exist ".env" exit /b 0
+for /f "usebackq tokens=1,* delims==" %%a in (".env") do (
+    if "%%a"=="%_VAR%" (
+        set "%_VAR%=%%b"
+    )
+)
 exit /b 0

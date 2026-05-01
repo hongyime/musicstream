@@ -1,0 +1,90 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: musicstream-postgres
+    environment:
+      POSTGRES_DB: musicstream
+      POSTGRES_USER: musicstream
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U musicstream"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  plex:
+    image: plexinc/pms-docker:latest
+    container_name: musicstream-plex
+    network_mode: host
+    environment:
+      - PLEX_CLAIM=${PLEX_CLAIM_TOKEN}
+      - ADVERTISE_IP=http://${TAILSCALE_IP}:32400/
+      - TZ=Asia/Singapore
+    volumes:
+      - ${EXTERNAL_MEDIA_DRIVE}:/media:ro
+      - ./plex/config:/config
+      - ./plex/transcode:/transcode
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:32400/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  scrobbler:
+    image: foxxmd/multi-scrobbler:latest
+    container_name: musicstream-scrobbler
+    volumes:
+      - ./scrobbler/config:/config
+    ports:
+      - "9078:9078"
+    environment:
+      - TZ=Asia/Singapore
+    restart: unless-stopped
+    depends_on:
+      plex:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9078/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile.daemon
+    container_name: musicstream-daemon
+    volumes:
+      - ${EXTERNAL_MEDIA_DRIVE}:/media
+      - ./logs:/app/logs
+      - ./backups:/app/backups
+      - ./.env:/app/.env:ro
+      - ./cookies.txt:/app/cookies.txt:ro
+    ports:
+      - "9079:9079"
+    environment:
+      - TZ=Asia/Singapore
+      - PYTHONUNBUFFERED=1
+      - DATABASE_URL=postgresql://musicstream:${POSTGRES_PASSWORD}@postgres:5432/musicstream
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9079/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  postgres_data:

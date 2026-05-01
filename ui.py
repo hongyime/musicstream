@@ -162,4 +162,76 @@ __all__ = [
     "confirm_resume",
     "print_interrupted",
     "print_fresh_start",
+    "print_daemon_banner",
+    "print_integrity_result",
 ]
+
+
+def print_daemon_banner(
+    last_run_str: str,
+    downloaded: int,
+    failed: int,
+    requeued: int,
+    db_tracks: int,
+    missing: int,
+    corrupt: int,
+    lb_total: int,
+    lb_ingested: int,
+    errors_mb: float,
+) -> None:
+    """Print the daemon startup banner using rich Panel (PRD §13.3 format).
+
+    Renders a box matching the PRD §13.3 layout:
+
+        ╔════════════════════════════════════════════════════╗
+        ║         MUSICSTREAM DAEMON v3.0                    ║
+        ╠════════════════════════════════════════════════════╣
+        ║ Last full run:   2026-04-22 03:00 SGT              ║
+        ║ Downloaded:  44  │  Failed:    1  │  Requeued:  0  ║
+        ║ DB tracks:  4219  │  Missing:   0  │  Corrupt:  0  ║
+        ║ LB recs:    200   │  Ingested: 12                  ║
+        ║ errors.log: 1.2MB / 5MB                            ║
+        ╚════════════════════════════════════════════════════╝
+    """
+    lines = [
+        "[bold cyan]MUSICSTREAM DAEMON v3.0[/bold cyan]",
+        "",
+        f"Last full run:   {last_run_str}",
+        (
+            f"Downloaded: {downloaded:>3}  │  Failed: {failed:>4}  │  Requeued: {requeued:>2}"
+        ),
+        (
+            f"DB tracks: {db_tracks:>5}  │  Missing: {missing:>3}  │  Corrupt: {corrupt:>2}"
+        ),
+        f"LB recs:   {lb_total:>5}  │  Ingested: {lb_ingested:>2}",
+        f"errors.log: {errors_mb:.1f}MB / 5MB",
+    ]
+
+    panel = Panel(
+        "\n".join(lines),
+        border_style="cyan",
+        padding=(0, 2),
+    )
+    console.print(panel)
+
+
+def print_integrity_result(result: Any) -> None:
+    """Print an IntegrityResult summary using rich Table.
+
+    Expects *result* to have attributes: total_checked, ok, missing, corrupt.
+    """
+    table = Table(title="Integrity Check Results")
+    table.add_column("Metric", style="bold")
+    table.add_column("Count", justify="right")
+
+    total = getattr(result, "total_checked", 0)
+    ok = getattr(result, "ok", 0)
+    missing = getattr(result, "missing", 0)
+    corrupt = getattr(result, "corrupt", 0)
+
+    table.add_row("[white]Total checked[/white]", f"[white]{total}[/white]")
+    table.add_row("[green]OK[/green]", f"[green]{ok}[/green]")
+    table.add_row("[yellow]Missing[/yellow]", f"[yellow]{missing}[/yellow]")
+    table.add_row("[red]Corrupt[/red]", f"[red]{corrupt}[/red]")
+
+    console.print(table)
