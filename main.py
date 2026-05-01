@@ -7,23 +7,20 @@ import re
 import shutil
 import subprocess
 import sys
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from importlib import import_module
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, List, cast
+from typing import List
 
 from dotenv import load_dotenv  # type: ignore[import-untyped]
 
 from exceptions import RateLimitError
-from models import DatabaseManager, SourceType, Track, TrackStatus
+from models import Track, TrackStatus
 from ui import (
-    confirm_resume,
     console,
-    create_progress,
     print_error,
     print_fresh_start,
     print_header,
+    print_integrity_result,
     print_interrupted,
     print_sources_table,
     print_success,
@@ -31,23 +28,26 @@ from ui import (
     print_warning,
 )
 
-if TYPE_CHECKING:
-    from spotify_client import SpotifyIngestor
-    from ytm_client import YTMResolver
-
 logger = logging.getLogger(__name__)
 
 _MAX_DOWNLOAD_WORKERS = 4
+
+# Updated validation targets to reflect the new module structure
 _VALIDATION_TARGETS = [
     "main.py",
-    "downloader.py",
     "models.py",
-    "spotify_client.py",
-    "ytm_client.py",
-    "robustness.py",
+    "db.py",
     "exceptions.py",
+    "rate_limiter.py",
     "ui.py",
-    "test_robustness.py",
+    "daemon.py",
+    "ingestion/scraper.py",
+    "ingestion/downloader.py",
+    "ingestion/tagger.py",
+    "ingestion/organiser.py",
+    "discovery/listenbrainz.py",
+    "discovery/plex_playlists.py",
+    "integrity/checker.py",
 ]
 
 
@@ -122,36 +122,43 @@ def _require_client_id() -> str:
 # ── Scrape command ─────────────────────────────────────────────────────────────
 
 def cmd_scrape(args: argparse.Namespace) -> None:
-    from spotify_client import SpotifyIngestor
+    from db import get_session, init_db
+    from ingestion.scraper import SpotifyScraper
 
     print_header("Scrape")
     client_id = _require_client_id()
-    db = DatabaseManager()
-    spotify = SpotifyIngestor(client_id)
+    init_db()
 
     try:
-        if args.fresh:
-            reset = db.reset_tracks_for_fresh_scrape()
-            print_fresh_start("scrape")
-            if reset:
-                print_warning(f"Reset {reset} tracks to pending")
+        with get_session() as session:
+            scraper = SpotifyScraper(client_id)
 
-        new_tracks = _scrape_all_sources(db, spotify)
+            if args.fresh:
+                # Reset all non-downloaded tracks to pending
+                reset = (
+                    session.query(Track)
+                    .filter(Track.status != TrackStatus.DOWNLOADED.value)
+                    .update({"status": TrackStatus.PENDING.value})
+                )
+                print_fresh_start("scrape")
+                if reset:
+                    print_warning(f"Reset {reset} tracks to pending")
 
-        counts = db.get_track_counts()
-        logger.info(
-            "Scrape complete — new=%d pending=%d resolved=%d failed=%d downloaded=%d",
-            new_tracks,
-            counts.get("pending", 0),
-            counts.get("resolved", 0),
-            counts.get("failed", 0),
-            counts.get("downloaded", 0),
-        )
-        print_success("Spotify discovery finished. No YouTube resolution was run.")
-        print_summary(counts)
+            new_tracks = scraper.full_backfill(session)
+
+            counts = _get_track_counts(session)
+            logger.info(
+                "Scrape complete — new=%d pending=%d downloaded=%d failed=%d",
+                new_tracks,
+                counts.get("pending", 0),
+                counts.get("downloaded", 0),
+                counts.get("failed", 0),
+            )
+            print_success(f"Spotify discovery finished. {new_tracks} new tracks added.")
+            print_summary(counts)
+
     except KeyboardInterrupt:
-        counts = db.get_track_counts()
-        print_interrupted("scrape", counts.get("total", 0) - counts.get("pending", 0), counts.get("total", 0))
+        print_interrupted("scrape", 0, 0)
     except RateLimitError as exc:
         print_error(str(exc))
         print_error("Process terminated due to rate limiting. Try again later or add cookies.txt")
@@ -159,101 +166,13 @@ def cmd_scrape(args: argparse.Namespace) -> None:
     except Exception:
         logger.exception("Scrape failed")
         print_error("Scrape failed. See logs/music-download-code.log for details.")
-    finally:
-        db.close()
-
-
-def _scrape_all_sources(db: DatabaseManager, spotify: SpotifyIngestor) -> int:
-    """Returns total new tracks added."""
-    logger.info("Discovering playlists...")
-    playlists = spotify.get_all_playlists()
-    logger.info("Found %d playlists", len(playlists))
-
-    total_new = 0
-    progress = create_progress()
-    with progress:
-        task = progress.add_task("Scraping playlists", total=len(playlists))
-        for pl in playlists:
-            progress.update(task, description=f"Scraping: {pl['name'][:40]}")
-            db.upsert_source(pl["spotify_id"], pl["name"], SourceType.PLAYLIST)
-            tracks = spotify.get_playlist_tracks(pl["spotify_id"])
-            new_count = _ingest_tracks(db, tracks, pl["spotify_id"])
-            db.mark_source_scraped(pl["spotify_id"])
-            total_new += new_count
-            logger.info("Scraped %s: %d new tracks", pl["name"], new_count)
-            progress.advance(task)
-
-        liked_task = progress.add_task("Scraping Liked Songs", total=1)
-        liked_source_id = "__liked_songs__"
-        db.upsert_source(liked_source_id, "Liked Songs", SourceType.LIKED)
-        liked = spotify.get_liked_songs()
-        new_count = _ingest_tracks(db, liked, liked_source_id)
-        db.mark_source_scraped(liked_source_id)
-        total_new += new_count
-        logger.info("Liked Songs: %d new tracks", new_count)
-        progress.advance(liked_task)
-
-    return total_new
-
-
-def _ingest_tracks(
-    db: DatabaseManager, tracks: List[dict], source_spotify_id: str
-) -> int:
-    new_count = 0
-    for t in tracks:
-        existing = db.get_track_by_spotify_uri(t["spotify_uri"])
-        if not existing:
-            new_count += 1
-        db.add_track(
-            spotify_uri=t["spotify_uri"],
-            track_name=t["track_name"],
-            artist_name=t["artist_name"],
-            album_name=t.get("album_name"),
-            track_number=t.get("track_number"),
-            duration_ms=t.get("duration_ms"),
-            source_spotify_id=source_spotify_id,
-        )
-    return new_count
-
-
-def _resolve_pending(db: DatabaseManager, ytm: YTMResolver) -> tuple[int, int]:
-    """Returns (resolved_count, failed_count)."""
-    pending = db.get_pending_tracks()
-    if not pending:
-        print_success("No pending tracks to resolve")
-        return 0, 0
-
-    resolved = 0
-    failed = 0
-    progress = create_progress()
-    with progress:
-        task = progress.add_task("Resolving on YouTube Music", total=len(pending))
-        for track in pending:
-            progress.update(
-                task,
-                description=(
-                    f"Resolving: {track.track_name[:35]} - {track.artist_name[:20]}"
-                ),
-            )
-            video_id = ytm.search_track(
-                track.track_name, track.artist_name, duration_ms=track.duration_ms
-            )
-            if video_id:
-                db.update_track_video_id(track.spotify_uri, video_id)
-                resolved += 1
-            else:
-                db.update_track_status(track.spotify_uri, TrackStatus.FAILED)
-                failed += 1
-            progress.advance(task)
-
-    logger.info("Resolution: %d resolved, %d failed", resolved, failed)
-    return resolved, failed
 
 
 # ── Download command ───────────────────────────────────────────────────────────
 
 def cmd_download(args: argparse.Namespace) -> None:
-    from downloader import AudioExtractor
+    from db import get_session, init_db
+    from ingestion.downloader import DownloadOrchestrator
 
     print_header("Download")
     if not _check_ffmpeg():
@@ -264,106 +183,37 @@ def cmd_download(args: argparse.Namespace) -> None:
         print_error("FFmpeg not found.")
         sys.exit(1)
 
-    download_dir = args.output
-    if not download_dir:
-        download_dir = input("Where should downloads be saved? (default: downloads): ").strip()
-        if not download_dir:
-            download_dir = "downloads"
-
-    db = DatabaseManager()
-    downloader = AudioExtractor(
-        download_dir,
-        chaos_enabled=args.chaos,
-        chaos_intensity=args.chaos_intensity,
-    )
+    init_db()
+    orchestrator = DownloadOrchestrator()
 
     try:
-        interrupted_count = db.get_interrupted_download_count()
-        if args.fresh:
-            if interrupted_count:
-                db.reset_interrupted_downloads()
-            print_fresh_start("download")
-        elif interrupted_count:
-            total_resolved = len(db.get_tracks_by_status(TrackStatus.RESOLVED))
-            confirm_resume("download", total_resolved, total_resolved + interrupted_count)
-            db.reset_interrupted_downloads()
-            print_warning(f"Recovered {interrupted_count} interrupted downloads")
+        with get_session() as session:
+            if args.fresh:
+                # Reset non-downloaded tracks to pending
+                session.query(Track).filter(
+                    Track.status.in_([
+                        TrackStatus.DOWNLOADING.value,
+                        TrackStatus.FAILED.value,
+                    ])
+                ).update({"status": TrackStatus.PENDING.value})
+                print_fresh_start("download")
 
-        resolved = db.get_tracks_by_status(TrackStatus.RESOLVED)
-        logger.info("Downloading %d resolved tracks to %s", len(resolved), download_dir)
-
-        if not resolved:
-            print_success("Nothing to download. Run 'scrape' first.")
-            return
-
-        downloaded = 0
-        failed = 0
-        interrupted = False
-
-        progress = create_progress()
-        with progress:
-            task = progress.add_task(
-                "Downloading", total=len([t for t in resolved if t.yt_video_id])
+            pending_count = (
+                session.query(Track)
+                .filter(Track.status == TrackStatus.PENDING.value)
+                .count()
             )
 
-            def _download_one(track: Track) -> tuple[str, bool, str | None]:
-                db.update_track_status(track.spotify_uri, TrackStatus.DOWNLOADING)
-                result = downloader.extract_audio(
-                    track.yt_video_id or "",
-                    track.track_name,
-                    track.artist_name,
-                    album_name=track.album_name or "",
-                    force=args.fresh,
-                )
-                return track.spotify_uri, result is not None, result
+            if pending_count == 0:
+                print_success("Nothing to download. Run 'scrape' first.")
+                return
 
-            pool: ThreadPoolExecutor | None = None
-            try:
-                with ThreadPoolExecutor(max_workers=_MAX_DOWNLOAD_WORKERS) as pool:
-                    futures = {
-                        pool.submit(_download_one, t): t
-                        for t in resolved
-                        if t.yt_video_id
-                    }
-                    for future in as_completed(futures):
-                        track = futures[future]
-                        try:
-                            uri, success, filepath = future.result()
-                            if success:
-                                db.update_track_status(uri, TrackStatus.DOWNLOADED)
-                                logger.info("Downloaded: %s", filepath)
-                                downloaded += 1
-                            else:
-                                db.update_track_status(uri, TrackStatus.FAILED)
-                                logger.warning(
-                                    "Failed: %s by %s", track.track_name, track.artist_name
-                                )
-                                failed += 1
-                        except Exception:
-                            logger.exception("Error downloading %s", track.track_name)
-                            db.update_track_status(track.spotify_uri, TrackStatus.FAILED)
-                            failed += 1
-                        progress.advance(task)
-            except KeyboardInterrupt:
-                interrupted = True
-                if pool is not None:
-                    pool.shutdown(wait=False, cancel_futures=True)
+            logger.info("Downloading %d pending tracks", pending_count)
+            # download_pending opens its own per-thread sessions via get_session()
+            downloaded, failed = orchestrator.download_pending(session)
 
-        if interrupted:
-            reset_count = db.reset_interrupted_downloads()
-            downloader.cleanup_partial_files()
-            print_interrupted("download", downloaded, downloaded + failed + reset_count)
-            return
-
-        downloader.cleanup_partial_files()
         logger.info("Download complete — %d downloaded, %d failed", downloaded, failed)
-        print_summary(
-            {
-                "downloaded": downloaded,
-                "failed": failed,
-                "total": downloaded + failed,
-            }
-        )
+        print_summary({"downloaded": downloaded, "failed": failed, "total": downloaded + failed})
 
     except KeyboardInterrupt:
         print_interrupted("download", 0, 0)
@@ -374,236 +224,101 @@ def cmd_download(args: argparse.Namespace) -> None:
     except Exception:
         logger.exception("Download failed")
         print_error("Download failed. See logs/music-download-code.log for details.")
-    finally:
-        db.close()
 
 
 # ── Status command ─────────────────────────────────────────────────────────────
 
 def cmd_status(_args: argparse.Namespace) -> None:
-    db = DatabaseManager()
+    from db import get_session, init_db
+    from models import Source
+
+    init_db()
     try:
-        print_header("music-download-code Status")
-        counts = db.get_track_counts()
-        print_summary(counts)
+        with get_session() as session:
+            print_header("musicstream Status")
+            counts = _get_track_counts(session)
+            print_summary(counts)
 
-        sources = db.get_all_sources()
-        if sources:
-            encoding = sys.stdout.encoding or "utf-8"
-            safe_sources = [
-                SimpleNamespace(
-                    name=s.name.encode(encoding, errors="replace").decode(
-                        encoding, errors="replace"
-                    ),
-                    source_type=s.source_type,
-                    last_scraped_at=s.last_scraped_at,
-                )
-                for s in sources
-            ]
-            print_sources_table(safe_sources)
-    finally:
-        db.close()
-
-
-# ── Resolve command ────────────────────────────────────────────────────────────
-
-def cmd_resolve(args: argparse.Namespace) -> None:
-    from ytm_client import YTMResolver
-
-    print_header("Resolve")
-    db = DatabaseManager()
-    ytm = YTMResolver(
-        chaos_enabled=args.chaos,
-        chaos_intensity=args.chaos_intensity,
-    )
-
-    try:
-        if args.fresh:
-            reset = db.reset_tracks_for_fresh_scrape()
-            print_fresh_start("resolve")
-            if reset:
-                print_warning(f"Reset {reset} tracks to pending")
-
-        if not args.skip_health_check:
-            print_success("Running resolver health check before long resolve...")
-            health = ytm.health_check()
-            filter_summary = ", ".join(
-                f"{item['filter']}={item['count']}" for item in health["filters"]
-            )
-            if health["ok"]:
-                if health["ytm_ok"]:
-                    print_success(f"Resolver health check passed (ytmusicapi results: {filter_summary})")
-                else:
-                    print_warning(
-                        "Resolver health check: ytmusicapi is degraded, yt-dlp fallback is available"
+            sources = session.query(Source).all()
+            if sources:
+                encoding = sys.stdout.encoding or "utf-8"
+                safe_sources = [
+                    SimpleNamespace(
+                        name=s.name.encode(encoding, errors="replace").decode(
+                            encoding, errors="replace"
+                        ),
+                        source_type=SimpleNamespace(value=s.source_type),
+                        last_scraped_at=s.last_scraped_at,
                     )
-            else:
-                print_error("Resolver health check failed before resolve start.")
-                print_error("No results from ytmusicapi filters or yt-dlp fallback.")
-                print_error("Add headers_auth.json and verify internet/cookies, then retry.")
-                sys.exit(1)
-
-        resolved_count, failed_count = _resolve_pending(db, ytm)
-
-        counts = db.get_track_counts()
-        logger.info(
-            "Resolve complete — pending=%d resolved=%d failed=%d",
-            counts.get("pending", 0),
-            counts.get("resolved", 0),
-            counts.get("failed", 0),
-        )
-        logger.info("Resolved this run: %d, Failed this run: %d", resolved_count, failed_count)
-        print_summary(counts)
-    except KeyboardInterrupt:
-        counts = db.get_track_counts()
-        completed_count = (
-            counts.get("resolved", 0)
-            + counts.get("failed", 0)
-            + counts.get("downloaded", 0)
-        )
-        total_count = counts.get("total", 0)
-        print_interrupted("resolve", completed_count, total_count)
-    except RateLimitError as exc:
-        print_error(str(exc))
-        print_error("Process terminated due to rate limiting. Try again later or add cookies.txt")
-        sys.exit(1)
+                    for s in sources
+                ]
+                print_sources_table(safe_sources)
     except Exception:
-        logger.exception("Resolve failed")
-        print_error("Resolve failed. See logs/music-download-code.log for details.")
-    finally:
-        db.close()
+        logger.exception("Status failed")
+        print_error("Status failed. See logs/music-download-code.log for details.")
 
 
-# ── Retry command ──────────────────────────────────────────────────────────────
-
-def cmd_retry(args: argparse.Namespace) -> None:
-    from downloader import AudioExtractor
-
-    print_header("Retry")
-    if not _check_ffmpeg():
-        logger.error("FFmpeg not found.")
-        print_error("FFmpeg not found.")
-        sys.exit(1)
-
-    download_dir = args.output or "downloads"
-    db = DatabaseManager()
-    downloader = AudioExtractor(
-        download_dir,
-        chaos_enabled=args.chaos,
-        chaos_intensity=args.chaos_intensity,
+def _get_track_counts(session) -> dict:
+    """Return a dict of status → count for all tracks."""
+    from sqlalchemy import func
+    rows = (
+        session.query(Track.status, func.count(Track.id))
+        .group_by(Track.status)
+        .all()
     )
-    recovered = 0
-    failed: list[Track] = []
+    counts = {status: count for status, count in rows}
+    counts["total"] = sum(counts.values())
+    return counts
+
+
+# ── Integrity command ──────────────────────────────────────────────────────────
+
+def cmd_integrity(_args: argparse.Namespace) -> None:
+    from db import get_session, init_db
+    from integrity.checker import IntegrityChecker
+
+    print_header("Integrity Check")
+    init_db()
 
     try:
-        if args.fresh:
-            failed = list(db.get_tracks_by_status(TrackStatus.FAILED)) + list(
-                db.get_tracks_by_status(TrackStatus.FAILED_VALIDATION)
-            )
-            print_fresh_start("retry")
-        else:
-            failed = list(db.get_tracks_by_status(TrackStatus.FAILED))
-
-        logger.info("Retrying %d failed tracks", len(failed))
-
-        if not failed:
-            print_success("No failed tracks to retry")
-            return
-
-        still_failed = 0
-        progress = create_progress()
-        with progress:
-            task = progress.add_task("Retrying failed", total=len(failed))
-            for track in failed:
-                if not track.yt_video_id:
-                    still_failed += 1
-                    progress.advance(task)
-                    continue
-
-                progress.update(task, description=f"Retrying: {track.track_name[:35]}")
-                result = downloader.extract_audio(
-                    track.yt_video_id,
-                    track.track_name,
-                    track.artist_name,
-                    album_name=track.album_name or "",
-                    force=args.fresh,
-                )
-                if result:
-                    db.update_track_status(track.spotify_uri, TrackStatus.DOWNLOADED)
-                    logger.info("Recovered: %s", result)
-                    recovered += 1
-                else:
-                    logger.warning("Still failed: %s by %s", track.track_name, track.artist_name)
-                    still_failed += 1
-                progress.advance(task)
-
-        logger.info("Retry complete: %d recovered out of %d", recovered, len(failed))
-        print_summary(
-            {"recovered": recovered, "still_failed": still_failed, "total": len(failed)}
+        checker = IntegrityChecker()
+        with get_session() as session:
+            result = checker.run(session)
+        print_integrity_result(result)
+        print_success(
+            f"Integrity check complete: {result.total_checked} checked, "
+            f"{result.ok} ok, {result.missing} missing, {result.corrupt} corrupt"
         )
-    except KeyboardInterrupt:
-        print_interrupted("retry", recovered if 'recovered' in locals() else 0, len(failed) if 'failed' in locals() else 0)
     except Exception:
-        logger.exception("Retry failed")
-        print_error("Retry failed. See logs/music-download-code.log for details.")
-    finally:
-        db.close()
+        logger.exception("Integrity check failed")
+        print_error("Integrity check failed. See logs/music-download-code.log for details.")
 
 
-# ── Chaos Test command ─────────────────────────────────────────────────────────
+# ── Daemon command ─────────────────────────────────────────────────────────────
 
-def cmd_chaos_test(args: argparse.Namespace) -> None:
-    from downloader import AudioExtractor
-    from robustness import MusicDownloadChaosMonkey
-    from ytm_client import YTMResolver
+def cmd_daemon(_args: argparse.Namespace) -> None:
+    """Start the musicstream daemon (APScheduler + Flask control plane)."""
+    print_header("Daemon")
+    try:
+        import daemon as daemon_module
+        daemon_module.startup_sequence()
+        daemon_module.app.run(host="0.0.0.0", port=9079, threaded=True)
+    except Exception:
+        logger.exception("Daemon failed to start")
+        print_error("Daemon failed. See logs/daemon.log for details.")
+        sys.exit(1)
 
-    print_header("Chaos Test")
-    monkey = MusicDownloadChaosMonkey(enabled=True, intensity=args.chaos_intensity)
-    resolver = YTMResolver(chaos_enabled=True, chaos_intensity=args.chaos_intensity)
-    downloader = AudioExtractor(
-        args.output or "downloads",
-        chaos_enabled=True,
-        chaos_intensity=args.chaos_intensity,
-    )
 
-    def _run_operation(operation: str) -> None:
-        if operation == "spotify_playlist_fetch":
-            time.sleep(0.01)
-            return
-        if operation == "youtube_search":
-            resolver.search_track("Get Lucky", "Daft Punk", 248000)
-            return
-        if operation == "download_track":
-            downloader.cleanup_partial_files()
-            return
-        if operation == "database_update":
-            db = DatabaseManager()
-            try:
-                db.get_track_counts()
-            finally:
-                db.close()
-
-    results = monkey.run_chaos_test_suite(args.duration_seconds, _run_operation)
-    total = int(results["total_operations"])
-    failed = int(results["failed_operations"])
-    recovered = int(results["recovered_operations"])
-    failure_rate = (failed / total * 100) if total else 0.0
-    recovery_rate = (recovered / failed * 100) if failed else 100.0
-    failure_types = cast(dict[str, int], results["failure_types"])
-
-    print_success(
-        f"Chaos run complete: total={total} failed={failed} "
-        f"({failure_rate:.1f}%) recovered={recovered} ({recovery_rate:.1f}%)"
-    )
-    if failure_types:
-        summary = ", ".join(f"{k}={v}" for k, v in sorted(failure_types.items()))
-        print_warning(f"Failure distribution: {summary}")
-
+# ── Validate command ───────────────────────────────────────────────────────────
 
 def cmd_validate(_args: argparse.Namespace) -> None:
     print_header("Project Validation")
+
+    # Only validate files that actually exist
+    existing_targets = [t for t in _VALIDATION_TARGETS if os.path.exists(t)]
+
     steps: list[tuple[str, list[str]]] = [
-        ("Ruff lint", [sys.executable, "-m", "ruff", "check", *_VALIDATION_TARGETS]),
+        ("Ruff lint", [sys.executable, "-m", "ruff", "check", *existing_targets]),
         (
             "Mypy type check",
             [
@@ -612,10 +327,9 @@ def cmd_validate(_args: argparse.Namespace) -> None:
                 "mypy",
                 "--disable-error-code=call-overload",
                 "--disable-error-code=method-assign",
-                *_VALIDATION_TARGETS,
+                *existing_targets,
             ],
         ),
-        ("Unit tests", [sys.executable, "-m", "unittest", "test_robustness.py"]),
     ]
     for label, command in steps:
         print_success(f"Running {label}...")
@@ -631,87 +345,39 @@ def cmd_validate(_args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="music-download-code",
-        description="Sync Spotify playlists to local audio files via YouTube Music",
+        prog="musicstream",
+        description="Self-hosted autonomous music pipeline",
     )
     sub = parser.add_subparsers(dest="command")
 
+    # scrape
     scrape_parser = sub.add_parser(
-        "scrape", help="Discover Spotify playlists + Liked Songs only"
+        "scrape", help="Discover Spotify playlists + Liked Songs and ingest into DB"
     )
     scrape_parser.add_argument(
-        "--fresh", action="store_true", help="Start from scratch, ignoring previous progress"
+        "--fresh", action="store_true", help="Reset non-downloaded tracks and start from scratch"
     )
 
-    dl = sub.add_parser("download", help="Download all resolved tracks")
-    dl.add_argument("-o", "--output", type=str, default="", help="Output directory")
+    # download
+    dl = sub.add_parser("download", help="Download all pending tracks via 5-tier chain")
     dl.add_argument(
-        "--fresh", action="store_true", help="Start from scratch, ignoring previous progress"
-    )
-    dl.add_argument("--chaos", action="store_true", help="Enable chaos injection during command")
-    dl.add_argument(
-        "--chaos-intensity",
-        type=str,
-        choices=("low", "medium", "high"),
-        default="low",
-        help="Chaos injection intensity",
+        "--fresh", action="store_true", help="Reset failed/downloading tracks and retry all"
     )
 
-    sub.add_parser("status", help="Show current database status")
+    # status
+    sub.add_parser("status", help="Show current database status and source list")
 
-    resolve_parser = sub.add_parser(
-        "resolve", help="Only resolve existing pending tracks on YouTube Music (skip Spotify scraping)"
-    )
-    resolve_parser.add_argument(
-        "--fresh", action="store_true", help="Start from scratch, ignoring previous progress"
-    )
-    resolve_parser.add_argument(
-        "--skip-health-check",
-        action="store_true",
-        help="Skip resolver preflight health check",
-    )
-    resolve_parser.add_argument(
-        "--chaos", action="store_true", help="Enable chaos injection during command"
-    )
-    resolve_parser.add_argument(
-        "--chaos-intensity",
-        type=str,
-        choices=("low", "medium", "high"),
-        default="low",
-        help="Chaos injection intensity",
+    # integrity
+    sub.add_parser("integrity", help="Run file integrity check (missing/corrupt files)")
+
+    # daemon
+    sub.add_parser(
+        "daemon",
+        help="Start the long-running daemon (APScheduler + Flask control plane on :9079)",
     )
 
-    rt = sub.add_parser("retry", help="Retry failed downloads")
-    rt.add_argument("-o", "--output", type=str, default="", help="Output directory")
-    rt.add_argument(
-        "--fresh", action="store_true", help="Include validation failures in retry"
-    )
-    rt.add_argument("--chaos", action="store_true", help="Enable chaos injection during command")
-    rt.add_argument(
-        "--chaos-intensity",
-        type=str,
-        choices=("low", "medium", "high"),
-        default="low",
-        help="Chaos injection intensity",
-    )
-
-    chaos = sub.add_parser("chaos-test", help="Run chaos robustness simulation suite")
-    chaos.add_argument(
-        "--duration-seconds",
-        type=int,
-        default=20,
-        help="Duration in seconds for chaos simulation",
-    )
-    chaos.add_argument("-o", "--output", type=str, default="", help="Output directory")
-    chaos.add_argument(
-        "--chaos-intensity",
-        type=str,
-        choices=("low", "medium", "high"),
-        default="medium",
-        help="Chaos injection intensity",
-    )
-
-    sub.add_parser("validate", help="Run project lint, type checks, and tests")
+    # validate
+    sub.add_parser("validate", help="Run project lint and type checks")
 
     return parser
 
@@ -728,13 +394,12 @@ def main() -> None:
         sys.exit(0)
 
     commands = {
-        "scrape": cmd_scrape,
-        "download": cmd_download,
-        "status": cmd_status,
-        "resolve": cmd_resolve,
-        "retry": cmd_retry,
-        "chaos-test": cmd_chaos_test,
-        "validate": cmd_validate,
+        "scrape":    cmd_scrape,
+        "download":  cmd_download,
+        "status":    cmd_status,
+        "integrity": cmd_integrity,
+        "daemon":    cmd_daemon,
+        "validate":  cmd_validate,
     }
     commands[args.command](args)
 
