@@ -67,7 +67,8 @@ services:
       - ./backups:/app/backups
       - ./.env:/app/.env:ro
       - ./cookies.txt:/app/cookies.txt:ro
-    # Note: cookies.txt must exist on the host (can be empty)
+      - ./spotify_token.json:/app/spotify_token.json
+    # Note: cookies.txt and spotify_token.json must exist on the host
     ports:
       - "9079:9079"
     environment:
@@ -78,6 +79,7 @@ services:
       - PLEX_TOKEN=${PLEX_TOKEN}
       - PLEX_LIBRARY_SECTION_ID=${PLEX_LIBRARY_SECTION_ID}
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
+      - SPOTIFY_TOKEN_CACHE=/app/spotify_token.json
       - LISTENBRAINZ_TOKEN=${LISTENBRAINZ_TOKEN}
       - LISTENBRAINZ_USERNAME=${LISTENBRAINZ_USERNAME}
       - ACOUSTID_API_KEY=${ACOUSTID_API_KEY}

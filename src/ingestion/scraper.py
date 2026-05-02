@@ -16,10 +16,12 @@ PRD §7.3.1 album_artist rule:
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Optional
 
 import spotipy
+from spotipy.cache_handler import CacheFileHandler
 from spotipy.oauth2 import SpotifyPKCE
 from sqlalchemy.orm import Session
 
@@ -57,16 +59,32 @@ class SpotifyScraper:
 
     @property
     def sp(self) -> spotipy.Spotify:
-        """Return (or lazily create) the authenticated spotipy client."""
+        """Return (or lazily create) the authenticated spotipy client.
+
+        Raises RuntimeError if no cached token exists — callers must catch this
+        and skip the sync rather than blocking on an interactive OAuth flow.
+        """
         if self._sp is None:
+            cache_path = os.environ.get("SPOTIFY_TOKEN_CACHE", "/app/spotify_token.json")
+            cache_handler = CacheFileHandler(cache_path=cache_path)
             auth_manager = SpotifyPKCE(
                 client_id=self._client_id,
                 redirect_uri="http://127.0.0.1:8888/callback",
                 scope=_SCOPES,
-                open_browser=True,
+                open_browser=False,
+                cache_handler=cache_handler,
             )
+            # If no valid cached token exists, raise instead of blocking for
+            # manual OAuth input (which hangs forever in a headless container).
+            if auth_manager.validate_token(auth_manager.get_cached_token()) is None:
+                raise RuntimeError(
+                    f"No valid Spotify token at {cache_path}. "
+                    "Run 'python -m src.ingestion.spotify_auth' locally to authenticate, "
+                    "then mount the resulting file into the container via "
+                    "SPOTIFY_TOKEN_CACHE or the default /app/spotify_token.json volume mount."
+                )
             self._sp = spotipy.Spotify(auth_manager=auth_manager)
-            logger.info("Spotify PKCE client initialised.")
+            logger.info("Spotify PKCE client initialised (token from %s).", cache_path)
         return self._sp
 
     # ── Public API ─────────────────────────────────────────────────────────────
