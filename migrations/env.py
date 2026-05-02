@@ -9,12 +9,26 @@ from __future__ import annotations
 
 import os
 from logging.config import fileConfig
+from pathlib import Path
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 # Import Base from models so Alembic can detect schema changes via autogenerate
 from src.models import Base
+
+# ── Load .env if DATABASE_URL is not already in the environment ───────────────
+# This allows `python -m alembic upgrade head` to work without manually
+# exporting environment variables first.
+if "DATABASE_URL" not in os.environ:
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, value = line.partition("=")
+                    os.environ.setdefault(key.strip(), value.strip())
 
 # ── Alembic Config object ─────────────────────────────────────────────────────
 
