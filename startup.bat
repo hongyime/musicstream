@@ -52,22 +52,55 @@ echo   [1] Starting Stack...
 echo ============================================================
 echo.
 docker-compose up -d --build
-if %errorlevel% neq 0 (
+set STACK_ERR=%errorlevel%
+echo.
+echo --- Container status ---
+docker-compose ps
+echo.
+if %STACK_ERR% neq 0 (
+    echo [ERROR] docker-compose up failed. Showing logs for unhealthy containers...
     echo.
-    echo [ERROR] docker-compose up failed. Check the output above.
+    echo --- postgres logs ^(last 20 lines^) ---
+    docker-compose logs --tail=20 postgres
+    echo.
+    echo --- plex logs ^(last 20 lines^) ---
+    docker-compose logs --tail=20 plex
+    echo.
+    echo --- daemon logs ^(last 20 lines^) ---
+    docker-compose logs --tail=20 daemon
+    echo.
+    echo --- scrobbler logs ^(last 20 lines^) ---
+    docker-compose logs --tail=20 scrobbler
 ) else (
+    echo [OK]   Stack started.
     echo.
-    echo [OK]   Stack started. Services:
-    docker-compose ps
+    echo [INFO] Waiting 15 seconds for services to initialise...
+    timeout /t 15 /nobreak >nul
     echo.
-    echo [INFO] Waiting 10 seconds for services to initialise...
-    timeout /t 10 /nobreak >nul
-    echo.
-    echo [INFO] Daemon health check:
+    echo --- Health checks ---
+    echo [INFO] Daemon ^(:9079^):
     curl -sf http://localhost:9079/health 2>nul
     if %errorlevel% neq 0 (
         echo [WARN] Daemon not yet responding on :9079. It may still be starting up.
-        echo        Run option [2] in a moment to check health.
+        echo        Check logs with option [5] or run option [2] in a moment.
+    ) else (
+        echo.
+    )
+    echo.
+    echo [INFO] Plex ^(:32400^):
+    curl -sf http://localhost:32400/health >nul 2>&1
+    if %errorlevel% neq 0 (
+        echo [WARN] Plex not yet responding on :32400. It can take 1-2 minutes on first start.
+    ) else (
+        echo [OK]   Plex is up.
+    )
+    echo.
+    echo [INFO] Scrobbler ^(:9078^):
+    curl -sf http://localhost:9078/health >nul 2>&1
+    if %errorlevel% neq 0 (
+        echo [WARN] Scrobbler not yet responding on :9078.
+    ) else (
+        echo [OK]   Scrobbler is up.
     )
 )
 echo.
