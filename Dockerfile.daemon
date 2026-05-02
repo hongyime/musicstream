@@ -13,4 +13,4 @@ COPY . .
 
 EXPOSE 9079
 
-CMD ["python", "daemon.py"]
+CMD ["python", "src/daemon.py"]
