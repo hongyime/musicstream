@@ -107,6 +107,7 @@ if exist ".env" (
 )
 
 call :read_env SPOTIFY_CLIENT_ID
+call :read_env SPOTIFY_CLIENT_SECRET
 call :read_env LISTENBRAINZ_TOKEN
 call :read_env LISTENBRAINZ_USERNAME
 call :read_env POSTGRES_PASSWORD
@@ -122,6 +123,14 @@ echo   Get from: https://developer.spotify.com/dashboard
 if defined SPOTIFY_CLIENT_ID echo   Current: !SPOTIFY_CLIENT_ID!
 set /p "INPUT=  Enter value (Enter to keep): "
 if not "!INPUT!"=="" set SPOTIFY_CLIENT_ID=!INPUT!
+set INPUT=
+echo.
+
+echo SPOTIFY_CLIENT_SECRET
+echo   Same app as above - Settings tab - needed for spotdl ^(Tier 3^)
+if defined SPOTIFY_CLIENT_SECRET echo   Current: [set]
+set /p "INPUT=  Enter value (Enter to keep): "
+if not "!INPUT!"=="" set SPOTIFY_CLIENT_SECRET=!INPUT!
 set INPUT=
 echo.
 
@@ -206,6 +215,7 @@ if not exist ".env" (
         echo # DO NOT COMMIT THIS FILE
         echo.
         echo SPOTIFY_CLIENT_ID=!SPOTIFY_CLIENT_ID!
+        echo SPOTIFY_CLIENT_SECRET=!SPOTIFY_CLIENT_SECRET!
         echo LISTENBRAINZ_TOKEN=!LISTENBRAINZ_TOKEN!
         echo LISTENBRAINZ_USERNAME=!LISTENBRAINZ_USERNAME!
         echo POSTGRES_PASSWORD=!POSTGRES_PASSWORD!
@@ -224,6 +234,7 @@ if not exist ".env" (
 ) else (
     echo [INFO] .env exists - patching keys only.
     call :patch_env SPOTIFY_CLIENT_ID "!SPOTIFY_CLIENT_ID!"
+    call :patch_env SPOTIFY_CLIENT_SECRET "!SPOTIFY_CLIENT_SECRET!"
     call :patch_env LISTENBRAINZ_TOKEN "!LISTENBRAINZ_TOKEN!"
     call :patch_env LISTENBRAINZ_USERNAME "!LISTENBRAINZ_USERNAME!"
     call :patch_env POSTGRES_PASSWORD "!POSTGRES_PASSWORD!"

@@ -406,6 +406,7 @@ class DownloadOrchestrator:
         """
         Download via spotdl using the Spotify URI. Output: MP3 320kbps to temp/.
         Returns temp file path or None.
+        Requires SPOTIFY_CLIENT_SECRET env var.
         """
         if not SPOTDL_AVAILABLE:
             return None
@@ -414,13 +415,17 @@ class DownloadOrchestrator:
             logger.warning("spotdl circuit breaker open; skipping Tier 3.")
             return None
 
+        client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
+        if not client_secret:
+            logger.warning("SPOTIFY_CLIENT_SECRET not set; skipping Tier 3 spotdl.")
+            return None
+
         try:
             spotdl_client = Spotdl(
                 client_id=os.environ.get("SPOTIFY_CLIENT_ID", ""),
-                client_secret=os.environ.get("SPOTIFY_CLIENT_SECRET", ""),
+                client_secret=client_secret,
             )
 
-            # spotdl downloads to the current directory by default; redirect to temp/
             original_dir = os.getcwd()
             os.chdir(TEMP_DIR)
             try:
@@ -435,7 +440,6 @@ class DownloadOrchestrator:
 
             if paths:
                 downloaded_path = paths[0] if isinstance(paths[0], str) else str(paths[0])
-                # Ensure the path is absolute / relative to TEMP_DIR
                 if not os.path.isabs(downloaded_path):
                     downloaded_path = os.path.join(TEMP_DIR, downloaded_path)
                 if os.path.exists(downloaded_path) and os.path.getsize(downloaded_path) > 0:

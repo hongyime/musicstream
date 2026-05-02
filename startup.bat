@@ -137,7 +137,7 @@ if %errorlevel% neq 0 (
 echo.
 
 echo --- Plex ^(localhost:32400^) ---
-curl -s -o nul -w "HTTP %%{http_code}" http://localhost:32400/health 2>nul
+curl -s -o nul -w "HTTP %%{http_code}" http://localhost:32400/identity 2>nul
 if %errorlevel% neq 0 (
     echo [DOWN] Plex not responding on :32400
     echo        Logs:
