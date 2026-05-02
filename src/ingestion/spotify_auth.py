@@ -22,6 +22,7 @@ try:
     load_dotenv(Path(__file__).parent.parent.parent / ".env")
 except ImportError:
     pass
+from spotipy.cache_handler import CacheFileHandler
 from spotipy.oauth2 import SpotifyPKCE
 
 _SCOPES = (

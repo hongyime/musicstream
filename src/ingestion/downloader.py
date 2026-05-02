@@ -283,15 +283,33 @@ class DownloadOrchestrator:
                 # Find the downloaded file
                 for root, _, files in os.walk(service_dir):
                     for fname in files:
-                        if fname.endswith((".flac", ".m4a", ".mp3")):
+                        if fname.endswith((".flac", ".m4a", ".mp3", ".ogg", ".opus")):
                             found = os.path.join(root, fname)
                             if os.path.getsize(found) > 0:
-                                # Rename to encode service for _resolve_method_label
-                                ext = os.path.splitext(fname)[1]
-                                labeled = os.path.join(out_dir, f"{uuid.uuid4().hex}_{service}{ext}")
-                                os.rename(found, labeled)
-                                self._rate_limiter.record_success("spotiflac")
-                                return labeled
+                                # Convert to MP3 320 via FFmpeg
+                                mp3_path = os.path.join(out_dir, f"{uuid.uuid4().hex}_{service}.mp3")
+                                try:
+                                    import subprocess
+                                    subprocess.run(
+                                        [
+                                            "ffmpeg", "-y", "-i", found,
+                                            "-codec:a", "libmp3lame", "-b:a", "320k",
+                                            "-q:a", "0", mp3_path,
+                                        ],
+                                        check=True,
+                                        capture_output=True,
+                                    )
+                                    if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+                                        os.remove(found)
+                                        self._rate_limiter.record_success("spotiflac")
+                                        return mp3_path
+                                except Exception as conv_exc:
+                                    logger.warning("FFmpeg conversion failed for SpotiFLAC output: %s", conv_exc)
+                                    # Fall back to returning original file if conversion fails
+                                    labeled = os.path.join(out_dir, f"{uuid.uuid4().hex}_{service}{os.path.splitext(fname)[1]}")
+                                    os.rename(found, labeled)
+                                    self._rate_limiter.record_success("spotiflac")
+                                    return labeled
             except Exception as exc:
                 logger.debug("SpotiFLAC service=%s failed for track %d: %s", service, track.id, exc)
                 continue
