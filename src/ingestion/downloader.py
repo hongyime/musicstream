@@ -25,7 +25,7 @@ import yt_dlp  # type: ignore[import-untyped]
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from src.exceptions import DownloadError, SpotiFLACError
+from src.exceptions import DownloadError, OrganiserError, SpotiFLACError, TaggingError
 from src.models import DownloadAttempt, Track, TrackStatus
 from src.rate_limiter import ServiceRateLimiter
 
@@ -35,11 +35,17 @@ errors_logger = logging.getLogger("errors")
 # ── SpotiFLAC optional import ──────────────────────────────────────────────────
 
 try:
-    from SpotiFLAC import SpotiFLAC as _SpotiFLAC
+    # Package installs as 'spotiflac' (lowercase) — on Linux the filesystem is
+    # case-sensitive, so 'from SpotiFLAC import ...' raises ImportError in Docker.
+    from spotiflac import SpotiFLAC as _SpotiFLAC
     SPOTIFLAC_AVAILABLE = True
 except ImportError:
-    SPOTIFLAC_AVAILABLE = False
-    logger.warning("SpotiFLAC not available; Tier 1 will be skipped")
+    try:
+        from SpotiFLAC import SpotiFLAC as _SpotiFLAC  # fallback for unusual installs
+        SPOTIFLAC_AVAILABLE = True
+    except ImportError:
+        SPOTIFLAC_AVAILABLE = False
+        logger.warning("SpotiFLAC not available (ImportError); Tier 1 will be skipped for all tracks")
 
 # ── ytmusicapi optional import ─────────────────────────────────────────────────
 
@@ -82,8 +88,35 @@ class DownloadOrchestrator:
     MAX_CONCURRENT = 4
 
     def __init__(self) -> None:
-        self._rate_limiter = ServiceRateLimiter()
+        # Threshold=20 because 4 concurrent workers each failing the same tier
+        # simultaneously would trip a threshold=5 breaker in one batch pass,
+        # blocking the remaining tracks for the rest of the run.
+        # Cooldown=300s so a tripped breaker recovers within the same batch run
+        # rather than the default 30 minutes.
+        self._rate_limiter = ServiceRateLimiter(
+            circuit_breaker_threshold=20,
+            circuit_breaker_cooldown=300,
+        )
         os.makedirs(TEMP_DIR, exist_ok=True)
+
+        # Lazy-init tagger and organiser from env vars.
+        # Imported here to avoid circular imports at module level.
+        from src.ingestion.tagger import MetadataTagger
+        from src.ingestion.organiser import FileOrganiser
+
+        self._tagger = MetadataTagger(
+            acoustid_api_key=os.environ.get("ACOUSTID_API_KEY", ""),
+        )
+        media_drive = os.environ.get("EXTERNAL_MEDIA_DRIVE", "/media")
+        plex_url = os.environ.get("PLEX_URL", "http://localhost:32400")
+        plex_token = os.environ.get("PLEX_TOKEN", "")
+        plex_section_id = os.environ.get("PLEX_LIBRARY_SECTION_ID", "")
+        self._organiser = FileOrganiser(
+            media_drive=media_drive,
+            plex_url=plex_url,
+            plex_token=plex_token,
+            plex_section_id=plex_section_id,
+        )
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -186,20 +219,47 @@ class DownloadOrchestrator:
                     self._record_attempt(
                         session, track.id, method_name, error=None, success=True
                     )
-                    # Determine the canonical download_method label
                     download_method = self._resolve_method_label(method_name, path)
                     track.download_method = download_method
-                    track.status = TrackStatus.DOWNLOADED.value
                     session.flush()
-                    logger.info(
-                        "Downloaded track id=%d via %s: %s",
-                        track.id,
-                        download_method,
-                        path,
-                    )
-                    return True
+
+                    # ── Tag the file (non-fatal: bad tags ≠ bad download) ──────
+                    try:
+                        self._tagger.tag_file(path, track, session)
+                    except TaggingError as tag_exc:
+                        logger.warning(
+                            "Tagging failed for track %d ('%s'): %s — proceeding without full tags",
+                            track.id, track.title, tag_exc,
+                        )
+                    except Exception as tag_exc:
+                        logger.warning(
+                            "Unexpected tagging error for track %d: %s",
+                            track.id, tag_exc,
+                        )
+
+                    # ── Move file into Plex library (fatal: no file = no point) ─
+                    try:
+                        final_path = self._organiser.organise(path, track, session)
+                        logger.info(
+                            "Track %d ('%s') delivered via %s → %s",
+                            track.id, track.title, download_method, final_path,
+                        )
+                        return True
+                    except OrganiserError as org_exc:
+                        logger.error(
+                            "Organiser failed for track %d ('%s'): %s",
+                            track.id, track.title, org_exc,
+                        )
+                        track.status = TrackStatus.FAILED_VALIDATION.value
+                        session.flush()
+                        return False
+
                 else:
-                    # Tier returned None without raising — treat as soft failure
+                    # Tier returned None without raising — soft failure, try next tier
+                    logger.info(
+                        "Tier %s → no result for track %d ('%s'); trying next tier",
+                        method_name, track.id, track.title,
+                    )
                     self._record_attempt(
                         session,
                         track.id,
@@ -255,13 +315,15 @@ class DownloadOrchestrator:
         Returns the path to the downloaded file, or None on failure.
         """
         if not SPOTIFLAC_AVAILABLE:
+            logger.warning("Tier 1 skipped for track %d ('%s'): SpotiFLAC not installed", track.id, track.title)
             return None
 
         if not self._rate_limiter.is_healthy("spotiflac"):
-            logger.warning("SpotiFLAC circuit breaker open; skipping Tier 1.")
+            logger.warning("SpotiFLAC circuit breaker open; skipping Tier 1 for track %d", track.id)
             return None
 
         if not track.spotify_id:
+            logger.warning("Tier 1 skipped for track %d ('%s'): no spotify_id", track.id, track.title)
             return None
 
         spotify_url = f"https://open.spotify.com/track/{track.spotify_id}"
@@ -280,40 +342,28 @@ class DownloadOrchestrator:
                     quality="LOSSLESS",
                     log_level=logging.WARNING,
                 )
-                # Find the downloaded file
+                # Return the original file as-is — no transcode.
+                # SpotiFLAC provides OGG/FLAC/M4A; transcoding to MP3 here
+                # would be a lossy-to-lossy downgrade with no benefit.
                 for root, _, files in os.walk(service_dir):
                     for fname in files:
                         if fname.endswith((".flac", ".m4a", ".mp3", ".ogg", ".opus")):
                             found = os.path.join(root, fname)
                             if os.path.getsize(found) > 0:
-                                # Convert to MP3 320 via FFmpeg
-                                mp3_path = os.path.join(out_dir, f"{uuid.uuid4().hex}_{service}.mp3")
-                                try:
-                                    import subprocess
-                                    subprocess.run(
-                                        [
-                                            "ffmpeg", "-y", "-i", found,
-                                            "-codec:a", "libmp3lame", "-b:a", "320k",
-                                            "-q:a", "0", mp3_path,
-                                        ],
-                                        check=True,
-                                        capture_output=True,
-                                    )
-                                    if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
-                                        os.remove(found)
-                                        self._rate_limiter.record_success("spotiflac")
-                                        return mp3_path
-                                except Exception as conv_exc:
-                                    logger.warning("FFmpeg conversion failed for SpotiFLAC output: %s", conv_exc)
-                                    # Fall back to returning original file if conversion fails
-                                    labeled = os.path.join(out_dir, f"{uuid.uuid4().hex}_{service}{os.path.splitext(fname)[1]}")
-                                    os.rename(found, labeled)
-                                    self._rate_limiter.record_success("spotiflac")
-                                    return labeled
+                                ext = os.path.splitext(fname)[1]
+                                dest = os.path.join(out_dir, f"{uuid.uuid4().hex}_{service}{ext}")
+                                os.rename(found, dest)
+                                self._rate_limiter.record_success("spotiflac")
+                                logger.info(
+                                    "SpotiFLAC: downloaded track %d via %s → %s",
+                                    track.id, service, os.path.basename(dest),
+                                )
+                                return dest
             except Exception as exc:
-                logger.debug("SpotiFLAC service=%s failed for track %d: %s", service, track.id, exc)
+                logger.warning("SpotiFLAC service=%s failed for track %d ('%s'): %s", service, track.id, track.title, exc)
                 continue
 
+        logger.warning("SpotiFLAC: all services exhausted for track %d ('%s'); Tier 1 failed", track.id, track.title)
         self._rate_limiter.record_failure("spotiflac")
         return None
 
@@ -396,7 +446,8 @@ class DownloadOrchestrator:
                         delta,
                     )
                     os.remove(downloaded)
-                    self._rate_limiter.record_failure("youtube")
+                    # Wrong video is a content-matching failure, not a YouTube
+                    # service failure — do NOT count toward the circuit breaker.
                     return None
 
             self._rate_limiter.record_success("youtube")
@@ -426,33 +477,35 @@ class DownloadOrchestrator:
             logger.warning("SPOTIFY_CLIENT_SECRET not set; skipping Tier 3 spotdl.")
             return None
 
+        abs_temp = os.path.abspath(TEMP_DIR)
         try:
-            spotdl_client = Spotdl(
-                client_id=os.environ.get("SPOTIFY_CLIENT_ID", ""),
-                client_secret=client_secret,
+            # Use the spotdl CLI via subprocess with explicit --output to avoid
+            # os.chdir() which is not thread-safe under concurrent workers.
+            import subprocess as _sp
+            result = _sp.run(
+                [
+                    "spotdl",
+                    "--output", abs_temp,
+                    "--client-id", os.environ.get("SPOTIFY_CLIENT_ID", ""),
+                    "--client-secret", client_secret,
+                    track.spotify_uri,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=180,
             )
+            if result.returncode != 0:
+                logger.warning("spotdl exited %d for track %d: %s", result.returncode, track.id, result.stderr[:300])
+                self._rate_limiter.record_failure("spotdl")
+                return None
 
-            original_dir = os.getcwd()
-            abs_temp = os.path.abspath(TEMP_DIR)
-            os.chdir(abs_temp)
-            try:
-                songs, _ = spotdl_client.search([track.spotify_uri])
-                if not songs:
-                    self._rate_limiter.record_failure("spotdl")
-                    return None
-
-                paths = spotdl_client.download_songs(songs)
-            finally:
-                os.chdir(original_dir)
-
-            if paths:
-                downloaded_path = paths[0] if isinstance(paths[0], str) else str(paths[0])
-                if not os.path.isabs(downloaded_path):
-                    downloaded_path = os.path.join(abs_temp, downloaded_path)
-                downloaded_path = os.path.normpath(downloaded_path)
-                if os.path.exists(downloaded_path) and os.path.getsize(downloaded_path) > 0:
-                    self._rate_limiter.record_success("spotdl")
-                    return downloaded_path
+            # Find the file spotdl created (any audio file newer than process start)
+            for fname in os.listdir(abs_temp):
+                if fname.endswith((".mp3", ".flac", ".ogg", ".m4a", ".opus")):
+                    candidate = os.path.join(abs_temp, fname)
+                    if os.path.getsize(candidate) > 0:
+                        self._rate_limiter.record_success("spotdl")
+                        return candidate
 
             self._rate_limiter.record_failure("spotdl")
             return None

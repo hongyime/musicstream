@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request as flask_request
 
 # ── Module-level singletons ───────────────────────────────────────────────────
 
@@ -334,10 +334,28 @@ def db_backup() -> Optional[str]:
         logger.error("DATABASE_URL not set; cannot run pg_dump")
         return None
 
+    # Parse DATABASE_URL to avoid passing password on the CLI (visible in ps/logs).
+    import urllib.parse as _urlparse
+    _u = _urlparse.urlparse(database_url)
+    _pg_env = {
+        **os.environ,
+        "PGPASSWORD": _u.password or "",
+    }
+    _pg_cmd = [
+        "pg_dump",
+        "-h", _u.hostname or "localhost",
+        "-p", str(_u.port or 5432),
+        "-U", _u.username or "musicstream",
+        "-d", _u.path.lstrip("/"),
+        "--no-password",
+        "--file", str(backup_path),
+    ]
+
     logger.info("Running pg_dump → %s", backup_path)
     try:
         result = subprocess.run(
-            ["pg_dump", database_url, "--file", str(backup_path)],
+            _pg_cmd,
+            env=_pg_env,
             capture_output=True,
             text=True,
             timeout=300,
@@ -461,10 +479,8 @@ def _record_run_complete(
 
 def startup_sequence() -> None:
     """
-    Full daemon startup sequence:
-      1. Connect PostgreSQL (retry 5x, 5s backoff)
-      2. alembic upgrade head
-      3. Print startup banner (PRD §13.3)
+    Post-DB startup sequence (DB connect + migrations already done in __main__):
+      3. Print startup banner
       4. integrity_check()
       5. spotify_incremental_sync()
       6. download_pipeline()
@@ -475,25 +491,6 @@ def startup_sequence() -> None:
     logger.info("=" * 60)
     logger.info("MUSICSTREAM DAEMON v3.0 — starting up")
     logger.info("=" * 60)
-
-    # ── Step 1: Connect to PostgreSQL ─────────────────────────────────────────
-    logger.info("Step 1/9: Connecting to PostgreSQL…")
-    try:
-        from src.db import init_db, run_migrations, wait_for_db
-        engine = wait_for_db(max_retries=5, backoff_s=5.0)
-        init_db()
-        logger.info("PostgreSQL connection established.")
-    except Exception as exc:
-        logger.critical("Cannot connect to PostgreSQL: %s — aborting startup", exc)
-        raise
-
-    # ── Step 2: Alembic upgrade head ──────────────────────────────────────────
-    logger.info("Step 2/9: Running Alembic migrations…")
-    try:
-        run_migrations()
-    except Exception as exc:
-        logger.critical("Alembic migration failed: %s — aborting startup", exc)
-        raise
 
     # ── Step 3: Startup banner ────────────────────────────────────────────────
     logger.info("Step 3/9: Printing startup banner…")
@@ -599,6 +596,25 @@ def _register_scheduler_jobs() -> None:
 
 # ── Flask HTTP control plane ──────────────────────────────────────────────────
 
+_DAEMON_TOKEN: Optional[str] = os.environ.get("DAEMON_API_TOKEN") or None
+
+
+def _check_auth() -> Optional[tuple]:
+    """
+    Return a 401 response tuple if DAEMON_API_TOKEN is set and the request
+    doesn't supply a matching token. Returns None when auth passes.
+    """
+    if _DAEMON_TOKEN is None:
+        return None  # no token configured — open access (default)
+    provided = (
+        flask_request.headers.get("X-Daemon-Token")
+        or (flask_request.headers.get("Authorization", "").removeprefix("Bearer ").strip() or None)
+    )
+    if provided != _DAEMON_TOKEN:
+        return jsonify({"error": "Unauthorized"}), 401
+    return None
+
+
 @app.get("/health")
 def health():
     """
@@ -649,6 +665,15 @@ def status():
         return jsonify({"error": str(exc)}), 500
 
 
+def _dispatch(fn, job_id: str) -> None:
+    """Run *fn* via scheduler if running, otherwise in a daemon thread."""
+    import threading
+    if scheduler.running:
+        scheduler.add_job(fn, id=job_id, replace_existing=True)
+    else:
+        threading.Thread(target=fn, name=job_id, daemon=True).start()
+
+
 @app.post("/sync")
 def sync():
     """
@@ -656,13 +681,11 @@ def sync():
     Triggers the full pipeline (Spotify sync + download) immediately.
     Returns 202 Accepted with {"queued": true}.
     """
+    if (auth_err := _check_auth()) is not None:
+        return auth_err
     try:
-        scheduler.add_job(
-            _run_full_pipeline,
-            id="manual_sync",
-            replace_existing=True,
-        )
-        logger.info("Manual sync queued via /sync")
+        _dispatch(_run_full_pipeline, "manual_sync")
+        logger.info("Manual sync dispatched via /sync")
         return jsonify({"queued": True}), 202
     except Exception as exc:
         logger.error("/sync endpoint error: %s", exc)
@@ -676,13 +699,11 @@ def integrity():
     Triggers an integrity check immediately.
     Returns 202 Accepted with {"queued": true}.
     """
+    if (auth_err := _check_auth()) is not None:
+        return auth_err
     try:
-        scheduler.add_job(
-            integrity_check,
-            id="manual_integrity",
-            replace_existing=True,
-        )
-        logger.info("Manual integrity check queued via /integrity")
+        _dispatch(integrity_check, "manual_integrity")
+        logger.info("Manual integrity check dispatched via /integrity")
         return jsonify({"queued": True}), 202
     except Exception as exc:
         logger.error("/integrity endpoint error: %s", exc)
@@ -696,13 +717,11 @@ def discover():
     Triggers ListenBrainz discovery immediately.
     Returns 202 Accepted with {"queued": true}.
     """
+    if (auth_err := _check_auth()) is not None:
+        return auth_err
     try:
-        scheduler.add_job(
-            listenbrainz_discovery,
-            id="manual_discover",
-            replace_existing=True,
-        )
-        logger.info("Manual LB discovery queued via /discover")
+        _dispatch(listenbrainz_discovery, "manual_discover")
+        logger.info("Manual LB discovery dispatched via /discover")
         return jsonify({"queued": True}), 202
     except Exception as exc:
         logger.error("/discover endpoint error: %s", exc)
@@ -772,6 +791,8 @@ def backup():
     Runs pg_dump immediately.
     Returns {"path": "...", "size_bytes": N} on success, or 500 on failure.
     """
+    if (auth_err := _check_auth()) is not None:
+        return auth_err
     try:
         path = db_backup()
         if path is None:
@@ -799,13 +820,23 @@ def _run_full_pipeline() -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import signal
     import threading
+
+    # ── SIGTERM handler — allows Docker `stop` to shut down cleanly ───────────
+    def _handle_sigterm(signum, frame):  # type: ignore[misc]
+        logger.info("SIGTERM received — shutting down scheduler and exiting")
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     # ── Steps 1 & 2: DB + migrations — must succeed before Flask starts ───────
     try:
         from src.db import init_db, run_migrations, wait_for_db
-        wait_for_db(max_retries=5, backoff_s=5.0)
-        init_db()
+        _db_engine = wait_for_db(max_retries=5, backoff_s=5.0)
+        init_db(engine=_db_engine)   # reuse engine, avoid second pool
         run_migrations()
         logger.info("DB ready. Starting Flask…")
     except Exception as exc:

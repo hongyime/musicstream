@@ -25,7 +25,6 @@ Rules:
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import re
@@ -38,6 +37,7 @@ from sqlalchemy.orm import Session
 
 from src.exceptions import OrganiserError
 from src.models import Track, TrackStatus
+from src.utils import compute_sha256
 
 logger = logging.getLogger(__name__)
 
@@ -219,35 +219,11 @@ class FileOrganiser:
     # ── SHA-256 ────────────────────────────────────────────────────────────────
 
     def _compute_sha256(self, path: str) -> str:
-        """
-        Compute the SHA-256 hex digest of the file at *path*.
-
-        Reads the file in 64 KiB chunks to avoid loading large audio files
-        entirely into memory.
-
-        Parameters
-        ----------
-        path:
-            Absolute path to the file.
-
-        Returns
-        -------
-        str
-            Lowercase hex-encoded SHA-256 digest.
-
-        Raises
-        ------
-        OrganiserError
-            If the file cannot be read.
-        """
-        h = hashlib.sha256()
+        """Delegate to shared utility; wrap OSError as OrganiserError."""
         try:
-            with open(path, "rb") as fh:
-                for chunk in iter(lambda: fh.read(65536), b""):
-                    h.update(chunk)
+            return compute_sha256(path)
         except OSError as exc:
             raise OrganiserError(f"Cannot read file for SHA-256: {path!r}: {exc}") from exc
-        return h.hexdigest()
 
     # ── Plex refresh ───────────────────────────────────────────────────────────
 
@@ -266,9 +242,9 @@ class FileOrganiser:
         url = (
             f"{self._plex_url}/library/sections/{self._plex_section_id}/refresh"
         )
-        params = {"X-Plex-Token": self._plex_token}
+        headers = {"X-Plex-Token": self._plex_token}
         try:
-            resp = requests.post(url, params=params, timeout=10)
+            resp = requests.post(url, headers=headers, timeout=10)
             if resp.ok:
                 logger.info(
                     "Plex library section %s refresh triggered (HTTP %s).",

@@ -301,10 +301,21 @@ def cmd_integrity(_args: argparse.Namespace) -> None:
 
 def cmd_daemon(_args: argparse.Namespace) -> None:
     """Start the musicstream daemon (APScheduler + Flask control plane)."""
+    import threading
     print_header("Daemon")
     try:
+        from src.db import init_db, run_migrations, wait_for_db
+        _engine = wait_for_db(max_retries=5, backoff_s=5.0)
+        init_db(engine=_engine)
+        run_migrations()
+    except Exception:
+        logger.exception("DB init failed")
+        print_error("Database unavailable. Check DATABASE_URL.")
+        sys.exit(1)
+    try:
         from src import daemon as daemon_module
-        daemon_module.startup_sequence()
+        t = threading.Thread(target=daemon_module.startup_sequence, daemon=True)
+        t.start()
         daemon_module.app.run(host="0.0.0.0", port=9079, threaded=True)
     except Exception:
         logger.exception("Daemon failed to start")
