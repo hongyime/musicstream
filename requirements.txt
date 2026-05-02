@@ -6,9 +6,11 @@ psycopg2-binary==2.9.10
 python-dotenv==1.2.2
 
 # Download pipeline
-yt-dlp[default]==2026.2.21
+# yt-dlp and spotdl are unpinned — spotdl has tight yt-dlp constraints
+# that vary by version; let pip resolve a compatible set.
+yt-dlp[default]
 ytmusicapi==1.11.5
-spotdl==4.2.10
+spotdl
 
 # Metadata & tagging
 mutagen==1.47.0
@@ -18,13 +20,13 @@ pyacoustid==1.3.0
 requests==2.33.1
 
 # Daemon
-Flask==3.1.3
+Flask==3.1.1
 APScheduler==3.11.0
 
-# UI
-rich>=13.9.4,<14.0.0
+# UI — version constrained by spotdl
+rich
 
 # Dev tools
 ruff==0.15.12
 mypy==1.20.2
-pytest==9.0.3
+pytest==8.3.5
