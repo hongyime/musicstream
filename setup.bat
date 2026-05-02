@@ -282,7 +282,9 @@ if !TOKEN_SIZE! gtr 10 (
     echo        Log in and click Allow - the token will be saved automatically.
     echo        This is a one-time step. The daemon reuses the token forever.
     echo.
-    python -c "import os; os.environ['SPOTIFY_CLIENT_ID']='!SPOTIFY_CLIENT_ID!'; os.environ['SPOTIFY_TOKEN_CACHE']='./spotify_token.json'; from src.ingestion.scraper import SpotifyScraper; s=SpotifyScraper('!SPOTIFY_CLIENT_ID!'); name=s.sp.current_user().get('display_name','unknown'); print('[OK]   Spotify authenticated as: ' + name)"
+    set SPOTIFY_CLIENT_ID=!SPOTIFY_CLIENT_ID!
+    set SPOTIFY_TOKEN_CACHE=./spotify_token.json
+    python -m src.ingestion.spotify_auth
     if !errorlevel! neq 0 (
         echo [ERROR] Spotify authentication failed.
         echo         Check your SPOTIFY_CLIENT_ID and ensure the redirect URI
