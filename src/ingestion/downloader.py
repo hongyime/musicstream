@@ -35,7 +35,7 @@ errors_logger = logging.getLogger("errors")
 # ── SpotiFLAC optional import ──────────────────────────────────────────────────
 
 try:
-    import spotiflac  # type: ignore[import-untyped]
+    from SpotiFLAC import SpotiFLAC as _SpotiFLAC
     SPOTIFLAC_AVAILABLE = True
 except ImportError:
     SPOTIFLAC_AVAILABLE = False
@@ -62,10 +62,8 @@ except ImportError:
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 TEMP_DIR: str = os.environ.get("TEMP_DIR", "temp")
-_SPOTIFLAC_SERVICES = ["qobuz", "tidal", "amazon", "deezer", "youtube"]
-_SPOTIFLAC_TIMEOUT = 120  # seconds
 _DURATION_TOLERANCE_S = 5  # ±5 seconds for duration validation
-_GIVE_UP_THRESHOLD = 9     # ≥9 failed attempts → mark as failed
+_GIVE_UP_THRESHOLD = 25    # ~5 complete tier-chain runs before giving up
 
 
 def _utcnow() -> datetime:
@@ -252,9 +250,9 @@ class DownloadOrchestrator:
 
     def _tier1_spotiflac(self, track: Track) -> Optional[str]:
         """
-        Attempt download via SpotiFLAC with services=['qobuz','tidal','amazon','deezer','youtube'].
-        Returns temp file path (FLAC) or None. Timeout: 120s.
-        Gracefully skipped if SpotiFLAC is not installed.
+        Attempt FLAC download via SpotiFLAC.
+        Tries services in order: tidal, qobuz, amazon, deezer, youtube.
+        Returns the path to the downloaded FLAC file, or None on failure.
         """
         if not SPOTIFLAC_AVAILABLE:
             return None
@@ -263,50 +261,32 @@ class DownloadOrchestrator:
             logger.warning("SpotiFLAC circuit breaker open; skipping Tier 1.")
             return None
 
-        out_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}.flac")
+        # SpotiFLAC needs a Spotify track URL, not a URI
+        spotify_url = f"https://open.spotify.com/track/{track.spotify_id}"
+        out_dir = os.path.join(TEMP_DIR, f"spotiflac_{uuid.uuid4().hex}")
+        os.makedirs(out_dir, exist_ok=True)
 
         try:
-            import signal
+            _SpotiFLAC(
+                url=spotify_url,
+                output_dir=out_dir,
+                services=["tidal", "qobuz", "amazon", "deezer", "youtube"],
+                quality="LOSSLESS",
+                log_level=logging.WARNING,
+            )
 
-            def _timeout_handler(signum, frame):
-                raise TimeoutError(f"SpotiFLAC timed out after {_SPOTIFLAC_TIMEOUT}s")
+            # Find the downloaded file
+            for root, _, files in os.walk(out_dir):
+                for fname in files:
+                    if fname.endswith((".flac", ".m4a", ".mp3")):
+                        found = os.path.join(root, fname)
+                        if os.path.getsize(found) > 0:
+                            self._rate_limiter.record_success("spotiflac")
+                            return found
 
-            # Use signal-based timeout on Unix; on Windows fall back to thread approach
-            use_signal = hasattr(signal, "SIGALRM")
-
-            if use_signal:
-                old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-                signal.alarm(_SPOTIFLAC_TIMEOUT)
-
-            try:
-                result = spotiflac.download(
-                    track.spotify_uri,
-                    services=_SPOTIFLAC_SERVICES,
-                    output=out_path,
-                )
-            finally:
-                if use_signal:
-                    signal.alarm(0)
-                    signal.signal(signal.SIGALRM, old_handler)
-
-            if result and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                self._rate_limiter.record_success("spotiflac")
-                # Determine which service succeeded for the method label
-                service_used = getattr(result, "service", None) or "unknown"
-                # Store service on the path so _resolve_method_label can use it
-                # We encode it in the filename convention: {uuid}_{service}.flac
-                labeled_path = os.path.join(
-                    TEMP_DIR, f"{uuid.uuid4()}_{service_used}.flac"
-                )
-                os.rename(out_path, labeled_path)
-                return labeled_path
-            else:
-                self._rate_limiter.record_failure("spotiflac")
-                return None
-
-        except TimeoutError as exc:
             self._rate_limiter.record_failure("spotiflac")
-            raise SpotiFLACError(f"SpotiFLAC timeout: {exc}") from exc
+            return None
+
         except Exception as exc:
             self._rate_limiter.record_failure("spotiflac")
             raise SpotiFLACError(f"SpotiFLAC error: {exc}") from exc

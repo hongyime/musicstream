@@ -8,6 +8,7 @@ python-dotenv==1.2.2
 # Download pipeline
 # yt-dlp and spotdl are unpinned — spotdl has tight yt-dlp constraints
 # that vary by version; let pip resolve a compatible set.
+spotiflac==0.2.6
 yt-dlp[default]
 ytmusicapi==1.11.5
 spotdl

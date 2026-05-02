@@ -21,12 +21,13 @@ echo   [4] Force Integrity     POST http://localhost:9079/integrity
 echo   [5] View Daemon Logs    docker-compose logs --tail=200 --follow daemon
 echo   [6] Backup Database     POST http://localhost:9079/backup
 echo   [7] Stop Stack          docker-compose down
-echo   [8] Exit
+echo   [8] Reset Failed Tracks back to pending
+echo   [9] Exit
 echo.
 echo ============================================================
 echo.
 
-set /p "CHOICE=  Select option [1-8]: "
+set /p "CHOICE=  Select option [1-9]: "
 
 if "%CHOICE%"=="1" goto :opt1
 if "%CHOICE%"=="2" goto :opt2
@@ -36,9 +37,10 @@ if "%CHOICE%"=="5" goto :opt5
 if "%CHOICE%"=="6" goto :opt6
 if "%CHOICE%"=="7" goto :opt7
 if "%CHOICE%"=="8" goto :opt8
+if "%CHOICE%"=="9" goto :opt9
 
 echo.
-echo [WARN] Invalid option. Please enter a number between 1 and 8.
+echo [WARN] Invalid option. Please enter a number between 1 and 9.
 timeout /t 2 /nobreak >nul
 goto :menu
 
@@ -272,9 +274,35 @@ pause
 goto :menu
 
 :: ============================================================
-:: [8] Exit
+:: [8] Reset Failed Tracks to Pending
 :: ============================================================
 :opt8
+echo.
+echo ============================================================
+echo   [8] Reset Failed Tracks to Pending
+echo ============================================================
+echo.
+echo [INFO] Resetting all failed tracks to pending and clearing bad attempt history...
+docker exec musicstream-postgres psql -U musicstream -d musicstream -c "UPDATE tracks SET status='pending' WHERE status='failed';" 2>nul
+if %errorlevel% neq 0 (
+    echo [ERROR] Could not connect to postgres. Is the stack running?
+    goto :reset_done
+)
+docker exec musicstream-postgres psql -U musicstream -d musicstream -c "DELETE FROM download_attempts;" 2>nul
+echo.
+echo [INFO] Track counts after reset:
+docker exec musicstream-postgres psql -U musicstream -d musicstream -c "SELECT status, COUNT(*) FROM tracks GROUP BY status ORDER BY status;" 2>nul
+echo.
+echo [OK]   Done. Run option [3] Force Full Sync to retry downloads.
+:reset_done
+echo.
+pause
+goto :menu
+
+:: ============================================================
+:: [9] Exit
+:: ============================================================
+:opt9
 echo.
 echo Goodbye.
 echo.
