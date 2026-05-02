@@ -799,11 +799,30 @@ def _run_full_pipeline() -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import threading
+
+    # ── Step 1 & 2: DB + migrations must succeed before anything else ─────────
     try:
-        startup_sequence()
+        from src.db import init_db, run_migrations, wait_for_db
+        wait_for_db(max_retries=5, backoff_s=5.0)
+        init_db()
+        run_migrations()
     except Exception as exc:
-        logger.critical("Startup sequence failed: %s", exc, exc_info=True)
+        logger.critical("DB init/migration failed: %s — aborting", exc, exc_info=True)
         raise SystemExit(1) from exc
 
+    # ── Start Flask immediately so health checks pass ─────────────────────────
+    # Steps 3-9 (banner, integrity, Spotify sync, downloads, LB, backup,
+    # scheduler) run in a background thread so the HTTP server is never blocked.
+    def _background_startup() -> None:
+        try:
+            startup_sequence()
+        except Exception as exc:
+            logger.critical("Startup sequence failed: %s", exc, exc_info=True)
+
+    t = threading.Thread(target=_background_startup, name="startup", daemon=True)
+    t.start()
+
     # Run Flask on port 9079 (threaded for concurrent requests)
+    logger.info("Flask starting on 0.0.0.0:9079")
     app.run(host="0.0.0.0", port=9079, threaded=True)
