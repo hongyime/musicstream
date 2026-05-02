@@ -116,18 +116,52 @@ echo ============================================================
 echo   [2] View Health
 echo ============================================================
 echo.
-echo --- docker-compose ps ---
+
+echo --- Container status ---
 docker-compose ps
 echo.
-echo --- GET http://localhost:9079/health ---
-curl -sf http://localhost:9079/health 2>nul
+
+echo --- Port bindings ---
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>nul
+echo.
+
+echo --- Daemon ^(localhost:9079^) ---
+curl -s http://localhost:9079/health 2>nul
 if %errorlevel% neq 0 (
-    echo [WARN] Daemon not responding on :9079.
-    echo        Is the stack running? Use option [1] to start it.
+    echo [DOWN] Daemon not responding on :9079
+    echo        Logs:
+    docker-compose logs --tail=10 daemon 2>nul
+) else (
+    echo.
 )
 echo.
-echo --- GET http://localhost:9079/status (last 5 runs) ---
-curl -sf http://localhost:9079/status 2>nul
+
+echo --- Plex ^(localhost:32400^) ---
+curl -s -o nul -w "HTTP %%{http_code}" http://localhost:32400/health 2>nul
+if %errorlevel% neq 0 (
+    echo [DOWN] Plex not responding on :32400
+    echo        Logs:
+    docker-compose logs --tail=10 plex 2>nul
+) else (
+    echo.
+)
+echo.
+
+echo --- Scrobbler ^(localhost:9078^) ---
+curl -s http://localhost:9078/health 2>nul
+if %errorlevel% neq 0 (
+    echo [DOWN] Scrobbler not responding on :9078
+) else (
+    echo.
+)
+echo.
+
+echo --- Last 5 daemon runs ---
+curl -s http://localhost:9079/status 2>nul
+if %errorlevel% neq 0 (
+    echo [INFO] Daemon not available - no run history
+)
+echo.
 if %errorlevel% neq 0 (
     echo [WARN] Could not fetch /status from daemon.
 )
