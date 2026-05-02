@@ -32,7 +32,13 @@ from src.rate_limiter import ServiceRateLimiter
 logger = logging.getLogger(__name__)
 
 # OAuth scopes required — no client secret needed for PKCE
-_SCOPES = "playlist-read-private playlist-read-collaborative user-library-read"
+_SCOPES = (
+    "playlist-read-private "
+    "playlist-read-collaborative "
+    "user-library-read "
+    "user-follow-read "
+    "user-read-playback-history"
+)
 
 # Sentinel spotify_id used for the liked-songs virtual source
 _LIKED_SONGS_ID = "__liked_songs__"
@@ -137,6 +143,69 @@ class SpotifyScraper:
 
         self._update_source(session, liked_source, snapshot_id=None, track_count=len(liked_tracks))
         logger.info("Liked Songs: %d tracks upserted (%d new).", len(liked_tracks), added)
+
+        # ── Saved albums ───────────────────────────────────────────────────────
+        try:
+            saved_albums = self.get_saved_albums()
+            logger.info("Found %d saved albums.", len(saved_albums))
+            for album in saved_albums:
+                album_obj = album.get("album", album)
+                album_id = album_obj.get("id")
+                album_name = album_obj.get("name", album_id)
+                album_source = self._get_or_create_source(
+                    session,
+                    spotify_id=f"album_{album_id}",
+                    name=album_name,
+                    source_type=SourceType.ALBUM.value,
+                )
+                raw_tracks = self._album_to_track_items(album_obj)
+                added = self._upsert_tracks(session, raw_tracks, album_source)
+                new_count += added
+                self._update_source(session, album_source, snapshot_id=None, track_count=len(raw_tracks))
+                logger.info("Album '%s': %d tracks upserted (%d new).", album_name, len(raw_tracks), added)
+        except Exception as exc:
+            logger.error("Saved albums ingestion failed (non-fatal): %s", exc)
+
+        # ── Followed artists ───────────────────────────────────────────────────
+        try:
+            artists = self.get_followed_artists()
+            logger.info("Found %d followed artists.", len(artists))
+            for artist in artists:
+                artist_id = artist.get("id")
+                artist_name = artist.get("name", artist_id)
+                artist_source = self._get_or_create_source(
+                    session,
+                    spotify_id=f"artist_{artist_id}",
+                    name=artist_name,
+                    source_type=SourceType.ARTIST.value,
+                )
+                albums = self.get_artist_albums(artist_id)
+                artist_track_count = 0
+                for alb in albums:
+                    raw_tracks = self._album_to_track_items(alb)
+                    added = self._upsert_tracks(session, raw_tracks, artist_source)
+                    new_count += added
+                    artist_track_count += len(raw_tracks)
+                self._update_source(session, artist_source, snapshot_id=None, track_count=artist_track_count)
+                logger.info("Artist '%s': %d tracks upserted.", artist_name, artist_track_count)
+        except Exception as exc:
+            logger.error("Followed artists ingestion failed (non-fatal): %s", exc)
+
+        # ── Listening history ──────────────────────────────────────────────────
+        try:
+            history_source = self._get_or_create_source(
+                session,
+                spotify_id="__history__",
+                name="Listening History",
+                source_type=SourceType.HISTORY.value,
+            )
+            history_tracks = self.get_recently_played()
+            added = self._upsert_tracks(session, history_tracks, history_source)
+            new_count += added
+            self._update_source(session, history_source, snapshot_id=None, track_count=len(history_tracks))
+            logger.info("Listening History: %d tracks upserted (%d new).", len(history_tracks), added)
+        except Exception as exc:
+            logger.error("Listening history ingestion failed (non-fatal): %s", exc)
 
         logger.info("Full backfill complete. Total new tracks: %d.", new_count)
         return new_count
@@ -342,6 +411,144 @@ class SpotifyScraper:
             offset += limit
 
         return tracks
+
+    def get_saved_albums(self) -> list[dict]:
+        """Fetch all saved albums via /me/albums (50/page)."""
+        albums: list[dict] = []
+        limit = 50
+        offset = 0
+        while True:
+            attempt = 0
+            while True:
+                try:
+                    result = self.sp.current_user_saved_albums(limit=limit, offset=offset)
+                    self._rate_limiter.record_success("spotify")
+                    break
+                except spotipy.SpotifyException as exc:
+                    if exc.http_status == 429:
+                        retry_after = float(exc.headers.get("Retry-After", 0)) if exc.headers else 0
+                        self._rate_limiter.record_failure("spotify")
+                        self._rate_limiter.wait("spotify", attempt, retry_after=retry_after)
+                        attempt += 1
+                        if attempt >= 5:
+                            raise SpotifyRateLimitError() from exc
+                    else:
+                        raise
+            items = result.get("items") or []
+            albums.extend(items)
+            if result.get("next") is None:
+                break
+            offset += limit
+        return albums
+
+    def get_followed_artists(self) -> list[dict]:
+        """Fetch all followed artists via /me/following?type=artist."""
+        artists: list[dict] = []
+        after: Optional[str] = None
+        limit = 50
+        while True:
+            attempt = 0
+            while True:
+                try:
+                    result = self.sp.current_user_followed_artists(limit=limit, after=after)
+                    self._rate_limiter.record_success("spotify")
+                    break
+                except spotipy.SpotifyException as exc:
+                    if exc.http_status == 429:
+                        retry_after = float(exc.headers.get("Retry-After", 0)) if exc.headers else 0
+                        self._rate_limiter.record_failure("spotify")
+                        self._rate_limiter.wait("spotify", attempt, retry_after=retry_after)
+                        attempt += 1
+                        if attempt >= 5:
+                            raise SpotifyRateLimitError() from exc
+                    else:
+                        raise
+            artists_page = result.get("artists", {})
+            items = artists_page.get("items") or []
+            artists.extend(items)
+            cursors = artists_page.get("cursors") or {}
+            after = cursors.get("after")
+            if not after:
+                break
+        return artists
+
+    def get_artist_albums(self, artist_id: str) -> list[dict]:
+        """Fetch all albums for an artist via /artists/{id}/albums."""
+        albums: list[dict] = []
+        limit = 50
+        offset = 0
+        while True:
+            attempt = 0
+            while True:
+                try:
+                    result = self.sp.artist_albums(
+                        artist_id,
+                        album_type="album,single",
+                        limit=limit,
+                        offset=offset,
+                    )
+                    self._rate_limiter.record_success("spotify")
+                    break
+                except spotipy.SpotifyException as exc:
+                    if exc.http_status == 429:
+                        retry_after = float(exc.headers.get("Retry-After", 0)) if exc.headers else 0
+                        self._rate_limiter.record_failure("spotify")
+                        self._rate_limiter.wait("spotify", attempt, retry_after=retry_after)
+                        attempt += 1
+                        if attempt >= 5:
+                            raise SpotifyRateLimitError() from exc
+                    else:
+                        raise
+            items = result.get("items") or []
+            # Fetch full album objects (artist_albums returns simplified)
+            for alb in items:
+                try:
+                    full_album = self.sp.album(alb["id"])
+                    albums.append(full_album)
+                    self._rate_limiter.record_success("spotify")
+                except Exception as exc:
+                    logger.warning("Could not fetch full album %s: %s", alb.get("id"), exc)
+            if result.get("next") is None:
+                break
+            offset += limit
+        return albums
+
+    def get_recently_played(self) -> list[dict]:
+        """Fetch recently played tracks via /me/player/recently_played (50 max)."""
+        attempt = 0
+        while True:
+            try:
+                result = self.sp.current_user_recently_played(limit=50)
+                self._rate_limiter.record_success("spotify")
+                break
+            except spotipy.SpotifyException as exc:
+                if exc.http_status == 429:
+                    retry_after = float(exc.headers.get("Retry-After", 0)) if exc.headers else 0
+                    self._rate_limiter.record_failure("spotify")
+                    self._rate_limiter.wait("spotify", attempt, retry_after=retry_after)
+                    attempt += 1
+                    if attempt >= 5:
+                        raise SpotifyRateLimitError() from exc
+                else:
+                    raise
+        # recently_played items have the same track structure as liked songs
+        return result.get("items") or []
+
+    def _album_to_track_items(self, album: dict) -> list[dict]:
+        """
+        Convert a full Spotify album object into a list of track items
+        compatible with _upsert_tracks (same shape as playlist/liked track items).
+        """
+        items = []
+        tracks = album.get("tracks", {}).get("items") or []
+        for track in tracks:
+            if not track or not track.get("id"):
+                continue
+            # Inject album info into the track so _extract_track_data works
+            track_with_album = dict(track)
+            track_with_album["album"] = album
+            items.append({"track": track_with_album})
+        return items
 
     # ── Metadata extraction ────────────────────────────────────────────────────
 

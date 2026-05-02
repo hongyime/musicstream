@@ -252,7 +252,7 @@ class DownloadOrchestrator:
         """
         Attempt FLAC download via SpotiFLAC.
         Tries services in order: tidal, qobuz, amazon, deezer, youtube.
-        Returns the path to the downloaded FLAC file, or None on failure.
+        Returns the path to the downloaded file, or None on failure.
         """
         if not SPOTIFLAC_AVAILABLE:
             return None
@@ -261,35 +261,43 @@ class DownloadOrchestrator:
             logger.warning("SpotiFLAC circuit breaker open; skipping Tier 1.")
             return None
 
-        # SpotiFLAC needs a Spotify track URL, not a URI
+        if not track.spotify_id:
+            return None
+
         spotify_url = f"https://open.spotify.com/track/{track.spotify_id}"
         out_dir = os.path.join(TEMP_DIR, f"spotiflac_{uuid.uuid4().hex}")
         os.makedirs(out_dir, exist_ok=True)
 
-        try:
-            _SpotiFLAC(
-                url=spotify_url,
-                output_dir=out_dir,
-                services=["tidal", "qobuz", "amazon", "deezer", "youtube"],
-                quality="LOSSLESS",
-                log_level=logging.WARNING,
-            )
+        # Try each service individually so we know which one succeeded
+        for service in ["tidal", "qobuz", "amazon", "deezer", "youtube"]:
+            service_dir = os.path.join(out_dir, service)
+            os.makedirs(service_dir, exist_ok=True)
+            try:
+                _SpotiFLAC(
+                    url=spotify_url,
+                    output_dir=service_dir,
+                    services=[service],
+                    quality="LOSSLESS",
+                    log_level=logging.WARNING,
+                )
+                # Find the downloaded file
+                for root, _, files in os.walk(service_dir):
+                    for fname in files:
+                        if fname.endswith((".flac", ".m4a", ".mp3")):
+                            found = os.path.join(root, fname)
+                            if os.path.getsize(found) > 0:
+                                # Rename to encode service for _resolve_method_label
+                                ext = os.path.splitext(fname)[1]
+                                labeled = os.path.join(out_dir, f"{uuid.uuid4().hex}_{service}{ext}")
+                                os.rename(found, labeled)
+                                self._rate_limiter.record_success("spotiflac")
+                                return labeled
+            except Exception as exc:
+                logger.debug("SpotiFLAC service=%s failed for track %d: %s", service, track.id, exc)
+                continue
 
-            # Find the downloaded file
-            for root, _, files in os.walk(out_dir):
-                for fname in files:
-                    if fname.endswith((".flac", ".m4a", ".mp3")):
-                        found = os.path.join(root, fname)
-                        if os.path.getsize(found) > 0:
-                            self._rate_limiter.record_success("spotiflac")
-                            return found
-
-            self._rate_limiter.record_failure("spotiflac")
-            return None
-
-        except Exception as exc:
-            self._rate_limiter.record_failure("spotiflac")
-            raise SpotiFLACError(f"SpotiFLAC error: {exc}") from exc
+        self._rate_limiter.record_failure("spotiflac")
+        return None
 
     # ── Tier 2: yt-dlp + ytmusicapi ───────────────────────────────────────────
 
@@ -407,7 +415,8 @@ class DownloadOrchestrator:
             )
 
             original_dir = os.getcwd()
-            os.chdir(TEMP_DIR)
+            abs_temp = os.path.abspath(TEMP_DIR)
+            os.chdir(abs_temp)
             try:
                 songs, _ = spotdl_client.search([track.spotify_uri])
                 if not songs:
@@ -421,7 +430,8 @@ class DownloadOrchestrator:
             if paths:
                 downloaded_path = paths[0] if isinstance(paths[0], str) else str(paths[0])
                 if not os.path.isabs(downloaded_path):
-                    downloaded_path = os.path.join(TEMP_DIR, downloaded_path)
+                    downloaded_path = os.path.join(abs_temp, downloaded_path)
+                downloaded_path = os.path.normpath(downloaded_path)
                 if os.path.exists(downloaded_path) and os.path.getsize(downloaded_path) > 0:
                     self._rate_limiter.record_success("spotdl")
                     return downloaded_path
@@ -588,10 +598,11 @@ class DownloadOrchestrator:
           ytdlp_ytm | spotdl | ytdlp_yt | ytdlp_soundcloud
         """
         if tier_name == "tier1_spotiflac":
-            # Service name was encoded in the filename: {uuid}_{service}.flac
+            # Service name encoded in filename: {hex}_{service}.ext
             basename = os.path.basename(file_path)
             name_no_ext = os.path.splitext(basename)[0]
-            parts = name_no_ext.split("_", 1)
+            # Split on last underscore to get service
+            parts = name_no_ext.rsplit("_", 1)
             service = parts[1] if len(parts) == 2 else "unknown"
             return f"spotiflac_{service}"
         elif tier_name == "tier2_ytdlp_ytm":
