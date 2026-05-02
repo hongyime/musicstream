@@ -84,11 +84,11 @@ echo [OK]   FFmpeg found.
 :: Chromaprint (fpcalc)
 where fpcalc >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [WARN] fpcalc (chromaprint) not found in PATH.
+    echo [WARN] fpcalc ^(chromaprint^) not found in PATH.
     echo        AcoustID fingerprinting will be unavailable.
     echo        Download from https://acoustid.org/chromaprint
 ) else (
-    echo [OK]   fpcalc (chromaprint) found.
+    echo [OK]   fpcalc ^(chromaprint^) found.
 )
 
 echo.
