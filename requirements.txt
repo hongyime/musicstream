@@ -6,11 +6,10 @@ psycopg2-binary==2.9.10
 python-dotenv==1.2.2
 
 # Download pipeline
-# yt-dlp pinned — breaking changes ship frequently; bump intentionally.
-# spotdl left unpinned because it pins its own yt-dlp constraint and
-# over-constraining both causes unsolvable dependency conflicts.
+# yt-dlp: unpinned — spotdl constrains it internally; dual-pinning causes
+# unsolvable conflicts. Floor at 2024.1.1 to exclude ancient breaking builds.
 spotiflac==0.2.6
-yt-dlp[default]==2025.1.15
+yt-dlp[default]>=2024.1.1
 ytmusicapi==1.11.5
 spotdl
 
