@@ -38,13 +38,18 @@ New tracks added to Spotify reach your Plex library within ~15 minutes of being 
 - ffmpeg + chromaprint installed in container
 
 ## Quick Start
+
 ```bash
-# One-time setup (generates .env, starts Plex, runs migrations)
+# One-time setup (generates .env, Spotify OAuth, starts Plex, runs migrations)
 setup.bat
 
 # Day-to-day operations menu
 startup.bat
 ```
+
+> **Note:** `setup.bat` will open a browser window for Spotify login during Step 4.
+> This is a one-time step — the token is saved to `spotify_token.json` and reused forever.
+> Run setup on a machine with a browser, then copy `spotify_token.json` to your production machine.
 
 ## Environment Variables
 See `.env.example` for full reference. Key variables:
