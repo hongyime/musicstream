@@ -271,10 +271,11 @@ class MetadataTagger:
             if mb:
                 return mb
 
-        # 2. AcoustID fingerprint (requires a file path — caller must pass it
-        #    separately; here we skip if acoustid_id is already known)
-        if track.acoustid_id:
-            mb = self._mb_lookup_recording(track.acoustid_id)
+        # 2. MB recording ID from AcoustID fingerprint (set by _fingerprint()
+        #    before this call). acoustid_id is the AcoustID ID — NOT a MB MBID.
+        #    mb_recording_id is the actual MB recording UUID.
+        if track.mb_recording_id:
+            mb = self._mb_lookup_recording(track.mb_recording_id)
             if mb:
                 return mb
 
@@ -301,7 +302,10 @@ class MetadataTagger:
             raise MusicBrainzError(f"ISRC lookup HTTP {resp.status_code}: {resp.text[:200]}")
 
         data = resp.json()
-        recordings = data.get("recordings") or data.get("isrc", {}).get("recordings", [])
+        # MusicBrainz /isrc/{isrc} returns {"isrc": "...", "recordings": [...]}
+        # data["isrc"] is the ISRC STRING — calling .get() on it crashes.
+        # Use data["recordings"] directly.
+        recordings = data.get("recordings", [])
         if not recordings:
             return None
 

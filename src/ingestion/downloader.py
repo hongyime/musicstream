@@ -35,17 +35,23 @@ errors_logger = logging.getLogger("errors")
 # ── SpotiFLAC optional import ──────────────────────────────────────────────────
 
 try:
-    # Package installs as 'spotiflac' (lowercase) — on Linux the filesystem is
-    # case-sensitive, so 'from SpotiFLAC import ...' raises ImportError in Docker.
     from spotiflac import SpotiFLAC as _SpotiFLAC
     SPOTIFLAC_AVAILABLE = True
 except ImportError:
     try:
-        from SpotiFLAC import SpotiFLAC as _SpotiFLAC  # fallback for unusual installs
+        from SpotiFLAC import SpotiFLAC as _SpotiFLAC
         SPOTIFLAC_AVAILABLE = True
     except ImportError:
         SPOTIFLAC_AVAILABLE = False
-        logger.warning("SpotiFLAC not available (ImportError); Tier 1 will be skipped for all tracks")
+        logger.warning("SpotiFLAC not available (ImportError); Tier 1 skipped")
+
+if SPOTIFLAC_AVAILABLE:
+    import inspect as _inspect
+    try:
+        _sig = _inspect.signature(_SpotiFLAC)
+        logger.info("SpotiFLAC signature: %s", _sig)
+    except Exception:
+        pass
 
 # ── ytmusicapi optional import ─────────────────────────────────────────────────
 
@@ -330,16 +336,25 @@ class DownloadOrchestrator:
         out_dir = os.path.join(TEMP_DIR, f"spotiflac_{uuid.uuid4().hex}")
         os.makedirs(out_dir, exist_ok=True)
 
-        # SpotiFLAC handles source selection internally — pass only what we know.
-        # Do NOT pass services/quality/log_level; those kwargs don't exist and
-        # cause TypeError that silently kills every attempt.
+        # SpotiFLAC handles source selection internally.
+        # We don't know the exact constructor signature — try positional URL only,
+        # then URL + output_dir if that fails. Signature is logged at startup.
         try:
-            _SpotiFLAC(spotify_url, output=out_dir)
-        except TypeError as exc:
-            # Wrong kwargs or positional signature — log full error so we can fix
-            logger.error("SpotiFLAC constructor failed for track %d — check API: %s", track.id, exc)
-            self._rate_limiter.record_failure("spotiflac")
-            return None
+            _SpotiFLAC(spotify_url, out_dir)
+        except TypeError:
+            try:
+                _SpotiFLAC(spotify_url)
+            except TypeError as exc:
+                logger.error(
+                    "SpotiFLAC constructor failed for track %d — unknown signature: %s",
+                    track.id, exc,
+                )
+                self._rate_limiter.record_failure("spotiflac")
+                return None
+            except Exception as exc:
+                logger.warning("SpotiFLAC failed for track %d: %s", track.id, exc)
+                self._rate_limiter.record_failure("spotiflac")
+                return None
         except Exception as exc:
             logger.warning("SpotiFLAC failed for track %d ('%s'): %s", track.id, track.title, exc)
             self._rate_limiter.record_failure("spotiflac")
@@ -472,15 +487,16 @@ class DownloadOrchestrator:
             logger.warning("SPOTIFY_CLIENT_SECRET not set; skipping Tier 3 spotdl.")
             return None
 
-        abs_temp = os.path.abspath(TEMP_DIR)
+        # Unique subdir per download — prevents picking up stale files from
+        # previous failed attempts that are still sitting in temp/.
+        spotdl_dir = os.path.join(TEMP_DIR, f"spotdl_{uuid.uuid4().hex}")
+        os.makedirs(spotdl_dir, exist_ok=True)
         try:
-            # Use the spotdl CLI via subprocess with explicit --output to avoid
-            # os.chdir() which is not thread-safe under concurrent workers.
             import subprocess as _sp
             result = _sp.run(
                 [
                     "spotdl",
-                    "--output", abs_temp,
+                    "--output", os.path.abspath(spotdl_dir),
                     "--client-id", os.environ.get("SPOTIFY_CLIENT_ID", ""),
                     "--client-secret", client_secret,
                     track.spotify_uri,
@@ -494,10 +510,9 @@ class DownloadOrchestrator:
                 self._rate_limiter.record_failure("spotdl")
                 return None
 
-            # Find the file spotdl created (any audio file newer than process start)
-            for fname in os.listdir(abs_temp):
+            for fname in os.listdir(spotdl_dir):
                 if fname.endswith((".mp3", ".flac", ".ogg", ".m4a", ".opus")):
-                    candidate = os.path.join(abs_temp, fname)
+                    candidate = os.path.join(spotdl_dir, fname)
                     if os.path.getsize(candidate) > 0:
                         self._rate_limiter.record_success("spotdl")
                         return candidate
@@ -639,9 +654,23 @@ class DownloadOrchestrator:
             "noplaylist": True,
         }
 
-        cookies_path = "cookies.txt"
-        if os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
-            opts["cookiefile"] = cookies_path
+        cookies_src = "cookies.txt"
+        if os.path.exists(cookies_src) and os.path.getsize(cookies_src) > 0:
+            if os.access(cookies_src, os.W_OK):
+                opts["cookiefile"] = cookies_src
+            else:
+                # Docker mounts cookies.txt :ro — yt-dlp tries to write-lock it
+                # on open, causing EROFS. Copy to a writable temp file instead.
+                import shutil, tempfile
+                try:
+                    tmp = tempfile.NamedTemporaryFile(
+                        suffix=".txt", delete=False, dir=TEMP_DIR
+                    )
+                    shutil.copy2(cookies_src, tmp.name)
+                    tmp.close()
+                    opts["cookiefile"] = tmp.name
+                except Exception as exc:
+                    logger.debug("Could not copy cookies.txt to temp: %s", exc)
 
         return opts
 
