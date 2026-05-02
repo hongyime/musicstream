@@ -84,6 +84,9 @@ services:
       - LISTENBRAINZ_TOKEN=${LISTENBRAINZ_TOKEN}
       - LISTENBRAINZ_USERNAME=${LISTENBRAINZ_USERNAME}
       - ACOUSTID_API_KEY=${ACOUSTID_API_KEY}
+      # Container-internal mount point for the media drive — always /media
+      # regardless of the host path in EXTERNAL_MEDIA_DRIVE.
+      - MEDIA_DIR=/media
     restart: unless-stopped
     depends_on:
       postgres:
