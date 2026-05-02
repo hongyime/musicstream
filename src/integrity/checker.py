@@ -14,21 +14,18 @@ Log format (written to errors.log):
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import logging
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
 from src.models import Track, TrackStatus
+from src.utils import compute_sha256
 
 logger = logging.getLogger(__name__)
 
 # Dedicated errors logger — matches the RotatingFileHandler configured in daemon.py
 errors_logger = logging.getLogger("musicstream.errors")
-
-# Chunk size for SHA-256 streaming reads (64 KiB)
-_CHUNK_SIZE = 65_536
 
 
 @dataclasses.dataclass
@@ -39,30 +36,6 @@ class IntegrityResult:
     corrupt: int = 0
     ok: int = 0
     total_checked: int = 0
-
-
-def _compute_sha256(path: str) -> str:
-    """
-    Compute the SHA-256 hex digest of the file at *path*.
-
-    Reads the file in 64 KiB chunks to avoid loading large audio files
-    entirely into memory.
-
-    Parameters
-    ----------
-    path:
-        Absolute path to the file.
-
-    Returns
-    -------
-    str
-        Lowercase hex-encoded SHA-256 digest.
-    """
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(_CHUNK_SIZE), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 class IntegrityChecker:
@@ -104,13 +77,13 @@ class IntegrityChecker:
         result = IntegrityResult()
         now = datetime.now(timezone.utc)
 
-        tracks: list[Track] = (
+        tracks = (
             session.query(Track)
             .filter(
                 Track.status == TrackStatus.DOWNLOADED.value,
                 Track.file_path.isnot(None),
             )
-            .all()
+            .yield_per(500)
         )
 
         for track in tracks:
@@ -148,7 +121,7 @@ class IntegrityChecker:
 
             # ── 2. Hash check ──────────────────────────────────────────────────
             try:
-                actual_hash = _compute_sha256(file_path)
+                actual_hash = compute_sha256(file_path)
             except OSError as exc:
                 # Treat unreadable file the same as missing
                 errors_logger.error(

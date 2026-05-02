@@ -17,7 +17,7 @@ import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Optional
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -67,15 +67,17 @@ def get_session_factory(engine: Engine) -> sessionmaker:
 
 # ── Lazy initialisation ───────────────────────────────────────────────────────
 
-def init_db() -> None:
+def init_db(engine: Optional[Engine] = None) -> None:
     """
     Lazily initialise the module-level engine and session factory.
 
+    Pass *engine* to reuse an already-created engine (e.g. the one returned
+    by ``wait_for_db``) and avoid opening a second connection pool.
     Safe to call multiple times — subsequent calls are no-ops.
     """
     global _engine, _session_factory
     if _engine is None:
-        _engine = get_engine()
+        _engine = engine if engine is not None else get_engine()
         logger.debug("SQLAlchemy engine created.")
     if _session_factory is None:
         _session_factory = get_session_factory(_engine)

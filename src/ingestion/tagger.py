@@ -52,6 +52,8 @@ try:
     )
     from mutagen.flac import FLAC, Picture
     from mutagen.mp4 import MP4, MP4Cover
+    from mutagen.oggvorbis import OggVorbis
+    from mutagen.oggopus import OggOpus
     MUTAGEN_AVAILABLE = True
 except ImportError:
     MUTAGEN_AVAILABLE = False
@@ -154,6 +156,11 @@ class MetadataTagger:
 
         # ── Step 1: read yt-dlp embedded tags as fallback baseline ────────────
         ytdlp_tags = self._read_embedded_tags(file_path)
+
+        # ── Step 1b: AcoustID fingerprint (populates track.acoustid_id and
+        #             track.mb_recording_id before the MusicBrainz lookup) ────
+        if ACOUSTID_AVAILABLE and self._acoustid_key:
+            self._fingerprint(file_path, track=track, session=session)
 
         # ── Step 2: attempt MusicBrainz lookup ────────────────────────────────
         mb_data: Optional[MBData] = None
@@ -499,6 +506,10 @@ class MetadataTagger:
             self._tag_flac(file_path, tags)
         elif ext in (".m4a", ".mp4", ".aac"):
             self._tag_m4a(file_path, tags)
+        elif ext == ".ogg":
+            self._tag_ogg(file_path, tags)
+        elif ext == ".opus":
+            self._tag_opus(file_path, tags)
         else:
             logger.warning("Unsupported format %r; skipping tag write", ext)
 
@@ -588,6 +599,48 @@ class MetadataTagger:
 
         if tags.cover_art:
             audio["covr"] = [MP4Cover(tags.cover_art, imageformat=MP4Cover.FORMAT_JPEG)]
+
+        audio.save()
+
+    def _tag_ogg(self, file_path: str, tags: TagData) -> None:
+        """Write Vorbis comment tags to an OGG Vorbis file using mutagen."""
+        audio = OggVorbis(file_path)
+
+        if tags.title:
+            audio["title"] = [tags.title]
+        if tags.artist:
+            audio["artist"] = [tags.artist]
+
+        album_artist = tags.album_artist or tags.artist or ""
+        audio["albumartist"] = [album_artist]
+
+        if tags.album:
+            audio["album"] = [tags.album]
+        if tags.year:
+            audio["date"] = [str(tags.year)]
+        if tags.track_number is not None:
+            audio["tracknumber"] = [str(tags.track_number)]
+
+        audio.save()
+
+    def _tag_opus(self, file_path: str, tags: TagData) -> None:
+        """Write Vorbis comment tags to an Opus file using mutagen."""
+        audio = OggOpus(file_path)
+
+        if tags.title:
+            audio["title"] = [tags.title]
+        if tags.artist:
+            audio["artist"] = [tags.artist]
+
+        album_artist = tags.album_artist or tags.artist or ""
+        audio["albumartist"] = [album_artist]
+
+        if tags.album:
+            audio["album"] = [tags.album]
+        if tags.year:
+            audio["date"] = [str(tags.year)]
+        if tags.track_number is not None:
+            audio["tracknumber"] = [str(tags.track_number)]
 
         audio.save()
 

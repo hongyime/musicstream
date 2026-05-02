@@ -59,11 +59,18 @@ class ServiceRateLimiter:
         "coverart":     ServiceRateConfig(base=0.5,  max=30,   concurrent=5),
     }
 
-    CIRCUIT_BREAKER_THRESHOLD: int = 5       # consecutive failures before unhealthy
-    CIRCUIT_BREAKER_COOLDOWN: float = 1800   # 30 minutes in seconds
+    CIRCUIT_BREAKER_THRESHOLD: int = 5       # default consecutive failures before unhealthy
+    CIRCUIT_BREAKER_COOLDOWN: float = 1800   # default 30 minutes in seconds
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        circuit_breaker_threshold: int = 5,
+        circuit_breaker_cooldown: float = 1800,
+    ) -> None:
         self._lock = threading.Lock()
+        # Allow per-instance override of class-level defaults
+        self.CIRCUIT_BREAKER_THRESHOLD = circuit_breaker_threshold
+        self.CIRCUIT_BREAKER_COOLDOWN = circuit_breaker_cooldown
         self._circuit: Dict[str, _CircuitState] = {
             svc: _CircuitState() for svc in self.CONFIGS
         }
