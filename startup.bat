@@ -22,12 +22,13 @@ echo   [5] View Daemon Logs    docker-compose logs --tail=200 --follow daemon
 echo   [6] Backup Database     POST http://localhost:9079/backup
 echo   [7] Stop Stack          docker-compose down
 echo   [8] Reset Failed Tracks back to pending
-echo   [9] Exit
+echo   [9] DB Stats + Sample Rows
+echo   [0] Exit
 echo.
 echo ============================================================
 echo.
 
-set /p "CHOICE=  Select option [1-9]: "
+set /p "CHOICE=  Select option [0-9]: "
 
 if "%CHOICE%"=="1" goto :opt1
 if "%CHOICE%"=="2" goto :opt2
@@ -38,9 +39,10 @@ if "%CHOICE%"=="6" goto :opt6
 if "%CHOICE%"=="7" goto :opt7
 if "%CHOICE%"=="8" goto :opt8
 if "%CHOICE%"=="9" goto :opt9
+if "%CHOICE%"=="0" goto :opt0
 
 echo.
-echo [WARN] Invalid option. Please enter a number between 1 and 9.
+echo [WARN] Invalid option. Please enter 0-9.
 timeout /t 2 /nobreak >nul
 goto :menu
 
@@ -300,9 +302,50 @@ pause
 goto :menu
 
 :: ============================================================
-:: [9] Exit
+:: [9] DB Stats + Sample Rows
 :: ============================================================
 :opt9
+echo.
+echo ============================================================
+echo   [9] DB Stats + Sample Rows
+echo ============================================================
+echo.
+
+docker exec musicstream-postgres psql -U musicstream -d musicstream -c "SELECT status, COUNT(*) AS count FROM tracks GROUP BY status ORDER BY status;" 2>nul
+if %errorlevel% neq 0 (
+    echo [ERROR] Could not connect to postgres. Is the stack running?
+    goto :stats_done
+)
+
+echo.
+echo --- Download method breakdown ---
+docker exec musicstream-postgres psql -U musicstream -d musicstream -c "SELECT download_method, COUNT(*) AS count FROM tracks WHERE download_method IS NOT NULL GROUP BY download_method ORDER BY count DESC;" 2>nul
+
+echo.
+echo --- Format breakdown ---
+docker exec musicstream-postgres psql -U musicstream -d musicstream -c "SELECT format, COUNT(*) AS count FROM tracks WHERE format IS NOT NULL GROUP BY format ORDER BY count DESC;" 2>nul
+
+echo.
+echo --- 5 most recently downloaded tracks ---
+docker exec musicstream-postgres psql -U musicstream -d musicstream -c "SELECT id, title, artist, status, format, download_method, LEFT(file_path,60) AS file_path FROM tracks WHERE status='downloaded' ORDER BY updated_at DESC LIMIT 5;" 2>nul
+
+echo.
+echo --- 5 most recently failed tracks ---
+docker exec musicstream-postgres psql -U musicstream -d musicstream -c "SELECT t.id, t.title, t.artist, da.method, LEFT(da.error,80) AS last_error FROM tracks t LEFT JOIN download_attempts da ON da.track_id = t.id AND da.id = (SELECT MAX(id) FROM download_attempts WHERE track_id = t.id) WHERE t.status IN ('failed','failed_validation') ORDER BY t.updated_at DESC LIMIT 5;" 2>nul
+
+echo.
+echo --- Sources ---
+docker exec musicstream-postgres psql -U musicstream -d musicstream -c "SELECT name, source_type, track_count, last_scraped_at FROM sources ORDER BY last_scraped_at DESC LIMIT 10;" 2>nul
+
+:stats_done
+echo.
+pause
+goto :menu
+
+:: ============================================================
+:: [0] Exit
+:: ============================================================
+:opt0
 echo.
 echo Goodbye.
 echo.
