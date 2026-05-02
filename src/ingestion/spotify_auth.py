@@ -30,7 +30,7 @@ _SCOPES = (
     "playlist-read-collaborative "
     "user-library-read "
     "user-follow-read "
-    "user-read-playback-history"
+    "user-read-recently-played"
 )
 
 
