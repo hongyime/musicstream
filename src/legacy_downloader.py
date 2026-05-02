@@ -12,7 +12,7 @@ from mutagen.id3 import ID3, TALB, TDRC, TIT2, TPE1  # type: ignore[import-untyp
 from mutagen.mp3 import MP3  # type: ignore[import-untyped]
 from mutagen.mp4 import MP4  # type: ignore[import-untyped]
 
-from robustness import DualServiceRateLimiter, MusicDownloadChaosMonkey
+from src.rate_limiter import MusicDownloadChaosMonkey, ServiceRateLimiter as DualServiceRateLimiter
 
 logger = logging.getLogger(__name__)
 
