@@ -334,15 +334,13 @@ class DownloadOrchestrator:
         out_dir = os.path.join(TEMP_DIR, f"spotiflac_{uuid.uuid4().hex}")
         os.makedirs(out_dir, exist_ok=True)
 
-        # Confirmed API (github.com/ShuShuzinhuu/SpotiFLAC-Module-Version):
-        #   SpotiFLAC(url, output_dir, services=[...], quality="LOSSLESS", log_level=...)
-        # Pass all services — SpotiFLAC handles its own fallback chain internally.
+        # API confirmed: output_dir + services valid in 0.2.6.
+        # quality= does NOT exist in 0.2.6 — omit it.
         try:
             _SpotiFLAC(
                 url=spotify_url,
                 output_dir=out_dir,
                 services=["qobuz", "tidal", "amazon", "deezer"],
-                quality="LOSSLESS",
                 log_level=logging.WARNING,
             )
         except Exception as exc:
@@ -626,7 +624,10 @@ class DownloadOrchestrator:
         Output template uses the stem; the final file will be {stem}.mp3.
         """
         opts: dict = {
-            "format": "bestaudio/best",
+            # Preference: webm/m4a separate audio streams → any separate audio
+            # → best combined format. Maximises compatibility with restricted
+            # YouTube videos that only serve muxed streams.
+            "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best[ext=mp4]/best",
             "outtmpl": out_stem + ".%(ext)s",
             "postprocessors": [
                 {
