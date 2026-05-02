@@ -23,8 +23,8 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from models import Base, Track, TrackStatus
-from integrity.checker import IntegrityChecker, IntegrityResult
+from src.models import Base, Track, TrackStatus
+from src.integrity.checker import IntegrityChecker, IntegrityResult
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────

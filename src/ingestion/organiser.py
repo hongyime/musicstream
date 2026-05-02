@@ -36,8 +36,8 @@ from typing import Optional
 import requests
 from sqlalchemy.orm import Session
 
-from exceptions import OrganiserError
-from models import Track, TrackStatus
+from src.exceptions import OrganiserError
+from src.models import Track, TrackStatus
 
 logger = logging.getLogger(__name__)
 

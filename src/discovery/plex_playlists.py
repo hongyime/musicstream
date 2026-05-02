@@ -26,7 +26,7 @@ from typing import Optional
 import requests
 from sqlalchemy.orm import Session
 
-from models import LbRecommendation, Track, TrackStatus
+from src.models import LbRecommendation, Track, TrackStatus
 
 logger = logging.getLogger(__name__)
 

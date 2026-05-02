@@ -24,8 +24,8 @@ _MUSICSTREAM_ROOT = str(Path(__file__).resolve().parent.parent)
 if _MUSICSTREAM_ROOT not in sys.path:
     sys.path.insert(0, _MUSICSTREAM_ROOT)
 
-from ingestion.organiser import FileOrganiser  # noqa: E402
-from models import Track  # noqa: E402
+from src.ingestion.organiser import FileOrganiser  # noqa: E402
+from src.models import Track  # noqa: E402
 
 
 def _make_organiser() -> FileOrganiser:

@@ -26,8 +26,8 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from models import Base, Track, TrackStatus
-from ingestion.organiser import FileOrganiser
+from src.models import Base, Track, TrackStatus
+from src.ingestion.organiser import FileOrganiser
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────

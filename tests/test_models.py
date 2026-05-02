@@ -16,7 +16,7 @@ import pytest
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import sessionmaker
 
-from models import (
+from src.models import (
     Base,
     DaemonRun,
     DownloadAttempt,

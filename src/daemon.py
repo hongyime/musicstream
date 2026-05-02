@@ -121,8 +121,8 @@ logger = logging.getLogger("musicstream.daemon")
 def _get_db_track_count() -> int:
     """Return the total number of tracks in the DB, or 0 on error."""
     try:
-        from db import get_session
-        from models import Track
+        from src.db import get_session
+        from src.models import Track
         with get_session() as session:
             return session.query(Track).count()
     except Exception as exc:
@@ -133,8 +133,8 @@ def _get_db_track_count() -> int:
 def _get_last_daemon_run():
     """Return the most recent DaemonRun row, or None."""
     try:
-        from db import get_session
-        from models import DaemonRun
+        from src.db import get_session
+        from src.models import DaemonRun
         with get_session() as session:
             return (
                 session.query(DaemonRun)
@@ -203,8 +203,8 @@ def _print_startup_banner() -> None:
     lb_total = 0
     lb_ingested = 0
     try:
-        from db import get_session
-        from models import LbRecommendation
+        from src.db import get_session
+        from src.models import LbRecommendation
         with get_session() as session:
             lb_total = session.query(LbRecommendation).count()
             lb_ingested = (
@@ -247,8 +247,8 @@ def integrity_check() -> None:
     """Run the file integrity checker and log results."""
     logger.info("Running integrity check…")
     try:
-        from db import get_session
-        from integrity.checker import IntegrityChecker
+        from src.db import get_session
+        from src.integrity.checker import IntegrityChecker
         checker = IntegrityChecker()
         with get_session() as session:
             result = checker.run(session)
@@ -264,8 +264,8 @@ def spotify_incremental_sync() -> None:
     """Run Spotify incremental sync and log new track count."""
     logger.info("Running Spotify incremental sync…")
     try:
-        from db import get_session
-        from ingestion.scraper import SpotifyScraper
+        from src.db import get_session
+        from src.ingestion.scraper import SpotifyScraper
         client_id = os.environ.get("SPOTIFY_CLIENT_ID", "")
         scraper = SpotifyScraper(client_id=client_id)
         with get_session() as session:
@@ -279,8 +279,8 @@ def download_pipeline() -> tuple[int, int]:
     """Run the download pipeline for all pending tracks. Returns (downloaded, failed)."""
     logger.info("Running download pipeline…")
     try:
-        from db import get_session
-        from ingestion.downloader import DownloadOrchestrator
+        from src.db import get_session
+        from src.ingestion.downloader import DownloadOrchestrator
         orchestrator = DownloadOrchestrator()
         with get_session() as session:
             downloaded, failed = orchestrator.download_pending(session)
@@ -298,9 +298,9 @@ def listenbrainz_discovery() -> None:
     """Run ListenBrainz discovery and Plex playlist sync."""
     logger.info("Running ListenBrainz discovery…")
     try:
-        from db import get_session
-        from discovery.listenbrainz import ListenBrainzDiscovery
-        from discovery.plex_playlists import PlexPlaylistSync
+        from src.db import get_session
+        from src.discovery.listenbrainz import ListenBrainzDiscovery
+        from src.discovery.plex_playlists import PlexPlaylistSync
         discovery = ListenBrainzDiscovery()
         with get_session() as session:
             new_tracks = discovery.run(session)
@@ -408,8 +408,8 @@ def full_integrity_check() -> None:
 def _record_run_start(run_type: str) -> Optional[int]:
     """Insert a DaemonRun row and return its id."""
     try:
-        from db import get_session
-        from models import DaemonRun
+        from src.db import get_session
+        from src.models import DaemonRun
         with get_session() as session:
             run = DaemonRun(
                 started_at=datetime.now(timezone.utc),
@@ -434,8 +434,8 @@ def _record_run_complete(
 ) -> None:
     """Update the most recent DaemonRun row with completion stats."""
     try:
-        from db import get_session
-        from models import DaemonRun
+        from src.db import get_session
+        from src.models import DaemonRun
         with get_session() as session:
             if run_id is not None:
                 run = session.get(DaemonRun, run_id)
@@ -479,7 +479,7 @@ def startup_sequence() -> None:
     # ── Step 1: Connect to PostgreSQL ─────────────────────────────────────────
     logger.info("Step 1/9: Connecting to PostgreSQL…")
     try:
-        from db import init_db, run_migrations, wait_for_db
+        from src.db import init_db, run_migrations, wait_for_db
         engine = wait_for_db(max_retries=5, backoff_s=5.0)
         init_db()
         logger.info("PostgreSQL connection established.")
@@ -621,8 +621,8 @@ def status():
     Returns the last 5 daemon_runs rows as JSON.
     """
     try:
-        from db import get_session
-        from models import DaemonRun
+        from src.db import get_session
+        from src.models import DaemonRun
         with get_session() as session:
             runs = (
                 session.query(DaemonRun)
@@ -716,8 +716,8 @@ def metrics():
     Returns per-tier download stats and success rates from download_attempts table.
     """
     try:
-        from db import get_session
-        from models import DownloadAttempt
+        from src.db import get_session
+        from src.models import DownloadAttempt
         from sqlalchemy import Integer, case, func
         with get_session() as session:
             rows = (

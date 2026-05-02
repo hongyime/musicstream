@@ -20,8 +20,8 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from models import Base, LbRecommendation, Track, TrackStatus
-from discovery.listenbrainz import ListenBrainzDiscovery, BACKFILL_COUNT, POLL_COUNT
+from src.models import Base, LbRecommendation, Track, TrackStatus
+from src.discovery.listenbrainz import ListenBrainzDiscovery, BACKFILL_COUNT, POLL_COUNT
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -118,7 +118,7 @@ class TestFetchRecommendations:
         assert len(recs) == 1
 
     def test_raises_on_http_error(self):
-        from exceptions import ListenBrainzError
+        from src.exceptions import ListenBrainzError
         d = _make_discovery()
         mock_resp = MagicMock()
         mock_resp.status_code = 500
@@ -130,7 +130,7 @@ class TestFetchRecommendations:
                 d._fetch_recommendations(100)
 
     def test_raises_when_username_not_set(self):
-        from exceptions import ListenBrainzError
+        from src.exceptions import ListenBrainzError
         d = ListenBrainzDiscovery(token="tok", username="")
         with pytest.raises(ListenBrainzError, match="LISTENBRAINZ_USERNAME"):
             d._fetch_recommendations(100)

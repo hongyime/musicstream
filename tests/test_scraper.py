@@ -26,8 +26,8 @@ _mock_spotipy = MagicMock()
 sys.modules.setdefault("spotipy", _mock_spotipy)
 sys.modules.setdefault("spotipy.oauth2", _mock_spotipy.oauth2)
 
-from models import Base, Source, SourceType, Track, TrackStatus
-from ingestion.scraper import SpotifyScraper
+from src.models import Base, Source, SourceType, Track, TrackStatus
+from src.ingestion.scraper import SpotifyScraper
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
