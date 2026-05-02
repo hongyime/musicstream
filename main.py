@@ -1,3 +1,9 @@
+"""
+musicstream/main.py — CLI entry point
+
+All source code lives under src/. This file stays at the repo root so that
+`python main.py <command>` works from the project directory.
+"""
 from __future__ import annotations
 
 import argparse
@@ -13,9 +19,9 @@ from typing import List
 
 from dotenv import load_dotenv  # type: ignore[import-untyped]
 
-from exceptions import RateLimitError
-from models import Track, TrackStatus
-from ui import (
+from src.exceptions import RateLimitError
+from src.models import Track, TrackStatus
+from src.ui import (
     console,
     print_error,
     print_fresh_start,
@@ -32,22 +38,22 @@ logger = logging.getLogger(__name__)
 
 _MAX_DOWNLOAD_WORKERS = 4
 
-# Updated validation targets to reflect the new module structure
+# Validation targets — all paths relative to the musicstream/ root
 _VALIDATION_TARGETS = [
     "main.py",
-    "models.py",
-    "db.py",
-    "exceptions.py",
-    "rate_limiter.py",
-    "ui.py",
-    "daemon.py",
-    "ingestion/scraper.py",
-    "ingestion/downloader.py",
-    "ingestion/tagger.py",
-    "ingestion/organiser.py",
-    "discovery/listenbrainz.py",
-    "discovery/plex_playlists.py",
-    "integrity/checker.py",
+    "src/daemon.py",
+    "src/db.py",
+    "src/exceptions.py",
+    "src/models.py",
+    "src/rate_limiter.py",
+    "src/ui.py",
+    "src/ingestion/scraper.py",
+    "src/ingestion/downloader.py",
+    "src/ingestion/tagger.py",
+    "src/ingestion/organiser.py",
+    "src/discovery/listenbrainz.py",
+    "src/discovery/plex_playlists.py",
+    "src/integrity/checker.py",
 ]
 
 
@@ -122,8 +128,8 @@ def _require_client_id() -> str:
 # ── Scrape command ─────────────────────────────────────────────────────────────
 
 def cmd_scrape(args: argparse.Namespace) -> None:
-    from db import get_session, init_db
-    from ingestion.scraper import SpotifyScraper
+    from src.db import get_session, init_db
+    from src.ingestion.scraper import SpotifyScraper
 
     print_header("Scrape")
     client_id = _require_client_id()
@@ -134,7 +140,6 @@ def cmd_scrape(args: argparse.Namespace) -> None:
             scraper = SpotifyScraper(client_id)
 
             if args.fresh:
-                # Reset all non-downloaded tracks to pending
                 reset = (
                     session.query(Track)
                     .filter(Track.status != TrackStatus.DOWNLOADED.value)
@@ -171,8 +176,8 @@ def cmd_scrape(args: argparse.Namespace) -> None:
 # ── Download command ───────────────────────────────────────────────────────────
 
 def cmd_download(args: argparse.Namespace) -> None:
-    from db import get_session, init_db
-    from ingestion.downloader import DownloadOrchestrator
+    from src.db import get_session, init_db
+    from src.ingestion.downloader import DownloadOrchestrator
 
     print_header("Download")
     if not _check_ffmpeg():
@@ -189,7 +194,6 @@ def cmd_download(args: argparse.Namespace) -> None:
     try:
         with get_session() as session:
             if args.fresh:
-                # Reset non-downloaded tracks to pending
                 session.query(Track).filter(
                     Track.status.in_([
                         TrackStatus.DOWNLOADING.value,
@@ -209,7 +213,6 @@ def cmd_download(args: argparse.Namespace) -> None:
                 return
 
             logger.info("Downloading %d pending tracks", pending_count)
-            # download_pending opens its own per-thread sessions via get_session()
             downloaded, failed = orchestrator.download_pending(session)
 
         logger.info("Download complete — %d downloaded, %d failed", downloaded, failed)
@@ -229,8 +232,8 @@ def cmd_download(args: argparse.Namespace) -> None:
 # ── Status command ─────────────────────────────────────────────────────────────
 
 def cmd_status(_args: argparse.Namespace) -> None:
-    from db import get_session, init_db
-    from models import Source
+    from src.db import get_session, init_db
+    from src.models import Source
 
     init_db()
     try:
@@ -274,8 +277,8 @@ def _get_track_counts(session) -> dict:
 # ── Integrity command ──────────────────────────────────────────────────────────
 
 def cmd_integrity(_args: argparse.Namespace) -> None:
-    from db import get_session, init_db
-    from integrity.checker import IntegrityChecker
+    from src.db import get_session, init_db
+    from src.integrity.checker import IntegrityChecker
 
     print_header("Integrity Check")
     init_db()
@@ -300,7 +303,7 @@ def cmd_daemon(_args: argparse.Namespace) -> None:
     """Start the musicstream daemon (APScheduler + Flask control plane)."""
     print_header("Daemon")
     try:
-        import daemon as daemon_module
+        from src import daemon as daemon_module
         daemon_module.startup_sequence()
         daemon_module.app.run(host="0.0.0.0", port=9079, threaded=True)
     except Exception:
@@ -314,7 +317,6 @@ def cmd_daemon(_args: argparse.Namespace) -> None:
 def cmd_validate(_args: argparse.Namespace) -> None:
     print_header("Project Validation")
 
-    # Only validate files that actually exist
     existing_targets = [t for t in _VALIDATION_TARGETS if os.path.exists(t)]
 
     steps: list[tuple[str, list[str]]] = [
@@ -350,7 +352,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command")
 
-    # scrape
     scrape_parser = sub.add_parser(
         "scrape", help="Discover Spotify playlists + Liked Songs and ingest into DB"
     )
@@ -358,25 +359,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--fresh", action="store_true", help="Reset non-downloaded tracks and start from scratch"
     )
 
-    # download
     dl = sub.add_parser("download", help="Download all pending tracks via 5-tier chain")
     dl.add_argument(
         "--fresh", action="store_true", help="Reset failed/downloading tracks and retry all"
     )
 
-    # status
     sub.add_parser("status", help="Show current database status and source list")
-
-    # integrity
     sub.add_parser("integrity", help="Run file integrity check (missing/corrupt files)")
-
-    # daemon
     sub.add_parser(
         "daemon",
         help="Start the long-running daemon (APScheduler + Flask control plane on :9079)",
     )
-
-    # validate
     sub.add_parser("validate", help="Run project lint and type checks")
 
     return parser

@@ -26,9 +26,9 @@ from typing import Optional
 import requests
 from sqlalchemy.orm import Session
 
-from exceptions import MusicBrainzError, TaggingError
-from models import Track
-from rate_limiter import ServiceRateLimiter
+from src.exceptions import MusicBrainzError, TaggingError
+from src.models import Track
+from src.rate_limiter import ServiceRateLimiter
 
 # ── Optional heavy imports (graceful degradation) ─────────────────────────────
 

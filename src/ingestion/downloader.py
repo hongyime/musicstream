@@ -25,9 +25,9 @@ import yt_dlp  # type: ignore[import-untyped]
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from exceptions import DownloadError, SpotiFLACError
-from models import DownloadAttempt, Track, TrackStatus
-from rate_limiter import ServiceRateLimiter
+from src.exceptions import DownloadError, SpotiFLACError
+from src.models import DownloadAttempt, Track, TrackStatus
+from src.rate_limiter import ServiceRateLimiter
 
 logger = logging.getLogger(__name__)
 errors_logger = logging.getLogger("errors")
@@ -114,7 +114,7 @@ class DownloadOrchestrator:
         failed = 0
 
         # Use a fresh session per thread to avoid cross-thread session sharing
-        from db import get_session  # local import to avoid circular deps
+        from src.db import get_session  # local import to avoid circular deps
 
         def _download_one(track_id: int) -> bool:
             """Download a single track in its own session. Never raises."""

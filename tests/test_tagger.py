@@ -21,8 +21,8 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from models import Base, Track, TrackStatus
-from ingestion.tagger import MBData, MetadataTagger, TagData, TagResult
+from src.models import Base, Track, TrackStatus
+from src.ingestion.tagger import MBData, MetadataTagger, TagData, TagResult
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────

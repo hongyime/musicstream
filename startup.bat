@@ -2,8 +2,7 @@
 setlocal enabledelayedexpansion
 
 :: ============================================================
-:: MUSICSTREAM STARTUP — Day-to-day operations menu
-:: PRD v3.0 §15.2
+:: MUSICSTREAM STARTUP - Day-to-day operations menu
 :: ============================================================
 
 title MUSICSTREAM OPERATIONS
@@ -12,7 +11,7 @@ title MUSICSTREAM OPERATIONS
 cls
 echo.
 echo ============================================================
-echo   MUSICSTREAM — Operations Menu
+echo   MUSICSTREAM - Operations Menu
 echo ============================================================
 echo.
 echo   [1] Start Stack         docker-compose up -d --build

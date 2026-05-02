@@ -23,7 +23,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from exceptions import DatabaseError
+from src.exceptions import DatabaseError
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +127,7 @@ def run_migrations() -> None:
         from alembic import command as alembic_command
         from alembic.config import Config as AlembicConfig
 
-        ini_path = Path(__file__).parent / "alembic.ini"
+        ini_path = Path(__file__).parent.parent / "alembic.ini"
         alembic_cfg = AlembicConfig(str(ini_path))
 
         logger.info("Running Alembic migrations (upgrade head)…")

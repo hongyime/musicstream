@@ -26,8 +26,8 @@ from sqlalchemy.orm import sessionmaker
 for _mod in ("yt_dlp", "spotipy", "spotipy.oauth2", "ytmusicapi", "spotdl"):
     sys.modules.setdefault(_mod, MagicMock())
 
-from models import Base, DownloadAttempt, Track, TrackStatus
-from ingestion.downloader import DownloadOrchestrator, _GIVE_UP_THRESHOLD
+from src.models import Base, DownloadAttempt, Track, TrackStatus
+from src.ingestion.downloader import DownloadOrchestrator, _GIVE_UP_THRESHOLD
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────

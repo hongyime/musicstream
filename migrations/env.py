@@ -14,7 +14,7 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 # Import Base from models so Alembic can detect schema changes via autogenerate
-from models import Base
+from src.models import Base
 
 # ── Alembic Config object ─────────────────────────────────────────────────────
 
