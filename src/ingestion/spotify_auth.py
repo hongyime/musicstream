@@ -40,7 +40,11 @@ def main() -> None:
         print("[ERROR] SPOTIFY_CLIENT_ID not set. Check your .env file.")
         sys.exit(1)
 
+    # Default to local path when running outside Docker
     cache_path = os.environ.get("SPOTIFY_TOKEN_CACHE", "./spotify_token.json")
+    # If the env var points to the Docker container path, override to local
+    if cache_path == "/app/spotify_token.json":
+        cache_path = "./spotify_token.json"
 
     print(f"[INFO] Authenticating with Spotify (client_id={client_id[:8]}...)")
     print(f"[INFO] Token will be saved to: {cache_path}")
@@ -57,8 +61,10 @@ def main() -> None:
     )
 
     # Trigger the OAuth flow -- opens browser, waits for redirect
-    token = auth_manager.get_access_token(as_dict=False)
-    if not token:
+    # get_access_token with no args triggers the full PKCE flow
+    auth_manager.get_access_token(code=None)
+    # Verify token was cached
+    if not auth_manager.get_cached_token():
         print("[ERROR] Failed to obtain access token.")
         sys.exit(1)
 
