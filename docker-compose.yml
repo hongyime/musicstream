@@ -35,8 +35,8 @@ services:
       test: ["CMD", "curl", "-sf", "http://localhost:32400/health"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 60s
+      retries: 5
+      start_period: 120s
 
   scrobbler:
     image: foxxmd/multi-scrobbler:latest
@@ -49,8 +49,7 @@ services:
       - TZ=Asia/Singapore
     restart: unless-stopped
     depends_on:
-      plex:
-        condition: service_healthy
+      - plex
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9078/health"]
       interval: 30s
