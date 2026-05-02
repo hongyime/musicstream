@@ -330,40 +330,35 @@ class DownloadOrchestrator:
         out_dir = os.path.join(TEMP_DIR, f"spotiflac_{uuid.uuid4().hex}")
         os.makedirs(out_dir, exist_ok=True)
 
-        # Try each service individually so we know which one succeeded
-        for service in ["tidal", "qobuz", "amazon", "deezer", "youtube"]:
-            service_dir = os.path.join(out_dir, service)
-            os.makedirs(service_dir, exist_ok=True)
-            try:
-                _SpotiFLAC(
-                    url=spotify_url,
-                    output_dir=service_dir,
-                    services=[service],
-                    quality="LOSSLESS",
-                    log_level=logging.WARNING,
-                )
-                # Return the original file as-is — no transcode.
-                # SpotiFLAC provides OGG/FLAC/M4A; transcoding to MP3 here
-                # would be a lossy-to-lossy downgrade with no benefit.
-                for root, _, files in os.walk(service_dir):
-                    for fname in files:
-                        if fname.endswith((".flac", ".m4a", ".mp3", ".ogg", ".opus")):
-                            found = os.path.join(root, fname)
-                            if os.path.getsize(found) > 0:
-                                ext = os.path.splitext(fname)[1]
-                                dest = os.path.join(out_dir, f"{uuid.uuid4().hex}_{service}{ext}")
-                                os.rename(found, dest)
-                                self._rate_limiter.record_success("spotiflac")
-                                logger.info(
-                                    "SpotiFLAC: downloaded track %d via %s → %s",
-                                    track.id, service, os.path.basename(dest),
-                                )
-                                return dest
-            except Exception as exc:
-                logger.warning("SpotiFLAC service=%s failed for track %d ('%s'): %s", service, track.id, track.title, exc)
-                continue
+        # SpotiFLAC handles source selection internally — pass only what we know.
+        # Do NOT pass services/quality/log_level; those kwargs don't exist and
+        # cause TypeError that silently kills every attempt.
+        try:
+            _SpotiFLAC(spotify_url, output=out_dir)
+        except TypeError as exc:
+            # Wrong kwargs or positional signature — log full error so we can fix
+            logger.error("SpotiFLAC constructor failed for track %d — check API: %s", track.id, exc)
+            self._rate_limiter.record_failure("spotiflac")
+            return None
+        except Exception as exc:
+            logger.warning("SpotiFLAC failed for track %d ('%s'): %s", track.id, track.title, exc)
+            self._rate_limiter.record_failure("spotiflac")
+            return None
 
-        logger.warning("SpotiFLAC: all services exhausted for track %d ('%s'); Tier 1 failed", track.id, track.title)
+        # Find whatever file SpotiFLAC wrote into out_dir
+        for root, _, files in os.walk(out_dir):
+            for fname in files:
+                if fname.endswith((".flac", ".m4a", ".mp3", ".ogg", ".opus")):
+                    found = os.path.join(root, fname)
+                    if os.path.getsize(found) > 0:
+                        ext = os.path.splitext(fname)[1]
+                        dest = os.path.join(out_dir, f"{uuid.uuid4().hex}_spotiflac{ext}")
+                        os.rename(found, dest)
+                        self._rate_limiter.record_success("spotiflac")
+                        logger.info("SpotiFLAC: downloaded track %d → %s", track.id, os.path.basename(dest))
+                        return dest
+
+        logger.warning("SpotiFLAC ran but produced no file for track %d ('%s')", track.id, track.title)
         self._rate_limiter.record_failure("spotiflac")
         return None
 
