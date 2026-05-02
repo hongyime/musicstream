@@ -801,28 +801,72 @@ def _run_full_pipeline() -> None:
 if __name__ == "__main__":
     import threading
 
-    # ── Step 1 & 2: DB + migrations must succeed before anything else ─────────
+    # ── Steps 1 & 2: DB + migrations — must succeed before Flask starts ───────
     try:
         from src.db import init_db, run_migrations, wait_for_db
         wait_for_db(max_retries=5, backoff_s=5.0)
         init_db()
         run_migrations()
+        logger.info("DB ready. Starting Flask…")
     except Exception as exc:
         logger.critical("DB init/migration failed: %s — aborting", exc, exc_info=True)
         raise SystemExit(1) from exc
 
-    # ── Start Flask immediately so health checks pass ─────────────────────────
-    # Steps 3-9 (banner, integrity, Spotify sync, downloads, LB, backup,
-    # scheduler) run in a background thread so the HTTP server is never blocked.
+    # ── Steps 3-9 run in background so Flask health endpoint is always up ─────
     def _background_startup() -> None:
         try:
-            startup_sequence()
+            logger.info("=" * 60)
+            logger.info("MUSICSTREAM DAEMON v3.0 — background startup")
+            logger.info("=" * 60)
+
+            logger.info("Step 3/9: Printing startup banner…")
+            try:
+                _print_startup_banner()
+            except Exception as exc:
+                logger.warning("Startup banner failed (non-fatal): %s", exc)
+
+            logger.info("Step 4/9: Running integrity check…")
+            try:
+                integrity_check()
+            except Exception as exc:
+                logger.error("Integrity check failed (non-fatal): %s", exc)
+
+            logger.info("Step 5/9: Running Spotify incremental sync…")
+            try:
+                spotify_incremental_sync()
+            except Exception as exc:
+                logger.error("Spotify sync failed (non-fatal): %s", exc)
+
+            logger.info("Step 6/9: Running download pipeline…")
+            run_id = _record_run_start("startup")
+            try:
+                downloaded, failed = download_pipeline()
+                _record_run_complete(run_id=run_id, downloaded=downloaded, failed=failed)
+            except Exception as exc:
+                logger.error("Download pipeline failed (non-fatal): %s", exc)
+
+            logger.info("Step 7/9: Running ListenBrainz discovery…")
+            try:
+                listenbrainz_discovery()
+            except Exception as exc:
+                logger.error("ListenBrainz discovery failed (non-fatal): %s", exc)
+
+            logger.info("Step 8/9: Running DB backup…")
+            try:
+                db_backup()
+            except Exception as exc:
+                logger.error("DB backup failed (non-fatal): %s", exc)
+
+            logger.info("Step 9/9: Starting APScheduler…")
+            _register_scheduler_jobs()
+            scheduler.start()
+            logger.info("Daemon fully initialised. Scheduler running.")
+
         except Exception as exc:
-            logger.critical("Startup sequence failed: %s", exc, exc_info=True)
+            logger.critical("Background startup failed: %s", exc, exc_info=True)
 
     t = threading.Thread(target=_background_startup, name="startup", daemon=True)
     t.start()
 
-    # Run Flask on port 9079 (threaded for concurrent requests)
-    logger.info("Flask starting on 0.0.0.0:9079")
+    # Flask runs on main thread — always available for health checks
     app.run(host="0.0.0.0", port=9079, threaded=True)
