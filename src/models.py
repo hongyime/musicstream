@@ -53,6 +53,9 @@ class SourceType(str, enum.Enum):
     """Valid values for Source.source_type.  Stored as plain VARCHAR in PostgreSQL."""
     PLAYLIST     = "playlist"
     LIKED        = "liked"
+    ALBUM        = "album"
+    ARTIST       = "artist"
+    HISTORY      = "history"
     LISTENBRAINZ = "listenbrainz"
 
 

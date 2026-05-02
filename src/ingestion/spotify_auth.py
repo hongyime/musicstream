@@ -24,7 +24,13 @@ except ImportError:
     pass
 from spotipy.oauth2 import SpotifyPKCE
 
-_SCOPES = "playlist-read-private playlist-read-collaborative user-library-read"
+_SCOPES = (
+    "playlist-read-private "
+    "playlist-read-collaborative "
+    "user-library-read "
+    "user-follow-read "
+    "user-read-playback-history"
+)
 
 
 def main() -> None:
