@@ -46,12 +46,7 @@ except ImportError:
         logger.warning("SpotiFLAC not available (ImportError); Tier 1 skipped")
 
 if SPOTIFLAC_AVAILABLE:
-    import inspect as _inspect
-    try:
-        _sig = _inspect.signature(_SpotiFLAC)
-        logger.info("SpotiFLAC signature: %s", _sig)
-    except Exception:
-        pass
+    logger.info("SpotiFLAC available — Tier 1 active")
 
 # ── ytmusicapi optional import ─────────────────────────────────────────────────
 
@@ -113,7 +108,9 @@ class DownloadOrchestrator:
         self._tagger = MetadataTagger(
             acoustid_api_key=os.environ.get("ACOUSTID_API_KEY", ""),
         )
-        media_drive = os.environ.get("EXTERNAL_MEDIA_DRIVE", "/media")
+        # MEDIA_DIR is the container-internal mount point (always /media).
+        # EXTERNAL_MEDIA_DRIVE is the HOST path — wrong inside the container.
+        media_drive = os.environ.get("MEDIA_DIR") or os.environ.get("EXTERNAL_MEDIA_DRIVE", "/media")
         plex_url = os.environ.get("PLEX_URL", "http://localhost:32400")
         plex_token = os.environ.get("PLEX_TOKEN", "")
         plex_section_id = os.environ.get("PLEX_LIBRARY_SECTION_ID", "")
@@ -211,11 +208,12 @@ class DownloadOrchestrator:
         session.flush()
 
         tiers = [
-            ("tier1_spotiflac",    self._tier1_spotiflac),
-            ("tier2_ytdlp_ytm",    self._tier2_ytdlp_ytm),
-            ("tier3_spotdl",       self._tier3_spotdl),
-            ("tier4_ytdlp_youtube", self._tier4_ytdlp_youtube),
-            ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),
+            # Ordered: highest quality → most reliable fallback
+            ("tier1_spotiflac",        self._tier1_spotiflac),         # FLAC lossless
+            ("tier2_ytdlp_ytm",        self._tier2_ytdlp_ytm),         # MP3 320, best YT matching
+            ("tier3_ytdlp_youtube",    self._tier4_ytdlp_youtube),     # MP3 320, reliable direct search
+            ("tier4_spotdl",           self._tier3_spotdl),            # MP3 320, needs client_secret
+            ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),  # MP3 320, last resort
         ]
 
         for method_name, tier_fn in tiers:
@@ -336,31 +334,22 @@ class DownloadOrchestrator:
         out_dir = os.path.join(TEMP_DIR, f"spotiflac_{uuid.uuid4().hex}")
         os.makedirs(out_dir, exist_ok=True)
 
-        # SpotiFLAC handles source selection internally.
-        # We don't know the exact constructor signature — try positional URL only,
-        # then URL + output_dir if that fails. Signature is logged at startup.
+        # Confirmed API (github.com/ShuShuzinhuu/SpotiFLAC-Module-Version):
+        #   SpotiFLAC(url, output_dir, services=[...], quality="LOSSLESS", log_level=...)
+        # Pass all services — SpotiFLAC handles its own fallback chain internally.
         try:
-            _SpotiFLAC(spotify_url, out_dir)
-        except TypeError:
-            try:
-                _SpotiFLAC(spotify_url)
-            except TypeError as exc:
-                logger.error(
-                    "SpotiFLAC constructor failed for track %d — unknown signature: %s",
-                    track.id, exc,
-                )
-                self._rate_limiter.record_failure("spotiflac")
-                return None
-            except Exception as exc:
-                logger.warning("SpotiFLAC failed for track %d: %s", track.id, exc)
-                self._rate_limiter.record_failure("spotiflac")
-                return None
+            _SpotiFLAC(
+                url=spotify_url,
+                output_dir=out_dir,
+                services=["qobuz", "tidal", "amazon", "deezer"],
+                quality="LOSSLESS",
+                log_level=logging.WARNING,
+            )
         except Exception as exc:
             logger.warning("SpotiFLAC failed for track %d ('%s'): %s", track.id, track.title, exc)
             self._rate_limiter.record_failure("spotiflac")
             return None
 
-        # Find whatever file SpotiFLAC wrote into out_dir
         for root, _, files in os.walk(out_dir):
             for fname in files:
                 if fname.endswith((".flac", ".m4a", ".mp3", ".ogg", ".opus")):
@@ -370,10 +359,10 @@ class DownloadOrchestrator:
                         dest = os.path.join(out_dir, f"{uuid.uuid4().hex}_spotiflac{ext}")
                         os.rename(found, dest)
                         self._rate_limiter.record_success("spotiflac")
-                        logger.info("SpotiFLAC: downloaded track %d → %s", track.id, os.path.basename(dest))
+                        logger.info("SpotiFLAC: track %d downloaded → %s", track.id, os.path.basename(dest))
                         return dest
 
-        logger.warning("SpotiFLAC ran but produced no file for track %d ('%s')", track.id, track.title)
+        logger.warning("SpotiFLAC: no file produced for track %d ('%s')", track.id, track.title)
         self._rate_limiter.record_failure("spotiflac")
         return None
 
