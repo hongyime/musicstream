@@ -228,6 +228,11 @@ def _print_startup_banner() -> None:
         f"LB recs:   {lb_total:>5}  │  Ingested: {lb_ingested:>2}",
         f"errors.log: {errors_mb:.1f}MB / 5MB",
     ]
+    
+    # Add staging mode warning
+    if os.environ.get("DISABLE_DOWNLOADS", "").lower() in ("1", "true", "yes", "on"):
+        lines.append("")
+        lines.append("[bold red]DOWNLOADS DISABLED (STAGING MODE)[/bold red]")
 
     panel = Panel(
         "\n".join(lines),
@@ -410,6 +415,11 @@ def _prune_backups() -> None:
 
 def full_download_pipeline() -> None:
     """Full download pipeline wrapper for scheduler."""
+    # Check if downloads are disabled (staging/development mode)
+    if os.environ.get("DISABLE_DOWNLOADS", "").lower() in ("1", "true", "yes", "on"):
+        logger.info("Downloads disabled via DISABLE_DOWNLOADS environment variable - skipping download pipeline")
+        return
+    
     _record_run_start("scheduled")
     try:
         downloaded, failed = download_pipeline()
@@ -515,12 +525,20 @@ def startup_sequence() -> None:
 
     # ── Step 6: Download pipeline ─────────────────────────────────────────────
     logger.info("Step 6/9: Running download pipeline…")
-    run_id = _record_run_start("scheduled")
-    try:
-        downloaded, failed = download_pipeline()
-        _record_run_complete(run_id=run_id, downloaded=downloaded, failed=failed)
-    except Exception as exc:
-        logger.error("Download pipeline failed (non-fatal): %s", exc)
+    
+    # Check if downloads are disabled (staging/development mode)
+    if os.environ.get("DISABLE_DOWNLOADS", "").lower() in ("1", "true", "yes", "on"):
+        logger.info("Downloads disabled via DISABLE_DOWNLOADS environment variable - skipping download pipeline")
+        # Still record the run with zero downloads
+        run_id = _record_run_start("startup")
+        _record_run_complete(run_id=run_id, downloaded=0, failed=0)
+    else:
+        run_id = _record_run_start("startup")
+        try:
+            downloaded, failed = download_pipeline()
+            _record_run_complete(run_id=run_id, downloaded=downloaded, failed=failed)
+        except Exception as exc:
+            logger.error("Download pipeline failed (non-fatal): %s", exc)
 
     # ── Step 7: ListenBrainz discovery ────────────────────────────────────────
     logger.info("Step 7/9: Running ListenBrainz discovery…")
@@ -811,6 +829,13 @@ def _run_full_pipeline() -> None:
     run_id = _record_run_start("manual")
     try:
         spotify_incremental_sync()
+        
+        # Check if downloads are disabled
+        if os.environ.get("DISABLE_DOWNLOADS", "").lower() in ("1", "true", "yes", "on"):
+            logger.info("Downloads disabled via DISABLE_DOWNLOADS - skipping download in manual sync")
+            _record_run_complete(run_id=run_id, downloaded=0, failed=0)
+            return
+        
         downloaded, failed = download_pipeline()
         _record_run_complete(run_id=run_id, downloaded=downloaded, failed=failed)
     except Exception as exc:
