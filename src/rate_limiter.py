@@ -142,6 +142,19 @@ class ServiceRateLimiter:
                     service, self.CIRCUIT_BREAKER_COOLDOWN / 60,
                 )
 
+    def force_open(self, service: str, reason: str = "") -> None:
+        """Immediately open the circuit breaker for *service* regardless of failure count."""
+        self._ensure_service(service)
+        with self._lock:
+            state = self._circuit[service]
+            if state.unhealthy_since is None:
+                state.consecutive_failures = self.CIRCUIT_BREAKER_THRESHOLD
+                state.unhealthy_since = time.monotonic()
+                logger.warning(
+                    "Circuit breaker FORCE-OPEN: service=%s reason=%s cooldown=%.0fs",
+                    service, reason or "forced", self.CIRCUIT_BREAKER_COOLDOWN,
+                )
+
     def is_healthy(self, service: str) -> bool:
         """
         Return ``True`` if *service* is not currently in circuit-breaker cooldown.

@@ -374,13 +374,22 @@ class DownloadOrchestrator:
                     return None
 
         except Exception as exc:
-            msg = str(exc).lower()
-            if "429" in msg or "too many requests" in msg or "rate limit" in msg:
+            # Walk the full exception chain — SpotiFLAC wraps backend 429s in
+            # generic messages ("Deezer download failed"), so str(exc) alone misses them.
+            if self._exc_contains_rate_limit(exc):
                 logger.warning(
                     "SpotiFLAC rate-limited for track %d ('%s') — backend overloaded, will retry next run",
                     track.id, track.title,
                 )
-                # 429 is transient overload, not a service failure — don't open CB.
+                return None
+            # "Failed all services" means every backend had a transient error
+            # (DNS/-3, 429 wrapped, etc.) — SpotiFLAC itself is healthy.
+            msg = str(exc).lower()
+            if "failed all services" in msg or "all services failed" in msg:
+                logger.warning(
+                    "SpotiFLAC all-services transient failure for track %d ('%s'): %s",
+                    track.id, track.title, exc,
+                )
                 return None
             logger.warning("SpotiFLAC failed for track %d ('%s'): %s", track.id, track.title, exc)
             self._rate_limiter.record_failure("spotiflac")
@@ -491,6 +500,15 @@ class DownloadOrchestrator:
                 return downloaded
 
             except Exception as exc:
+                if self._is_youtube_session_rate_limited(exc):
+                    # Session-level block — every subsequent request will fail too.
+                    # Open the CB immediately so no more workers waste time on YouTube.
+                    self._rate_limiter.force_open("youtube", "session rate-limited")
+                    logger.warning(
+                        "YouTube session rate-limited for track %d; circuit breaker opened",
+                        track.id,
+                    )
+                    return None
                 if self._is_content_error(exc):
                     logger.info(
                         "Tier 2 video %s content-restricted for track %d — trying next candidate: %s",
@@ -611,6 +629,10 @@ class DownloadOrchestrator:
             except yt_dlp.utils.MaxDownloadsReached:
                 pass  # expected: yt-dlp raises this after max_downloads=1 succeeds
             except Exception as exc:
+                if self._is_youtube_session_rate_limited(exc):
+                    self._rate_limiter.force_open("youtube", "session rate-limited")
+                    logger.warning("YouTube session rate-limited; circuit breaker opened, stopping Tier 4")
+                    return None
                 if not self._is_content_error(exc):
                     self._rate_limiter.record_failure("youtube")
                 logger.warning("Tier 4 query '%s' failed: %s", query, exc)
@@ -758,6 +780,34 @@ class DownloadOrchestrator:
             if os.path.exists(candidate):
                 return candidate
         return None
+
+    @staticmethod
+    def _exc_contains_rate_limit(exc: BaseException) -> bool:
+        """Walk the full exception chain looking for 429/rate-limit signals.
+
+        SpotiFLAC wraps backend 429s in generic messages like "Deezer download
+        failed", so str(exc) alone misses them.  Checking __cause__/__context__
+        catches the original HTTPError before it gets re-wrapped.
+        """
+        seen: set[int] = set()
+        current: Optional[BaseException] = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            text = (str(current) + repr(current)).lower()
+            if any(x in text for x in ("429", "too many requests", "rate limit", "rate-limit", "ratelimit")):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    @staticmethod
+    def _is_youtube_session_rate_limited(exc: Exception) -> bool:
+        """Return True when YouTube has rate-limited the entire session.
+
+        Per-video content errors use _is_content_error; this specifically
+        catches the session-level block that makes every subsequent request fail.
+        """
+        msg = str(exc).lower()
+        return "session has been rate-limited" in msg or "rate-limited by youtube" in msg
 
     @staticmethod
     def _is_content_error(exc: Exception) -> bool:
