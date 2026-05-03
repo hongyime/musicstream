@@ -96,6 +96,20 @@ echo [STEP 1/10] Prerequisites check complete.
 echo.
 
 :: ============================================================
+:: STEP 1b - Install Python dependencies
+:: ============================================================
+echo [STEP 1b]  Installing Python dependencies from requirements.txt...
+echo.
+pip install -r requirements.txt
+if %errorlevel% neq 0 (
+    echo [ERROR] pip install failed.
+    echo         Check your internet connection or proxy settings.
+    exit /b 1
+)
+echo [OK]   Python dependencies installed.
+echo.
+
+:: ============================================================
 :: STEP 2/10 - Configure .env
 :: ============================================================
 echo [STEP 2/10] Configuring .env...

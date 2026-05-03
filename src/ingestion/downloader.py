@@ -6,7 +6,7 @@ Implements the full tier chain for downloading tracks:
   Tier 2: yt-dlp + ytmusicapi (songs→videos→no filter) — MP3 320kbps, ±5s duration check
   Tier 3: spotdl Python API — MP3 320kbps, requires Spotify credentials
   Tier 4: yt-dlp YouTube direct search (ytsearch12) — MP3 320kbps
-  Tier 5: yt-dlp SoundCloud (scsearch8) — MP3 320kbps
+  Tier 5: yt-dlp SoundCloud (scsearch8) — MP3 320kbps, uses separate "soundcloud" circuit breaker
 
 After ≥25 failed attempts: status='failed', log [DOWNLOAD_FAIL] to errors.log.
 MAX_CONCURRENT = 4 parallel workers via ThreadPoolExecutor.
@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -72,6 +73,10 @@ except ImportError:
 TEMP_DIR: str = os.environ.get("TEMP_DIR", "temp")
 _DURATION_TOLERANCE_S = 5  # ±5 seconds for duration validation
 _GIVE_UP_THRESHOLD = 25    # ~5 complete tier-chain runs before giving up
+
+# spotdl serialisation — Spotify's API rate-limits quickly under concurrent calls.
+# One active spotdl download at a time prevents 4 workers from hitting the limit together.
+_SPOTDL_SEMAPHORE = threading.Semaphore(1)
 
 
 def _utcnow() -> datetime:
@@ -377,31 +382,38 @@ class DownloadOrchestrator:
             logger.warning("ytmusicapi circuit breaker open; skipping Tier 2.")
             return None
 
-        query = f"{track.title} {track.artist}"
-        video_id: Optional[str] = None
+        # ytmusicapi returns YouTube Music video IDs.  Without cookies those
+        # are all Premium-gated and return "Requested format is not available".
+        # Skip the tier entirely when cookies.txt is absent or empty to avoid
+        # burning 30+ seconds on guaranteed failures.
+        cookies_ok = os.path.exists("cookies.txt") and os.path.getsize("cookies.txt") > 0
+        if not cookies_ok:
+            logger.info(
+                "Tier 2 skipped for track %d: cookies.txt empty — ytmusicapi IDs require YouTube auth. "
+                "Export browser cookies to cookies.txt to enable this tier.",
+                track.id,
+            )
+            return None
 
-        # Search order: songs → videos → no filter
-        search_filters = ["songs", "videos", None]
-        for search_filter in search_filters:
+        query = f"{track.title} {track.artist}"
+
+        # Collect up to 4 candidates per filtered search (songs → videos only).
+        # Skipping the no-filter pass avoids hundreds of album/artist results
+        # that have no videoId and would still be YouTube Music Premium content.
+        candidates: list[str] = []
+        for search_filter in ("songs", "videos"):
             try:
                 ytm = YTMusic()
-                kwargs = {"query": query, "limit": 5}
-                if search_filter is not None:
-                    kwargs["filter"] = search_filter
-                results = ytm.search(**kwargs)
+                results = ytm.search(query=query, filter=search_filter, limit=4)
                 for result in results:
                     vid = result.get("videoId")
-                    if vid:
-                        video_id = vid
-                        break
-                if video_id:
-                    break
+                    if vid and vid not in candidates:
+                        candidates.append(vid)
             except Exception as exc:
                 self._rate_limiter.record_failure("ytmusicapi")
                 logger.warning("ytmusicapi search (filter=%s) failed: %s", search_filter, exc)
-                continue
 
-        if not video_id:
+        if not candidates:
             return None
 
         self._rate_limiter.record_success("ytmusicapi")
@@ -410,47 +422,48 @@ class DownloadOrchestrator:
             logger.warning("YouTube circuit breaker open; skipping Tier 2 download.")
             return None
 
-        out_stem = os.path.join(TEMP_DIR, str(uuid.uuid4()))
-        out_path = out_stem + ".mp3"
+        for video_id in candidates:
+            out_stem = os.path.join(TEMP_DIR, str(uuid.uuid4()))
+            ydl_opts = self._build_mp3_opts(out_stem)
+            url = f"https://www.youtube.com/watch?v={video_id}"
 
-        ydl_opts = self._build_mp3_opts(out_stem)
-        url = f"https://www.youtube.com/watch?v={video_id}"
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+                downloaded = self._find_output_file(out_stem)
+                if not downloaded or not os.path.exists(downloaded):
+                    self._rate_limiter.record_failure("youtube")
+                    continue
 
-            # Find the downloaded file
-            downloaded = self._find_output_file(out_stem)
-            if not downloaded or not os.path.exists(downloaded):
-                self._rate_limiter.record_failure("youtube")
-                return None
+                # Duration validation ±5s
+                if track.duration_ms is not None and info is not None:
+                    expected_s = track.duration_ms / 1000.0
+                    got_s = info.get("duration") or 0
+                    delta = abs(got_s - expected_s)
+                    if delta > _DURATION_TOLERANCE_S:
+                        errors_logger.warning(
+                            "[DURATION_MISMATCH] %s | %s | expected=%.0fms | got=%.0fs | delta=%.1fs | tier=2 vid=%s",
+                            track.title, track.artist,
+                            track.duration_ms, got_s, delta, video_id,
+                        )
+                        os.remove(downloaded)
+                        continue
 
-            # Duration validation ±5s
-            if track.duration_ms is not None and info is not None:
-                expected_s = track.duration_ms / 1000.0
-                got_s = info.get("duration") or 0
-                delta = abs(got_s - expected_s)
-                if delta > _DURATION_TOLERANCE_S:
-                    errors_logger.warning(
-                        "[DURATION_MISMATCH] %s | %s | expected=%.0fms | got=%.0fs | delta=%.1fs | tier=2",
-                        track.title,
-                        track.artist,
-                        track.duration_ms,
-                        got_s,
-                        delta,
+                self._rate_limiter.record_success("youtube")
+                return downloaded
+
+            except Exception as exc:
+                if self._is_content_error(exc):
+                    logger.info(
+                        "Tier 2 video %s content-restricted for track %d — trying next candidate: %s",
+                        video_id, track.id, exc,
                     )
-                    os.remove(downloaded)
-                    # Wrong video is a content-matching failure, not a YouTube
-                    # service failure — do NOT count toward the circuit breaker.
-                    return None
+                else:
+                    self._rate_limiter.record_failure("youtube")
+                    raise DownloadError(f"Tier 2 yt-dlp download failed: {exc}") from exc
 
-            self._rate_limiter.record_success("youtube")
-            return downloaded
-
-        except Exception as exc:
-            self._rate_limiter.record_failure("youtube")
-            raise DownloadError(f"Tier 2 yt-dlp download failed: {exc}") from exc
+        return None
 
     # ── Tier 3: spotdl ────────────────────────────────────────────────────────
 
@@ -473,8 +486,12 @@ class DownloadOrchestrator:
             logger.warning("SPOTIFY_CLIENT_ID/SECRET not set; skipping Tier 3 spotdl.")
             return None
 
-        # Unique subdir per download — prevents picking up stale files from
-        # previous failed attempts that are still sitting in temp/.
+        # Serialise spotdl — Spotify's API rate-limits quickly under concurrent load.
+        # Wait up to 60s for the slot; if another worker is still in spotdl, skip.
+        if not _SPOTDL_SEMAPHORE.acquire(timeout=60):
+            logger.warning("spotdl semaphore timeout for track %d; skipping Tier 3 this run.", track.id)
+            return None
+
         spotdl_dir = os.path.join(TEMP_DIR, f"spotdl_{uuid.uuid4().hex}")
         os.makedirs(spotdl_dir, exist_ok=True)
 
@@ -496,7 +513,7 @@ class DownloadOrchestrator:
 
             songs = client.search([track.spotify_uri])
             if not songs:
-                logger.warning("spotdl: no search results for track %d ('%s')", track.id, track.title)
+                logger.warning("spotdl: no results for track %d ('%s')", track.id, track.title)
                 self._rate_limiter.record_failure("spotdl")
                 return None
 
@@ -509,10 +526,19 @@ class DownloadOrchestrator:
             return str(path)
 
         except Exception as exc:
+            msg = str(exc)
+            if "rate" in msg.lower() or "limit" in msg.lower() or "retry will occur" in msg.lower():
+                # Spotify API rate-limit — transient, not a spotdl failure.
+                logger.warning(
+                    "spotdl rate-limited for track %d ('%s'): %s — skipping this run",
+                    track.id, track.title, msg.splitlines()[0],
+                )
+                return None
             self._rate_limiter.record_failure("spotdl")
             raise DownloadError(f"Tier 3 spotdl failed: {exc}") from exc
         finally:
             loop.close()
+            _SPOTDL_SEMAPHORE.release()
 
     # ── Tier 4: yt-dlp YouTube direct search ─────────────────────────────────
 
@@ -535,20 +561,28 @@ class DownloadOrchestrator:
         for query in queries:
             out_stem = os.path.join(TEMP_DIR, str(uuid.uuid4()))
             ydl_opts = self._build_mp3_opts(out_stem)
+            # For search queries, disable noplaylist so yt-dlp walks the result
+            # list.  ignoreerrors skips restricted videos silently; max_downloads
+            # stops after the first successful download.
+            ydl_opts["noplaylist"] = False
+            ydl_opts["ignoreerrors"] = True
+            ydl_opts["max_downloads"] = 1
 
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([query])
-
-                downloaded = self._find_output_file(out_stem)
-                if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 0:
-                    self._rate_limiter.record_success("youtube")
-                    return downloaded
-
+            except yt_dlp.utils.MaxDownloadsReached:
+                pass  # expected: yt-dlp raises this after max_downloads=1 succeeds
             except Exception as exc:
-                self._rate_limiter.record_failure("youtube")
+                if not self._is_content_error(exc):
+                    self._rate_limiter.record_failure("youtube")
                 logger.warning("Tier 4 query '%s' failed: %s", query, exc)
                 continue
+
+            downloaded = self._find_output_file(out_stem)
+            if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 0:
+                self._rate_limiter.record_success("youtube")
+                return downloaded
 
         return None
 
@@ -558,29 +592,37 @@ class DownloadOrchestrator:
         """
         Search SoundCloud with scsearch8 using "{title} {artist}".
         Returns temp file path (MP3 320kbps) or None.
+        Always returns None on failure — scsearch is a known flaky extractor
+        and should never raise into the tier chain or penalise the YouTube CB.
         """
-        if not self._rate_limiter.is_healthy("youtube"):
-            logger.warning("YouTube/yt-dlp circuit breaker open; skipping Tier 5.")
+        if not self._rate_limiter.is_healthy("soundcloud"):
+            logger.warning("SoundCloud circuit breaker open; skipping Tier 5.")
             return None
 
         query = f"scsearch8:{track.title} {track.artist}"
         out_stem = os.path.join(TEMP_DIR, str(uuid.uuid4()))
         ydl_opts = self._build_mp3_opts(out_stem)
+        ydl_opts["noplaylist"] = False
+        ydl_opts["ignoreerrors"] = True
+        ydl_opts["max_downloads"] = 1
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([query])
-
-            downloaded = self._find_output_file(out_stem)
-            if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 0:
-                self._rate_limiter.record_success("youtube")
-                return downloaded
-
+        except yt_dlp.utils.MaxDownloadsReached:
+            pass  # expected: raised after max_downloads=1 succeeds
+        except Exception as exc:
+            if not self._is_content_error(exc):
+                self._rate_limiter.record_failure("soundcloud")
+            logger.warning("Tier 5 SoundCloud failed for track %d ('%s'): %s", track.id, track.title, exc)
             return None
 
-        except Exception as exc:
-            self._rate_limiter.record_failure("youtube")
-            raise DownloadError(f"Tier 5 SoundCloud failed: {exc}") from exc
+        downloaded = self._find_output_file(out_stem)
+        if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 0:
+            self._rate_limiter.record_success("soundcloud")
+            return downloaded
+
+        return None
 
     # ── Attempt recording ──────────────────────────────────────────────────────
 
@@ -644,6 +686,12 @@ class DownloadOrchestrator:
             "fragment_retries": 3,
             "skip_unavailable_fragments": True,
             "noplaylist": True,
+            # Android player client returns pre-signed format URLs that bypass
+            # YouTube's JS nsig decryption challenge — no JS runtime required.
+            # Without this, modern music content returns "format not available".
+            "extractor_args": {
+                "youtube": {"player_client": ["android", "web"]},
+            },
         }
 
         cookies_src = "cookies.txt"
@@ -673,6 +721,27 @@ class DownloadOrchestrator:
             if os.path.exists(candidate):
                 return candidate
         return None
+
+    @staticmethod
+    def _is_content_error(exc: Exception) -> bool:
+        """
+        Returns True when the error is video/content-specific rather than a
+        service-level failure.  These must NOT trip the circuit breaker because
+        the service itself is healthy — only a specific piece of content failed.
+        """
+        msg = str(exc).lower()
+        return any(phrase in msg for phrase in (
+            "requested format is not available",
+            "private video",
+            "video unavailable",
+            "this video is not available",
+            "has been removed",
+            "sign in to confirm",
+            "requires payment",
+            "copyright",
+            "geographic restriction",
+            "not available in your country",
+        ))
 
     @staticmethod
     def _resolve_method_label(tier_name: str, file_path: str) -> str:

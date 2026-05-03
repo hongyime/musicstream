@@ -233,8 +233,8 @@ class FileOrganiser:
 
         Sends::
 
-            POST http://{plex_url}/library/sections/{section_id}/refresh
-                 ?X-Plex-Token={token}
+            GET http://{plex_url}/library/sections/{section_id}/refresh
+                ?X-Plex-Token={token}
 
         A non-2xx response is logged as a warning but does NOT raise an
         exception — a Plex refresh failure must never abort the pipeline.
@@ -242,9 +242,9 @@ class FileOrganiser:
         url = (
             f"{self._plex_url}/library/sections/{self._plex_section_id}/refresh"
         )
-        headers = {"X-Plex-Token": self._plex_token}
+        params = {"X-Plex-Token": self._plex_token}
         try:
-            resp = requests.post(url, headers=headers, timeout=10)
+            resp = requests.get(url, params=params, timeout=10)
             if resp.ok:
                 logger.info(
                     "Plex library section %s refresh triggered (HTTP %s).",
