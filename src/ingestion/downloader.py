@@ -21,7 +21,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import yt_dlp  # type: ignore[import-untyped]
 from sqlalchemy import func, select
@@ -77,6 +77,11 @@ _GIVE_UP_THRESHOLD = 25    # ~5 complete tier-chain runs before giving up
 # spotdl serialisation — Spotify's API rate-limits quickly under concurrent calls.
 # One active spotdl download at a time prevents 4 workers from hitting the limit together.
 _SPOTDL_SEMAPHORE = threading.Semaphore(1)
+
+# spotdl process-wide singleton — SpotifyClient is a class-level singleton internally;
+# creating a second Spotdl instance in the same process raises "already initialized".
+_SPOTDL_CLIENT: Optional[Any] = None
+_SPOTDL_CLIENT_LOCK = threading.Lock()
 
 # SpotiFLAC serialisation — deezmate and monochrome.tf return 429 under concurrent load.
 # Two slots preserves some parallelism while halving the request rate.
@@ -556,30 +561,15 @@ class DownloadOrchestrator:
             logger.info("Throttle skip: spotdl track %d — will retry next run", track.id)
             return None
 
-        # Serialise spotdl — Spotify's API rate-limits quickly under concurrent load.
-        # Wait up to 60s for the slot; if another worker is still in spotdl, skip.
+        # Serialise — Spotify's API rate-limits quickly under concurrent load.
         if not _SPOTDL_SEMAPHORE.acquire(timeout=60):
             logger.warning("spotdl semaphore timeout for track %d; skipping Tier 3 this run.", track.id)
             return None
 
-        spotdl_dir = os.path.join(TEMP_DIR, f"spotdl_{uuid.uuid4().hex}")
-        os.makedirs(spotdl_dir, exist_ok=True)
-
-        # Each call gets a fresh event loop — worker threads have no running loop.
-        loop = asyncio.new_event_loop()
         try:
-            client = Spotdl(
-                client_id=client_id,
-                client_secret=client_secret,
-                downloader_settings={
-                    "output": os.path.abspath(spotdl_dir),
-                    "format": "mp3",
-                    "bitrate": "320k",
-                    "overwrite": "force",
-                    "log_level": "ERROR",
-                },
-                loop=loop,
-            )
+            client = self._get_spotdl_client(client_id, client_secret)
+            if client is None:
+                return None
 
             songs = client.search([track.spotify_uri])
             if not songs:
@@ -608,7 +598,6 @@ class DownloadOrchestrator:
             self._rate_limiter.record_failure("spotdl")
             raise DownloadError(f"Tier 3 spotdl failed: {exc}") from exc
         finally:
-            loop.close()
             _SPOTDL_SEMAPHORE.release()
 
     # ── Tier 4: yt-dlp YouTube direct search ─────────────────────────────────
@@ -748,6 +737,37 @@ class DownloadOrchestrator:
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _get_spotdl_client(client_id: str, client_secret: str) -> Optional[Any]:
+        """Return the process-wide Spotdl singleton, creating it on first call.
+
+        SpotifyClient is a class-level singleton inside spotdl — constructing a
+        second Spotdl instance in the same process raises "already initialized".
+        A single instance is created once and reused for all downloads.
+        """
+        global _SPOTDL_CLIENT
+        if not SPOTDL_AVAILABLE:
+            return None
+        if _SPOTDL_CLIENT is not None:
+            return _SPOTDL_CLIENT
+        with _SPOTDL_CLIENT_LOCK:
+            if _SPOTDL_CLIENT is None:
+                loop = asyncio.new_event_loop()
+                _SPOTDL_CLIENT = Spotdl(
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    downloader_settings={
+                        "output": os.path.abspath(TEMP_DIR),
+                        "format": "mp3",
+                        "bitrate": "320k",
+                        "overwrite": "force",
+                        "log_level": "ERROR",
+                    },
+                    loop=loop,
+                )
+                logger.info("spotdl singleton initialised (client_id=%s…)", client_id[:8])
+        return _SPOTDL_CLIENT
+
     def _build_mp3_opts(self, out_stem: str) -> dict:
         """
         Build yt-dlp options for bestaudio → FFmpeg → MP3 320kbps output.
@@ -772,6 +792,9 @@ class DownloadOrchestrator:
             "fragment_retries": 3,
             "skip_unavailable_fragments": True,
             "noplaylist": True,
+            # Add per-request sleep at the yt-dlp level (on top of our throttle).
+            # This slows down info extraction HTTP calls and reduces 429 likelihood.
+            "sleep_interval_requests": 1,
             # Android player client returns pre-signed format URLs that bypass
             # YouTube's JS nsig decryption challenge — no JS runtime required.
             # Without this, modern music content returns "format not available".
