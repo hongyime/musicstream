@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session
 
 from src.exceptions import DownloadError, OrganiserError, SpotiFLACError, TaggingError
 from src.models import DownloadAttempt, Track, TrackStatus
-from src.rate_limiter import ServiceRateLimiter
+from src.rate_limiter import ServiceRateLimiter, ServiceThrottle
 
 logger = logging.getLogger(__name__)
 errors_logger = logging.getLogger("errors")
@@ -108,6 +108,7 @@ class DownloadOrchestrator:
             circuit_breaker_threshold=20,
             circuit_breaker_cooldown=300,
         )
+        self._throttle = ServiceThrottle()
         os.makedirs(TEMP_DIR, exist_ok=True)
 
         # Lazy-init tagger and organiser from env vars.
@@ -347,6 +348,10 @@ class DownloadOrchestrator:
             logger.warning("Tier 1 skipped for track %d ('%s'): no spotify_id", track.id, track.title)
             return None
 
+        if not self._throttle.wait("spotiflac"):
+            logger.info("Throttle skip: spotiflac track %d — will retry next run", track.id)
+            return None
+
         if not _SPOTIFLAC_SEMAPHORE.acquire(timeout=30):
             logger.warning("SpotiFLAC semaphore timeout for track %d; skipping this run.", track.id)
             return None
@@ -381,6 +386,7 @@ class DownloadOrchestrator:
                     "SpotiFLAC rate-limited for track %d ('%s') — backend overloaded, will retry next run",
                     track.id, track.title,
                 )
+                self._throttle.on_rate_limit("spotiflac")
                 return None
             # "Failed all services" means every backend had a transient error
             # (DNS/-3, 429 wrapped, etc.) — SpotiFLAC itself is healthy.
@@ -406,6 +412,7 @@ class DownloadOrchestrator:
                         dest = os.path.join(out_dir, f"{uuid.uuid4().hex}_spotiflac{ext}")
                         os.rename(found, dest)
                         self._rate_limiter.record_success("spotiflac")
+                        self._throttle.on_success("spotiflac")
                         logger.info("SpotiFLAC: track %d downloaded → %s", track.id, os.path.basename(dest))
                         return dest
 
@@ -469,6 +476,10 @@ class DownloadOrchestrator:
             return None
 
         for video_id in candidates:
+            if not self._throttle.wait("youtube"):
+                logger.info("Throttle skip: youtube tier 2 track %d — will retry next run", track.id)
+                return None
+
             out_stem = os.path.join(TEMP_DIR, str(uuid.uuid4()))
             ydl_opts = self._build_mp3_opts(out_stem)
             url = f"https://www.youtube.com/watch?v={video_id}"
@@ -497,13 +508,13 @@ class DownloadOrchestrator:
                         continue
 
                 self._rate_limiter.record_success("youtube")
+                self._throttle.on_success("youtube")
                 return downloaded
 
             except Exception as exc:
                 if self._is_youtube_session_rate_limited(exc):
-                    # Session-level block — every subsequent request will fail too.
-                    # Open the CB immediately so no more workers waste time on YouTube.
                     self._rate_limiter.force_open("youtube", "session rate-limited")
+                    self._throttle.on_rate_limit("youtube")
                     logger.warning(
                         "YouTube session rate-limited for track %d; circuit breaker opened",
                         track.id,
@@ -539,6 +550,10 @@ class DownloadOrchestrator:
         client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
         if not client_id or not client_secret:
             logger.warning("SPOTIFY_CLIENT_ID/SECRET not set; skipping Tier 3 spotdl.")
+            return None
+
+        if not self._throttle.wait("spotdl"):
+            logger.info("Throttle skip: spotdl track %d — will retry next run", track.id)
             return None
 
         # Serialise spotdl — Spotify's API rate-limits quickly under concurrent load.
@@ -578,16 +593,17 @@ class DownloadOrchestrator:
                 return None
 
             self._rate_limiter.record_success("spotdl")
+            self._throttle.on_success("spotdl")
             return str(path)
 
         except Exception as exc:
             msg = str(exc)
             if "rate" in msg.lower() or "limit" in msg.lower() or "retry will occur" in msg.lower():
-                # Spotify API rate-limit — transient, not a spotdl failure.
                 logger.warning(
                     "spotdl rate-limited for track %d ('%s'): %s — skipping this run",
                     track.id, track.title, msg.splitlines()[0],
                 )
+                self._throttle.on_rate_limit("spotdl")
                 return None
             self._rate_limiter.record_failure("spotdl")
             raise DownloadError(f"Tier 3 spotdl failed: {exc}") from exc
@@ -614,6 +630,10 @@ class DownloadOrchestrator:
         ]
 
         for query in queries:
+            if not self._throttle.wait("youtube"):
+                logger.info("Throttle skip: youtube tier 4 track %d — will retry next run", track.id)
+                return None
+
             out_stem = os.path.join(TEMP_DIR, str(uuid.uuid4()))
             ydl_opts = self._build_mp3_opts(out_stem)
             # For search queries, disable noplaylist so yt-dlp walks the result
@@ -631,6 +651,7 @@ class DownloadOrchestrator:
             except Exception as exc:
                 if self._is_youtube_session_rate_limited(exc):
                     self._rate_limiter.force_open("youtube", "session rate-limited")
+                    self._throttle.on_rate_limit("youtube")
                     logger.warning("YouTube session rate-limited; circuit breaker opened, stopping Tier 4")
                     return None
                 if not self._is_content_error(exc):
@@ -641,6 +662,7 @@ class DownloadOrchestrator:
             downloaded = self._find_output_file(out_stem)
             if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 0:
                 self._rate_limiter.record_success("youtube")
+                self._throttle.on_success("youtube")
                 return downloaded
 
         return None
@@ -656,6 +678,10 @@ class DownloadOrchestrator:
         """
         if not self._rate_limiter.is_healthy("soundcloud"):
             logger.warning("SoundCloud circuit breaker open; skipping Tier 5.")
+            return None
+
+        if not self._throttle.wait("soundcloud"):
+            logger.info("Throttle skip: soundcloud track %d — will retry next run", track.id)
             return None
 
         query = f"scsearch8:{track.title} {track.artist}"
@@ -679,6 +705,7 @@ class DownloadOrchestrator:
         downloaded = self._find_output_file(out_stem)
         if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 0:
             self._rate_limiter.record_success("soundcloud")
+            self._throttle.on_success("soundcloud")
             return downloaded
 
         return None
