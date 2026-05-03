@@ -87,6 +87,12 @@ services:
       # Container-internal mount point for the media drive — always /media
       # regardless of the host path in EXTERNAL_MEDIA_DRIVE.
       - MEDIA_DIR=/media
+    # Use public DNS — Docker's internal resolver ([Errno -2] Name or service not
+    # known) fails to resolve SpotiFLAC backend hostnames (monochrome.tf,
+    # deezmate.com, spotisaver.net).  Cloudflare first, Google as fallback.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     restart: unless-stopped
     depends_on:
       postgres:

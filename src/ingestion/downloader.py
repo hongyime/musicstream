@@ -78,6 +78,10 @@ _GIVE_UP_THRESHOLD = 25    # ~5 complete tier-chain runs before giving up
 # One active spotdl download at a time prevents 4 workers from hitting the limit together.
 _SPOTDL_SEMAPHORE = threading.Semaphore(1)
 
+# SpotiFLAC serialisation — deezmate and monochrome.tf return 429 under concurrent load.
+# Two slots preserves some parallelism while halving the request rate.
+_SPOTIFLAC_SEMAPHORE = threading.Semaphore(2)
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -320,9 +324,16 @@ class DownloadOrchestrator:
 
     def _tier1_spotiflac(self, track: Track) -> Optional[str]:
         """
-        Attempt FLAC download via SpotiFLAC.
-        Tries services in order: qobuz, tidal, amazon, deezer.
-        Returns the path to the downloaded file, or None on failure.
+        Attempt FLAC download via SpotiFLAC (qobuz → tidal → amazon → deezer).
+        Returns the downloaded file path, or None on failure.
+
+        Rate-limit handling:
+          - 429 / "Too Many Requests": soft-fail (no CB increment) — the backend
+            is alive but overloaded; the track will retry on the next run.
+          - DNS / connection errors: CB failure — retrying immediately won't help.
+
+        Concurrency: _SPOTIFLAC_SEMAPHORE(2) caps parallel calls so backends
+        are not hammered by all 4 workers simultaneously.
         """
         if not SPOTIFLAC_AVAILABLE:
             logger.warning("Tier 1 skipped for track %d ('%s'): SpotiFLAC not installed", track.id, track.title)
@@ -336,20 +347,46 @@ class DownloadOrchestrator:
             logger.warning("Tier 1 skipped for track %d ('%s'): no spotify_id", track.id, track.title)
             return None
 
+        if not _SPOTIFLAC_SEMAPHORE.acquire(timeout=30):
+            logger.warning("SpotiFLAC semaphore timeout for track %d; skipping this run.", track.id)
+            return None
+
         spotify_url = f"https://open.spotify.com/track/{track.spotify_id}"
         out_dir = os.path.join(TEMP_DIR, f"spotiflac_{uuid.uuid4().hex}")
         os.makedirs(out_dir, exist_ok=True)
 
         try:
-            _SpotiFLAC(
-                url=spotify_url,
-                output_dir=out_dir,
-                services=["qobuz", "tidal", "amazon", "deezer"],
-            )
+            # Run in a thread so we can impose a hard timeout — SpotiFLAC can
+            # hang indefinitely on a DNS failure before raising.
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(
+                    _SpotiFLAC,
+                    url=spotify_url,
+                    output_dir=out_dir,
+                    services=["qobuz", "tidal", "amazon", "deezer"],
+                )
+                try:
+                    fut.result(timeout=150)
+                except _cf.TimeoutError:
+                    logger.warning("SpotiFLAC timed out for track %d ('%s')", track.id, track.title)
+                    self._rate_limiter.record_failure("spotiflac")
+                    return None
+
         except Exception as exc:
+            msg = str(exc).lower()
+            if "429" in msg or "too many requests" in msg or "rate limit" in msg:
+                logger.warning(
+                    "SpotiFLAC rate-limited for track %d ('%s') — backend overloaded, will retry next run",
+                    track.id, track.title,
+                )
+                # 429 is transient overload, not a service failure — don't open CB.
+                return None
             logger.warning("SpotiFLAC failed for track %d ('%s'): %s", track.id, track.title, exc)
             self._rate_limiter.record_failure("spotiflac")
             return None
+        finally:
+            _SPOTIFLAC_SEMAPHORE.release()
 
         for root, _, files in os.walk(out_dir):
             for fname in files:
