@@ -75,6 +75,7 @@ class ServiceRateLimiter:
         "acoustid":     ServiceRateConfig(base=0.5,  max=30,   concurrent=3),
         "listenbrainz": ServiceRateConfig(base=1.0,  max=60,   concurrent=5),
         "coverart":     ServiceRateConfig(base=0.5,  max=30,   concurrent=5),
+        "soundcloud":   ServiceRateConfig(base=2.0,  max=60,   concurrent=3),
     }
 
     CIRCUIT_BREAKER_THRESHOLD: int = 5       # default consecutive failures before unhealthy
