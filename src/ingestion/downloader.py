@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -334,12 +335,16 @@ class DownloadOrchestrator:
         Returns the downloaded file path, or None on failure.
 
         Rate-limit handling:
-          - 429 / "Too Many Requests": soft-fail (no CB increment) — the backend
-            is alive but overloaded; the track will retry on the next run.
+          - 429 / "Too Many Requests": soft-fail with retry (up to 3 attempts with exponential backoff)
           - DNS / connection errors: CB failure — retrying immediately won't help.
 
         Concurrency: _SPOTIFLAC_SEMAPHORE(2) caps parallel calls so backends
         are not hammered by all 4 workers simultaneously.
+
+        Retry logic for 429 errors:
+          - First attempt: no delay
+          - Second attempt: 15 seconds wait
+          - Third attempt: 30 seconds wait
         """
         if not SPOTIFLAC_AVAILABLE:
             logger.warning("Tier 1 skipped for track %d ('%s'): SpotiFLAC not installed", track.id, track.title)
@@ -353,75 +358,130 @@ class DownloadOrchestrator:
             logger.warning("Tier 1 skipped for track %d ('%s'): no spotify_id", track.id, track.title)
             return None
 
-        if not self._throttle.wait("spotiflac"):
-            logger.info("Throttle skip: spotiflac track %d — will retry next run", track.id)
-            return None
-
-        if not _SPOTIFLAC_SEMAPHORE.acquire(timeout=30):
-            logger.warning("SpotiFLAC semaphore timeout for track %d; skipping this run.", track.id)
-            return None
-
         spotify_url = f"https://open.spotify.com/track/{track.spotify_id}"
-        out_dir = os.path.join(TEMP_DIR, f"spotiflac_{uuid.uuid4().hex}")
-        os.makedirs(out_dir, exist_ok=True)
 
-        try:
-            # Run in a thread so we can impose a hard timeout — SpotiFLAC can
-            # hang indefinitely on a DNS failure before raising.
-            import concurrent.futures as _cf
-            with _cf.ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(
-                    _SpotiFLAC,
-                    url=spotify_url,
-                    output_dir=out_dir,
-                    services=["qobuz", "tidal", "amazon", "deezer"],
-                )
-                try:
-                    fut.result(timeout=150)
-                except _cf.TimeoutError:
-                    logger.warning("SpotiFLAC timed out for track %d ('%s')", track.id, track.title)
-                    self._rate_limiter.record_failure("spotiflac")
+        # Retry logic for 429 rate limit errors
+        max_retries = 3
+        retry_delays = [0, 15, 30]  # seconds: first try, then 15s, then 30s
+
+        for attempt in range(max_retries):
+            if not self._throttle.wait("spotiflac"):
+                logger.info("Throttle skip: spotiflac track %d — will retry next run", track.id)
+                return None
+
+            if not _SPOTIFLAC_SEMAPHORE.acquire(timeout=30):
+                logger.warning("SpotiFLAC semaphore timeout for track %d; skipping this run.", track.id)
+                return None
+
+            out_dir = os.path.join(TEMP_DIR, f"spotiflac_{uuid.uuid4().hex}")
+            os.makedirs(out_dir, exist_ok=True)
+
+            try:
+                # Wait before retry (not on first attempt)
+                if attempt > 0:
+                    delay = retry_delays[attempt]
+                    logger.info(
+                        "SpotiFLAC retry %d/%d for track %d ('%s'): waiting %ds due to rate limit",
+                        attempt + 1, max_retries, track.id, track.title, delay,
+                    )
+                    time.sleep(delay)
+
+                # Run in a thread so we can impose a hard timeout — SpotiFLAC can
+                # hang indefinitely on a DNS failure before raising.
+                import concurrent.futures as _cf
+                
+                # Prepare Qobuz credentials if available
+                qobuz_email = os.environ.get("QOBUZ_EMAIL", "")
+                qobuz_password_md5 = os.environ.get("QOBUZ_PASSWORD_MD5", "")
+                
+                with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+                    spotiflac_kwargs = {
+                        "url": spotify_url,
+                        "output_dir": out_dir,
+                        "services": ["qobuz", "tidal", "amazon", "deezer"],
+                    }
+                    # Only add Qobuz credentials if both are provided
+                    if qobuz_email and qobuz_password_md5:
+                        spotiflac_kwargs["qobuz_email"] = qobuz_email
+                        spotiflac_kwargs["qobuz_password_md5"] = qobuz_password_md5
+                        logger.debug("Using Qobuz authentication for track %d", track.id)
+                    
+                    fut = ex.submit(_SpotiFLAC, **spotiflac_kwargs)
+                    try:
+                        fut.result(timeout=150)
+                    except _cf.TimeoutError:
+                        logger.warning("SpotiFLAC timed out for track %d ('%s')", track.id, track.title)
+                        self._rate_limiter.record_failure("spotiflac")
+                        _SPOTIFLAC_SEMAPHORE.release()
+                        continue  # Try next retry
+
+            except Exception as exc:
+                # Walk the full exception chain — SpotiFLAC wraps backend 429s in
+                # generic messages ("Deezer download failed"), so str(exc) alone misses them.
+                if self._exc_contains_rate_limit(exc):
+                    logger.warning(
+                        "SpotiFLAC rate-limited for track %d ('%s') (attempt %d/%d) — backend overloaded",
+                        track.id, track.title, attempt + 1, max_retries,
+                    )
+                    self._throttle.on_rate_limit("spotiflac")
+                    _SPOTIFLAC_SEMAPHORE.release()
+
+                    # If we haven't exhausted retries, continue to the next attempt
+                    if attempt < max_retries - 1:
+                        continue
+                    else:
+                        logger.warning(
+                            "SpotiFLAC exhausted all retries for track %d ('%s') — will retry next run",
+                            track.id, track.title,
+                        )
+                        return None
+
+                # "Failed all services" means every backend had a transient error
+                # (DNS/-3, 429 wrapped, etc.) — SpotiFLAC itself is healthy.
+                msg = str(exc).lower()
+                if "failed all services" in msg or "all services failed" in msg:
+                    logger.warning(
+                        "SpotiFLAC all-services transient failure for track %d ('%s') (attempt %d/%d): %s",
+                        track.id, track.title, attempt + 1, max_retries, exc,
+                    )
+                    _SPOTIFLAC_SEMAPHORE.release()
+
+                    # Check if this might be a rate limit in the exception chain
+                    if self._exc_contains_rate_limit(exc):
+                        if attempt < max_retries - 1:
+                            continue
+                        else:
+                            return None
                     return None
 
-        except Exception as exc:
-            # Walk the full exception chain — SpotiFLAC wraps backend 429s in
-            # generic messages ("Deezer download failed"), so str(exc) alone misses them.
-            if self._exc_contains_rate_limit(exc):
-                logger.warning(
-                    "SpotiFLAC rate-limited for track %d ('%s') — backend overloaded, will retry next run",
-                    track.id, track.title,
-                )
-                self._throttle.on_rate_limit("spotiflac")
+                logger.warning("SpotiFLAC failed for track %d ('%s'): %s", track.id, track.title, exc)
+                self._rate_limiter.record_failure("spotiflac")
+                _SPOTIFLAC_SEMAPHORE.release()
                 return None
-            # "Failed all services" means every backend had a transient error
-            # (DNS/-3, 429 wrapped, etc.) — SpotiFLAC itself is healthy.
-            msg = str(exc).lower()
-            if "failed all services" in msg or "all services failed" in msg:
-                logger.warning(
-                    "SpotiFLAC all-services transient failure for track %d ('%s'): %s",
-                    track.id, track.title, exc,
-                )
-                return None
-            logger.warning("SpotiFLAC failed for track %d ('%s'): %s", track.id, track.title, exc)
-            self._rate_limiter.record_failure("spotiflac")
-            return None
-        finally:
+            finally:
+                # Only release if we haven't already released it in the exception handlers
+                # The semaphore release is handled in each branch above
+
+            # Check for downloaded files
+            for root, _, files in os.walk(out_dir):
+                for fname in files:
+                    if fname.endswith((".flac", ".m4a", ".mp3", ".ogg", ".opus")):
+                        found = os.path.join(root, fname)
+                        if os.path.getsize(found) > 0:
+                            ext = os.path.splitext(fname)[1]
+                            dest = os.path.join(out_dir, f"{uuid.uuid4().hex}_spotiflac{ext}")
+                            os.rename(found, dest)
+                            self._rate_limiter.record_success("spotiflac")
+                            self._throttle.on_success("spotiflac")
+                            logger.info("SpotiFLAC: track %d downloaded → %s (attempt %d/%d)", track.id, os.path.basename(dest), attempt + 1, max_retries)
+                            _SPOTIFLAC_SEMAPHORE.release()
+                            return dest
+
+            logger.warning("SpotiFLAC: no file produced for track %d ('%s') (attempt %d/%d)", track.id, track.title, attempt + 1, max_retries)
             _SPOTIFLAC_SEMAPHORE.release()
 
-        for root, _, files in os.walk(out_dir):
-            for fname in files:
-                if fname.endswith((".flac", ".m4a", ".mp3", ".ogg", ".opus")):
-                    found = os.path.join(root, fname)
-                    if os.path.getsize(found) > 0:
-                        ext = os.path.splitext(fname)[1]
-                        dest = os.path.join(out_dir, f"{uuid.uuid4().hex}_spotiflac{ext}")
-                        os.rename(found, dest)
-                        self._rate_limiter.record_success("spotiflac")
-                        self._throttle.on_success("spotiflac")
-                        logger.info("SpotiFLAC: track %d downloaded → %s", track.id, os.path.basename(dest))
-                        return dest
-
-        logger.warning("SpotiFLAC: no file produced for track %d ('%s')", track.id, track.title)
+        # All retries exhausted
+        logger.warning("SpotiFLAC: exhausted all retries for track %d ('%s')", track.id, track.title)
         self._rate_limiter.record_failure("spotiflac")
         return None
 
