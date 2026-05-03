@@ -2,18 +2,19 @@
 musicstream/ingestion/downloader.py — 5-tier download orchestrator
 
 Implements the full tier chain for downloading tracks:
-  Tier 1: SpotiFLAC (qobuz/tidal/amazon/deezer/youtube) — FLAC, 120s timeout
+  Tier 1: SpotiFLAC (qobuz/tidal/amazon/deezer) — FLAC lossless
   Tier 2: yt-dlp + ytmusicapi (songs→videos→no filter) — MP3 320kbps, ±5s duration check
-  Tier 3: spotdl — MP3 320kbps
+  Tier 3: spotdl Python API — MP3 320kbps, requires Spotify credentials
   Tier 4: yt-dlp YouTube direct search (ytsearch12) — MP3 320kbps
   Tier 5: yt-dlp SoundCloud (scsearch8) — MP3 320kbps
 
-After ≥9 failed attempts: status='failed', log [DOWNLOAD_FAIL] to errors.log.
+After ≥25 failed attempts: status='failed', log [DOWNLOAD_FAIL] to errors.log.
 MAX_CONCURRENT = 4 parallel workers via ThreadPoolExecutor.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import uuid
@@ -211,8 +212,8 @@ class DownloadOrchestrator:
             # Ordered: highest quality → most reliable fallback
             ("tier1_spotiflac",        self._tier1_spotiflac),         # FLAC lossless
             ("tier2_ytdlp_ytm",        self._tier2_ytdlp_ytm),         # MP3 320, best YT matching
-            ("tier3_ytdlp_youtube",    self._tier4_ytdlp_youtube),     # MP3 320, reliable direct search
-            ("tier4_spotdl",           self._tier3_spotdl),            # MP3 320, needs client_secret
+            ("tier3_spotdl",           self._tier3_spotdl),            # MP3 320, needs client_secret
+            ("tier4_ytdlp_youtube",    self._tier4_ytdlp_youtube),     # MP3 320, reliable direct search
             ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),  # MP3 320, last resort
         ]
 
@@ -315,7 +316,7 @@ class DownloadOrchestrator:
     def _tier1_spotiflac(self, track: Track) -> Optional[str]:
         """
         Attempt FLAC download via SpotiFLAC.
-        Tries services in order: tidal, qobuz, amazon, deezer, youtube.
+        Tries services in order: qobuz, tidal, amazon, deezer.
         Returns the path to the downloaded file, or None on failure.
         """
         if not SPOTIFLAC_AVAILABLE:
@@ -334,8 +335,6 @@ class DownloadOrchestrator:
         out_dir = os.path.join(TEMP_DIR, f"spotiflac_{uuid.uuid4().hex}")
         os.makedirs(out_dir, exist_ok=True)
 
-        # API confirmed: output_dir + services valid in 0.2.6.
-        # quality= does NOT exist in 0.2.6 — omit it.
         try:
             _SpotiFLAC(
                 url=spotify_url,
@@ -457,9 +456,9 @@ class DownloadOrchestrator:
 
     def _tier3_spotdl(self, track: Track) -> Optional[str]:
         """
-        Download via spotdl using the Spotify URI. Output: MP3 320kbps to temp/.
+        Download via spotdl Python API using the Spotify URI. Output: MP3 320kbps to temp/.
         Returns temp file path or None.
-        Requires SPOTIFY_CLIENT_SECRET env var.
+        Requires SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET env vars.
         """
         if not SPOTDL_AVAILABLE:
             return None
@@ -468,47 +467,52 @@ class DownloadOrchestrator:
             logger.warning("spotdl circuit breaker open; skipping Tier 3.")
             return None
 
+        client_id = os.environ.get("SPOTIFY_CLIENT_ID", "")
         client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
-        if not client_secret:
-            logger.warning("SPOTIFY_CLIENT_SECRET not set; skipping Tier 3 spotdl.")
+        if not client_id or not client_secret:
+            logger.warning("SPOTIFY_CLIENT_ID/SECRET not set; skipping Tier 3 spotdl.")
             return None
 
         # Unique subdir per download — prevents picking up stale files from
         # previous failed attempts that are still sitting in temp/.
         spotdl_dir = os.path.join(TEMP_DIR, f"spotdl_{uuid.uuid4().hex}")
         os.makedirs(spotdl_dir, exist_ok=True)
+
+        # Each call gets a fresh event loop — worker threads have no running loop.
+        loop = asyncio.new_event_loop()
         try:
-            import subprocess as _sp
-            result = _sp.run(
-                [
-                    "spotdl",
-                    "--output", os.path.abspath(spotdl_dir),
-                    "--client-id", os.environ.get("SPOTIFY_CLIENT_ID", ""),
-                    "--client-secret", client_secret,
-                    track.spotify_uri,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=180,
+            client = Spotdl(
+                client_id=client_id,
+                client_secret=client_secret,
+                downloader_settings={
+                    "output": os.path.abspath(spotdl_dir),
+                    "format": "mp3",
+                    "bitrate": "320k",
+                    "overwrite": "force",
+                    "log_level": "ERROR",
+                },
+                loop=loop,
             )
-            if result.returncode != 0:
-                logger.warning("spotdl exited %d for track %d: %s", result.returncode, track.id, result.stderr[:300])
+
+            songs = client.search([track.spotify_uri])
+            if not songs:
+                logger.warning("spotdl: no search results for track %d ('%s')", track.id, track.title)
                 self._rate_limiter.record_failure("spotdl")
                 return None
 
-            for fname in os.listdir(spotdl_dir):
-                if fname.endswith((".mp3", ".flac", ".ogg", ".m4a", ".opus")):
-                    candidate = os.path.join(spotdl_dir, fname)
-                    if os.path.getsize(candidate) > 0:
-                        self._rate_limiter.record_success("spotdl")
-                        return candidate
+            _song, path = client.download(songs[0])
+            if path is None or not path.exists():
+                self._rate_limiter.record_failure("spotdl")
+                return None
 
-            self._rate_limiter.record_failure("spotdl")
-            return None
+            self._rate_limiter.record_success("spotdl")
+            return str(path)
 
         except Exception as exc:
             self._rate_limiter.record_failure("spotdl")
             raise DownloadError(f"Tier 3 spotdl failed: {exc}") from exc
+        finally:
+            loop.close()
 
     # ── Tier 4: yt-dlp YouTube direct search ─────────────────────────────────
 
@@ -603,8 +607,7 @@ class DownloadOrchestrator:
 
     def _should_give_up(self, session: Session, track_id: int) -> bool:
         """
-        Returns True if the track has ≥9 failed attempts recorded.
-        (3 complete tier-chain runs × 5 tiers = 15 max, but threshold is 9.)
+        Returns True if the track has ≥25 failed attempts recorded.
         """
         failed_count = session.execute(
             select(func.count(DownloadAttempt.id)).where(
@@ -677,18 +680,12 @@ class DownloadOrchestrator:
         Map internal tier name + file path to the canonical download_method label.
 
         Labels per spec:
-          spotiflac_qobuz | spotiflac_tidal | spotiflac_amazon |
-          spotiflac_deezer | spotiflac_youtube |
-          ytdlp_ytm | spotdl | ytdlp_yt | ytdlp_soundcloud
+          spotiflac | ytdlp_ytm | spotdl | ytdlp_yt | ytdlp_soundcloud
         """
         if tier_name == "tier1_spotiflac":
-            # Service name encoded in filename: {hex}_{service}.ext
-            basename = os.path.basename(file_path)
-            name_no_ext = os.path.splitext(basename)[0]
-            # Split on last underscore to get service
-            parts = name_no_ext.rsplit("_", 1)
-            service = parts[1] if len(parts) == 2 else "unknown"
-            return f"spotiflac_{service}"
+            # SpotiFLAC names output files by track title, not by service —
+            # there is no reliable way to recover which backend succeeded.
+            return "spotiflac"
         elif tier_name == "tier2_ytdlp_ytm":
             return "ytdlp_ytm"
         elif tier_name == "tier3_spotdl":

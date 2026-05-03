@@ -2,7 +2,7 @@
 Tests for musicstream/ingestion/downloader.py
 
 Covers:
-  - _should_give_up(): threshold logic (≥9 failed attempts)
+  - _should_give_up(): threshold logic (≥25 failed attempts)
   - _record_attempt(): writes DownloadAttempt row
   - _resolve_method_label(): correct label per tier
   - _build_mp3_opts(): correct yt-dlp options
@@ -85,8 +85,8 @@ class TestConstants:
     def test_max_concurrent_is_4(self):
         assert DownloadOrchestrator.MAX_CONCURRENT == 4
 
-    def test_give_up_threshold_is_9(self):
-        assert _GIVE_UP_THRESHOLD == 9
+    def test_give_up_threshold_is_25(self):
+        assert _GIVE_UP_THRESHOLD == 25
 
 
 # ── _should_give_up ───────────────────────────────────────────────────────────
@@ -100,13 +100,13 @@ class TestShouldGiveUp:
 
     def test_at_threshold_returns_true(self, session):
         track = _make_track(session, "spotify:track:giveup_at")
-        _add_failed_attempts(session, track.id, 9)
+        _add_failed_attempts(session, track.id, 25)
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         assert orch._should_give_up(session, track.id) is True
 
     def test_above_threshold_returns_true(self, session):
         track = _make_track(session, "spotify:track:giveup_above")
-        _add_failed_attempts(session, track.id, 12)
+        _add_failed_attempts(session, track.id, 30)
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         assert orch._should_give_up(session, track.id) is True
 
@@ -165,11 +165,12 @@ class TestRecordAttempt:
 
 class TestResolveMethodLabel:
     @pytest.mark.parametrize("tier,path,expected", [
-        ("tier1_spotiflac", "/tmp/abc_qobuz.flac",    "spotiflac_qobuz"),
-        ("tier1_spotiflac", "/tmp/abc_tidal.flac",    "spotiflac_tidal"),
-        ("tier1_spotiflac", "/tmp/abc_amazon.flac",   "spotiflac_amazon"),
-        ("tier1_spotiflac", "/tmp/abc_deezer.flac",   "spotiflac_deezer"),
-        ("tier1_spotiflac", "/tmp/abc_youtube.flac",  "spotiflac_youtube"),
+        # SpotiFLAC names files by track title — service cannot be recovered from path.
+        ("tier1_spotiflac", "/tmp/abc_qobuz.flac",    "spotiflac"),
+        ("tier1_spotiflac", "/tmp/abc_tidal.flac",    "spotiflac"),
+        ("tier1_spotiflac", "/tmp/abc_amazon.flac",   "spotiflac"),
+        ("tier1_spotiflac", "/tmp/abc_deezer.flac",   "spotiflac"),
+        ("tier1_spotiflac", "/tmp/abc_youtube.flac",  "spotiflac"),
         ("tier2_ytdlp_ytm",     "/tmp/x.mp3",  "ytdlp_ytm"),
         ("tier3_spotdl",        "/tmp/x.mp3",  "spotdl"),
         ("tier4_ytdlp_youtube", "/tmp/x.mp3",  "ytdlp_yt"),
@@ -226,26 +227,33 @@ class TestDownloadTrackIsolation:
         assert result is False  # must return False, not raise
 
     def test_successful_tier_returns_true_and_sets_downloaded(self, session):
+        from src.models import TrackStatus as TS
         track = _make_track(session, "spotify:track:tier1_success")
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         orch._rate_limiter = MagicMock()
+        orch._tagger = MagicMock()
 
-        # The method label is derived from the filename: {uuid}_{service}.flac
-        # split("_", 1) on "someuuid_qobuz" → ["someuuid", "qobuz"] → "spotiflac_qobuz"
-        # Use a filename with exactly one underscore to get the right label
-        fake_path = "/tmp/abc123_qobuz.flac"
+        # organise() must set track.status itself (FileOrganiser does this)
+        def _fake_organise(path, trk, sess):
+            trk.status = TS.DOWNLOADED.value
+            return "/media/artist/album/track.flac"
+
+        orch._organiser = MagicMock()
+        orch._organiser.organise.side_effect = _fake_organise
+
+        fake_path = "/tmp/abc123_spotiflac.flac"
         with patch.object(orch, "_tier1_spotiflac", return_value=fake_path), \
              patch.object(orch, "_record_attempt"):
             result = orch.download_track(track, session)
 
         assert result is True
         assert track.status == TrackStatus.DOWNLOADED.value
-        assert track.download_method == "spotiflac_qobuz"
+        assert track.download_method == "spotiflac"
 
     def test_status_set_to_failed_after_give_up(self, session):
         track = _make_track(session, "spotify:track:give_up_test")
-        # Pre-load 9 failed attempts
-        _add_failed_attempts(session, track.id, 9)
+        # Pre-load enough failures to cross the give-up threshold (25)
+        _add_failed_attempts(session, track.id, 25)
 
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         orch._rate_limiter = MagicMock()
@@ -283,37 +291,17 @@ class TestBug1YouTubeFormatSelectorExploration:
     EXPECTED OUTCOME after fix: Test PASSES (flexible selector accepts any format)
     """
     
-    def test_format_selector_is_restrictive_on_unfixed_code(self):
+    def test_format_selector_is_flexible(self):
         """
-        Verify the current format selector is overly restrictive.
-        
-        This test documents the bug: the format selector explicitly lists only
-        webm, m4a, and mp4 formats, which will fail when videos provide other formats.
-        
-        After the fix, this test will need to be updated to verify the flexible selector.
+        Verify the format selector is the permissive "bestaudio/best".
+
+        The old restrictive selector (bestaudio[ext=webm]/bestaudio[ext=m4a]/...)
+        was replaced with "bestaudio/best" so that any available audio format
+        is accepted and post-processed to MP3 320kbps by FFmpeg.
         """
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         opts = orch._build_mp3_opts("/tmp/test")
-        
-        # Current buggy format selector
-        current_selector = opts["format"]
-        
-        # This assertion documents the bug - the selector is too restrictive
-        assert "bestaudio[ext=webm]" in current_selector, \
-            "Current selector should explicitly list webm"
-        assert "bestaudio[ext=m4a]" in current_selector, \
-            "Current selector should explicitly list m4a"
-        
-        # The bug: opus, mp3, and other formats are NOT in the selector
-        assert "opus" not in current_selector, \
-            "BUG: Current selector does not include opus format"
-        assert "[ext=mp3]" not in current_selector, \
-            "BUG: Current selector does not explicitly include mp3 format"
-        
-        # After fix, the selector should be "bestaudio/best" which accepts any format
-        # This test will fail after the fix is applied, which is expected
-        assert current_selector != "bestaudio/best", \
-            "UNFIXED CODE: Selector should still be restrictive (not yet fixed to 'bestaudio/best')"
+        assert opts["format"] == "bestaudio/best"
     
     def test_opus_format_not_in_selector_list(self):
         """
@@ -345,26 +333,17 @@ class TestBug1YouTubeFormatSelectorExploration:
         assert "[ext=mp3]" not in format_selector, \
             "BUG CONFIRMED: mp3 format is not explicitly in the selector"
     
-    def test_combined_streams_may_not_match_selector(self):
+    def test_combined_streams_accepted_by_selector(self):
         """
-        Counterexample 3: Combined video+audio streams may not match the selector.
-        
-        The current selector prefers separate audio streams with specific extensions.
-        Videos with only combined streams (e.g., best[ext=webm] with both video and audio)
-        may not match if they don't have the exact format specified.
-        
-        After fix, "bestaudio/best" will accept any combined stream as fallback.
+        The "bestaudio/best" selector accepts combined video+audio streams as a
+        fallback, meaning no stream type is unnecessarily excluded.
         """
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         opts = orch._build_mp3_opts("/tmp/test")
-        
-        # Document the bug: selector is too specific about formats
         format_selector = opts["format"]
-        
-        # The selector requires specific extensions, which may not match all combined streams
         assert "/" in format_selector, "Selector uses fallback chain"
-        assert "bestaudio[ext=" in format_selector, \
-            "BUG: Selector requires specific audio extensions, may reject valid combined streams"
+        assert "bestaudio[ext=" not in format_selector, \
+            "Selector should not restrict to specific extensions"
 
 
 # ── Property 2: Preservation Tests ───────────────────────────────────────────
