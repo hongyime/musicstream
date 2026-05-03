@@ -61,14 +61,14 @@ services:
       context: .
       dockerfile: Dockerfile.daemon
     container_name: musicstream-daemon
+    env_file:
+      - .env
     volumes:
       - ${EXTERNAL_MEDIA_DRIVE}:/media
       - ./logs:/app/logs
       - ./backups:/app/backups
-      - ./.env:/app/.env:ro
-      - ./cookies.txt:/app/cookies.txt:ro
-      - ./spotify_token.json:/app/spotify_token.json
-    # Note: cookies.txt and spotify_token.json must exist on the host
+    # cookies.txt and spotify_token.json are baked into the image via COPY . .
+    # File bind-mounts with spaces in the host path fail on Docker Desktop / WSL2.
     ports:
       - "9079:9079"
     environment:
