@@ -358,6 +358,12 @@ class MetadataTagger:
 
     def _parse_recording(self, rec: dict) -> MBData:
         """Extract MBData from a MusicBrainz recording JSON object."""
+        # Add type checking to prevent errors
+        if not isinstance(rec, dict):
+            logger.warning("Invalid recording data type: %s, expected dict", type(rec))
+            logger.debug("Recording data: %s", rec)
+            return MBData()
+
         mb = MBData()
         mb.recording_id = rec.get("id")
         mb.title = rec.get("title")
@@ -368,29 +374,44 @@ class MetadataTagger:
             first = artist_credits[0]
             if isinstance(first, dict):
                 mb.artist = first.get("name") or (first.get("artist") or {}).get("name")
+            elif isinstance(first, str):
+                # Some MusicBrainz responses return artist-credit as string
+                mb.artist = first
+            else:
+                logger.warning("Unexpected artist-credit type: %s", type(first))
 
         # First release
         releases = rec.get("releases", [])
         if releases:
-            rel = releases[0]
-            mb.release_id = rel.get("id")
-            mb.album = rel.get("title")
+            # Add type check for release
+            first_release = releases[0]
+            if not isinstance(first_release, dict):
+                logger.warning("Invalid release data type: %s, expected dict", type(first_release))
+                logger.debug("Release data: %s", first_release)
+            else:
+                rel = first_release
+                mb.release_id = rel.get("id")
+                mb.album = rel.get("title")
 
-            # Year from release date
-            date_str = rel.get("date", "")
-            if date_str:
-                mb.year = date_str[:4]
+                # Year from release date
+                date_str = rel.get("date", "")
+                if date_str:
+                    mb.year = date_str[:4]
 
-            # Track number from media
-            media = rel.get("media", [])
-            if media:
-                tracks = media[0].get("tracks", [])
-                if tracks:
-                    pos = tracks[0].get("position") or tracks[0].get("number")
-                    try:
-                        mb.track_number = int(pos)
-                    except (TypeError, ValueError):
-                        pass
+                # Track number from media
+                media = rel.get("media", [])
+                if media:
+                    first_media = media[0]
+                    if isinstance(first_media, dict):
+                        tracks = first_media.get("tracks", [])
+                        if tracks:
+                            pos = tracks[0].get("position") or tracks[0].get("number")
+                            try:
+                                mb.track_number = int(pos)
+                            except (TypeError, ValueError):
+                                pass
+                    else:
+                        logger.warning("Invalid media data type: %s, expected dict", type(first_media))
 
         return mb
 

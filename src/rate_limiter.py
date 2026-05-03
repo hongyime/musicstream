@@ -67,7 +67,7 @@ class ServiceRateLimiter:
 
     CONFIGS: Dict[str, ServiceRateConfig] = {
         "spotify":      ServiceRateConfig(base=3.0,  max=3600, concurrent=10),
-        "spotiflac":    ServiceRateConfig(base=5.0,  max=300,  concurrent=2),
+        "spotiflac":    ServiceRateConfig(base=10.0, max=600,  concurrent=2),  # Increased base/backoff for Deezer 429
         "youtube":      ServiceRateConfig(base=4.0,  max=600,  concurrent=3),
         "ytmusicapi":   ServiceRateConfig(base=2.5,  max=300,  concurrent=5),
         "spotdl":       ServiceRateConfig(base=3.0,  max=180,  concurrent=3),
@@ -271,7 +271,7 @@ class ServiceThrottle:
     """
 
     CONFIGS: Dict[str, ThrottleConfig] = {
-        "spotiflac":  ThrottleConfig(floor=6.0, ceiling=60.0),   # random(6, 9)
+        "spotiflac":  ThrottleConfig(floor=10.0, ceiling=120.0),  # Increased to reduce Deezer 429 errors
         "youtube":    ThrottleConfig(floor=4.5, ceiling=60.0),   # random(4.5, 6.75)
         "soundcloud": ThrottleConfig(floor=1.5, ceiling=30.0),   # random(1.5, 2.25)
         "spotdl":     ThrottleConfig(floor=4.5, ceiling=60.0),   # random(4.5, 6.75)
