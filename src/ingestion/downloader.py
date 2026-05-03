@@ -341,7 +341,6 @@ class DownloadOrchestrator:
                 url=spotify_url,
                 output_dir=out_dir,
                 services=["qobuz", "tidal", "amazon", "deezer"],
-                log_level=logging.WARNING,
             )
         except Exception as exc:
             logger.warning("SpotiFLAC failed for track %d ('%s'): %s", track.id, track.title, exc)
@@ -624,10 +623,10 @@ class DownloadOrchestrator:
         Output template uses the stem; the final file will be {stem}.mp3.
         """
         opts: dict = {
-            # Preference: webm/m4a separate audio streams → any separate audio
-            # → best combined format. Maximises compatibility with restricted
-            # YouTube videos that only serve muxed streams.
-            "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best[ext=mp4]/best",
+            # Flexible format selector accepts any available audio stream.
+            # Relies on FFmpeg post-processing to normalize output to MP3 320kbps.
+            # This eliminates format availability as a failure point.
+            "format": "bestaudio/best",
             "outtmpl": out_stem + ".%(ext)s",
             "postprocessors": [
                 {

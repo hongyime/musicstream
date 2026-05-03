@@ -285,3 +285,374 @@ class TestWriteTagsDispatch:
         tags = TagData(title="T", artist="A", album_artist="A")
         # Should log a warning but not raise
         self.tagger._write_tags("/tmp/song.ogg", tags)
+
+
+# ── Bug Condition Exploration: ISRC Response Parsing ──────────────────────────
+
+class TestISRCResponseParsingBugCondition:
+    """
+    Bug Condition Exploration Test for MusicBrainz ISRC Parsing
+    
+    **Property 1: Bug Condition** - ISRC Response Parsing Calls .get() on String
+    
+    **Validates: Requirements 1.7, 1.8, 1.9**
+    
+    **CRITICAL**: This test MUST FAIL on unfixed code - failure confirms the bug exists
+    **DO NOT attempt to fix the test or the code when it fails**
+    
+    **GOAL**: Surface counterexamples that demonstrate the bug exists
+    
+    The MusicBrainz /isrc/{isrc} endpoint returns:
+    {"isrc": "USRC17607839", "recordings": [{"id": "...", "title": "..."}]}
+    
+    The unfixed code attempts: data["isrc"].get("recordings")
+    But data["isrc"] is a STRING, not a dict, causing AttributeError.
+    
+    Expected behavior: ISRC lookup should parse recordings correctly without AttributeError.
+    """
+    
+    def setup_method(self):
+        self.tagger = _make_tagger()
+    
+    def test_isrc_lookup_with_valid_response_structure(self):
+        """
+        Test ISRC lookup with actual MusicBrainz response structure.
+        
+        **EXPECTED OUTCOME ON UNFIXED CODE**: 
+        Test FAILS with AttributeError: "'str' object has no attribute 'get'"
+        (this is correct - it proves the bug exists)
+        
+        **EXPECTED OUTCOME ON FIXED CODE**:
+        Test PASSES - recordings are parsed correctly without AttributeError
+        """
+        # Mock the MusicBrainz response with actual structure
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "isrc": "USRC17607839",  # This is a STRING, not a dict
+            "recordings": [
+                {
+                    "id": "rec-uuid-001",
+                    "title": "Test Recording",
+                    "artist-credit": [
+                        {
+                            "name": "Test Artist",
+                            "artist": {"name": "Test Artist"}
+                        }
+                    ],
+                    "releases": [
+                        {
+                            "id": "rel-uuid-001",
+                            "title": "Test Album",
+                            "date": "2023-01-15"
+                        }
+                    ]
+                }
+            ]
+        }
+        
+        with patch.object(self.tagger._mb_session, "get", return_value=mock_response):
+            with patch.object(self.tagger._rl, "wait"):
+                # Call the ISRC lookup method
+                result = self.tagger._mb_lookup_isrc("USRC17607839")
+        
+        # Expected behavior: should parse recordings correctly
+        assert result is not None, "ISRC lookup should return MBData"
+        assert result.recording_id == "rec-uuid-001", "Should extract recording ID"
+        assert result.title == "Test Recording", "Should extract title"
+        assert result.artist == "Test Artist", "Should extract artist"
+        assert result.release_id == "rel-uuid-001", "Should extract release ID"
+        assert result.album == "Test Album", "Should extract album"
+        assert result.year == "2023", "Should extract year from date"
+    
+    def test_isrc_lookup_with_multiple_recordings(self):
+        """
+        Test ISRC lookup when response contains multiple recordings.
+        Should use the first recording.
+        """
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "isrc": "GBUM71507847",
+            "recordings": [
+                {
+                    "id": "first-rec-id",
+                    "title": "First Recording",
+                    "artist-credit": [{"name": "Artist 1"}],
+                    "releases": []
+                },
+                {
+                    "id": "second-rec-id",
+                    "title": "Second Recording",
+                    "artist-credit": [{"name": "Artist 2"}],
+                    "releases": []
+                }
+            ]
+        }
+        
+        with patch.object(self.tagger._mb_session, "get", return_value=mock_response):
+            with patch.object(self.tagger._rl, "wait"):
+                result = self.tagger._mb_lookup_isrc("GBUM71507847")
+        
+        # Should use first recording
+        assert result is not None
+        assert result.recording_id == "first-rec-id"
+        assert result.title == "First Recording"
+    
+    def test_isrc_lookup_with_empty_recordings_array(self):
+        """
+        Test ISRC lookup when response has empty recordings array.
+        Should return None.
+        """
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "isrc": "USRC17600000",
+            "recordings": []  # Empty array
+        }
+        
+        with patch.object(self.tagger._mb_session, "get", return_value=mock_response):
+            with patch.object(self.tagger._rl, "wait"):
+                result = self.tagger._mb_lookup_isrc("USRC17600000")
+        
+        # Should return None when no recordings found
+        assert result is None
+
+
+# ── Preservation Property Tests: Non-ISRC MusicBrainz Lookups ────────────────
+
+class TestMusicBrainzPreservation:
+    """
+    Preservation Property Tests for Non-ISRC MusicBrainz Lookups
+    
+    **Property 2: Preservation** - Non-ISRC MusicBrainz Lookups Continue to Work
+    
+    **Validates: Requirements 3.7, 3.8, 3.9**
+    
+    **IMPORTANT**: These tests verify that non-ISRC MusicBrainz lookups 
+    (recording ID lookups, text searches) continue to work correctly after the fix.
+    
+    The ISRC bug fix should NOT affect these other lookup methods.
+    
+    **EXPECTED OUTCOME**: Tests PASS (confirms baseline behavior is preserved)
+    """
+    
+    def setup_method(self):
+        self.tagger = _make_tagger()
+    
+    def test_recording_id_lookup_succeeds(self):
+        """
+        Test MusicBrainz recording ID lookup continues to work.
+        
+        **Property**: For all valid recording IDs, _mb_lookup_recording returns MBData
+        
+        This lookup method was NOT affected by the ISRC bug and should continue working.
+        """
+        # Mock the MusicBrainz recording lookup response
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "id": "recording-uuid-001",
+            "title": "Test Recording",
+            "artist-credit": [
+                {
+                    "name": "Test Artist",
+                    "artist": {"name": "Test Artist"}
+                }
+            ],
+            "releases": [
+                {
+                    "id": "release-uuid-001",
+                    "title": "Test Album",
+                    "date": "2023-05-20",
+                    "media": [
+                        {
+                            "tracks": [
+                                {"position": "3"}
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+        
+        with patch.object(self.tagger._mb_session, "get", return_value=mock_response):
+            with patch.object(self.tagger._rl, "wait"):
+                result = self.tagger._mb_lookup_recording("recording-uuid-001")
+        
+        # Verify recording lookup succeeds and extracts metadata correctly
+        assert result is not None, "Recording lookup should return MBData"
+        assert result.recording_id == "recording-uuid-001"
+        assert result.title == "Test Recording"
+        assert result.artist == "Test Artist"
+        assert result.release_id == "release-uuid-001"
+        assert result.album == "Test Album"
+        assert result.year == "2023"
+        assert result.track_number == 3
+    
+    def test_text_search_succeeds(self):
+        """
+        Test MusicBrainz title+artist text search continues to work.
+        
+        **Property**: For all valid title+artist pairs, _mb_search returns MBData
+        
+        This lookup method was NOT affected by the ISRC bug and should continue working.
+        """
+        # Mock the MusicBrainz search response
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "recordings": [
+                {
+                    "id": "search-result-uuid",
+                    "title": "Bohemian Rhapsody",
+                    "artist-credit": [
+                        {
+                            "name": "Queen",
+                            "artist": {"name": "Queen"}
+                        }
+                    ],
+                    "releases": [
+                        {
+                            "id": "release-search-uuid",
+                            "title": "A Night at the Opera",
+                            "date": "1975-11-21"
+                        }
+                    ]
+                }
+            ]
+        }
+        
+        with patch.object(self.tagger._mb_session, "get", return_value=mock_response):
+            with patch.object(self.tagger._rl, "wait"):
+                result = self.tagger._mb_search("Bohemian Rhapsody", "Queen")
+        
+        # Verify text search succeeds and extracts metadata correctly
+        assert result is not None, "Text search should return MBData"
+        assert result.recording_id == "search-result-uuid"
+        assert result.title == "Bohemian Rhapsody"
+        assert result.artist == "Queen"
+        assert result.release_id == "release-search-uuid"
+        assert result.album == "A Night at the Opera"
+        assert result.year == "1975"
+    
+    def test_recording_lookup_with_minimal_metadata(self):
+        """
+        Test recording lookup with minimal metadata (no releases).
+        
+        **Property**: Recording lookups succeed even with incomplete metadata
+        """
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "id": "minimal-recording-id",
+            "title": "Minimal Track",
+            "artist-credit": [{"name": "Minimal Artist"}],
+            "releases": []  # No releases
+        }
+        
+        with patch.object(self.tagger._mb_session, "get", return_value=mock_response):
+            with patch.object(self.tagger._rl, "wait"):
+                result = self.tagger._mb_lookup_recording("minimal-recording-id")
+        
+        # Should still return MBData with available fields
+        assert result is not None
+        assert result.recording_id == "minimal-recording-id"
+        assert result.title == "Minimal Track"
+        assert result.artist == "Minimal Artist"
+        assert result.release_id is None
+        assert result.album is None
+    
+    def test_text_search_with_no_results(self):
+        """
+        Test text search when no recordings are found.
+        
+        **Property**: Text search returns None when no matches found
+        """
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "recordings": []  # No results
+        }
+        
+        with patch.object(self.tagger._mb_session, "get", return_value=mock_response):
+            with patch.object(self.tagger._rl, "wait"):
+                result = self.tagger._mb_search("Nonexistent Song", "Unknown Artist")
+        
+        # Should return None when no results
+        assert result is None
+    
+    def test_recording_lookup_404_returns_none(self):
+        """
+        Test recording lookup when recording ID not found (404).
+        
+        **Property**: Recording lookup returns None for non-existent IDs
+        """
+        mock_response = MagicMock()
+        mock_response.status_code = 404
+        
+        with patch.object(self.tagger._mb_session, "get", return_value=mock_response):
+            with patch.object(self.tagger._rl, "wait"):
+                result = self.tagger._mb_lookup_recording("nonexistent-id")
+        
+        # Should return None for 404
+        assert result is None
+    
+    def test_musicbrainz_lookup_priority_chain(self):
+        """
+        Test the full MusicBrainz lookup priority chain.
+        
+        **Property**: Lookup chain tries ISRC → recording ID → text search in order
+        
+        This verifies the tagging pipeline priority is preserved.
+        """
+        # Create a track with ISRC, mb_recording_id, and title+artist
+        track = _make_track_stub(
+            isrc="USRC17607839",
+            mb_recording_id="rec-from-acoustid",
+            title="Test Song",
+            artist="Test Artist"
+        )
+        
+        # Mock ISRC lookup to return None (simulating no ISRC match)
+        with patch.object(self.tagger, "_mb_lookup_isrc", return_value=None):
+            # Mock recording ID lookup to succeed
+            expected_mb_data = MBData(
+                recording_id="rec-from-acoustid",
+                title="Recording Lookup Result",
+                artist="Test Artist"
+            )
+            with patch.object(self.tagger, "_mb_lookup_recording", return_value=expected_mb_data):
+                result = self.tagger._fetch_musicbrainz(track)
+        
+        # Should fall back to recording ID lookup when ISRC fails
+        assert result is not None
+        assert result.recording_id == "rec-from-acoustid"
+        assert result.title == "Recording Lookup Result"
+    
+    def test_text_search_fallback_when_isrc_and_recording_fail(self):
+        """
+        Test text search is used when ISRC and recording ID lookups fail.
+        
+        **Property**: Text search is the final fallback in the lookup chain
+        """
+        track = _make_track_stub(
+            isrc=None,  # No ISRC
+            mb_recording_id=None,  # No recording ID
+            title="Fallback Song",
+            artist="Fallback Artist"
+        )
+        
+        # Mock text search to succeed
+        expected_mb_data = MBData(
+            recording_id="text-search-result",
+            title="Fallback Song",
+            artist="Fallback Artist"
+        )
+        with patch.object(self.tagger, "_mb_search", return_value=expected_mb_data):
+            result = self.tagger._fetch_musicbrainz(track)
+        
+        # Should use text search as final fallback
+        assert result is not None
+        assert result.recording_id == "text-search-result"
+        assert result.title == "Fallback Song"
