@@ -86,6 +86,8 @@ services:
       - ACOUSTID_API_KEY=${ACOUSTID_API_KEY}
       - QOBUZ_EMAIL=${QOBUZ_EMAIL}
       - QOBUZ_PASSWORD_MD5=${QOBUZ_PASSWORD_MD5}
+      # Set to 1/true/yes/on to disable downloads (for staging/development)
+      - DISABLE_DOWNLOADS=${DISABLE_DOWNLOADS:-}
       # Container-internal mount point for the media drive — always /media
       # regardless of the host path in EXTERNAL_MEDIA_DRIVE.
       - MEDIA_DIR=/media
