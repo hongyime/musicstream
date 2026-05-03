@@ -269,6 +269,35 @@ class TestDownloadTrackIsolation:
         assert track.status == TrackStatus.FAILED.value
 
 
+# ── _is_content_error ─────────────────────────────────────────────────────────
+
+class TestIsContentError:
+    """Content errors must not trip circuit breakers."""
+
+    @pytest.mark.parametrize("msg", [
+        "Requested format is not available. Use --list-formats for a list of available formats",
+        "ERROR: [youtube] abc: Private video",
+        "Video unavailable",
+        "This video is not available",
+        "Sign in to confirm your age",
+        "This video requires payment",
+        "Geographic restriction",
+        "Not available in your country",
+    ])
+    def test_recognised_as_content_error(self, msg):
+        assert DownloadOrchestrator._is_content_error(Exception(msg)) is True
+
+    @pytest.mark.parametrize("msg", [
+        "HTTPSConnectionPool: Max retries exceeded",
+        "Connection refused",
+        "Name or service not known",
+        "timed out",
+        "503 Service Unavailable",
+    ])
+    def test_not_a_content_error(self, msg):
+        assert DownloadOrchestrator._is_content_error(Exception(msg)) is False
+
+
 # ── Bug Condition Exploration Tests ──────────────────────────────────────────
 # These tests are EXPECTED TO FAIL on unfixed code to confirm bugs exist.
 # They encode the expected behavior and will pass after fixes are implemented.
