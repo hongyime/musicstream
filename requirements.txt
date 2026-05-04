@@ -10,7 +10,7 @@ python-dotenv==1.2.2
 # pinning both causes unsolvable conflicts. Let pip resolve.
 spotiflac==0.2.6
 yt-dlp[default]
-ytmusicapi==1.11.5
+ytmusicapi==1.12.0
 spotdl
 
 # Metadata & tagging
