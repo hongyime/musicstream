@@ -220,7 +220,7 @@ def _print_startup_banner() -> None:
     corrupt = 0
 
     lines = [
-        f"[bold cyan]MUSICSTREAM DAEMON v3.0[/bold cyan]",
+        "[bold cyan]MUSICSTREAM DAEMON v3.0[/bold cyan]",
         "",
         f"Last full run:   {last_run_str}",
         f"Downloaded: {downloaded:>3}  │  Failed: {failed:>4}  │  Requeued: {requeued:>2}",
@@ -624,10 +624,14 @@ def _check_auth() -> Optional[tuple]:
     """
     if _DAEMON_TOKEN is None:
         return None  # no token configured — open access (default)
-    provided = (
-        flask_request.headers.get("X-Daemon-Token")
-        or (flask_request.headers.get("Authorization", "").removeprefix("Bearer ").strip() or None)
-    )
+    
+    # Check Bearer token header (string slicing for 3.8+ compatibility)
+    auth_header = flask_request.headers.get("Authorization", "")
+    if auth_header and auth_header.lower().startswith("bearer "):
+        provided = auth_header[7:].strip()
+    else:
+        provided = None
+    provided = provided or flask_request.headers.get("X-Daemon-Token")
     if provided != _DAEMON_TOKEN:
         return jsonify({"error": "Unauthorized"}), 401
     return None
@@ -755,7 +759,7 @@ def metrics():
     try:
         from src.db import get_session
         from src.models import DownloadAttempt
-        from sqlalchemy import Integer, case, func
+        from sqlalchemy import case, func
         with get_session() as session:
             rows = (
                 session.query(

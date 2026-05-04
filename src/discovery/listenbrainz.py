@@ -121,13 +121,18 @@ class ListenBrainzDiscovery:
                 .first()
             )
             if existing:
-                logger.debug("Skipping already-present MBID %s (status=%s)", mbid, existing.status)
-                if existing.status == "pending":
-                    existing.status = "skipped"
-                    try:
-                        session.flush()
-                    except Exception as exc:
-                        logger.warning("DB flush failed for skipped MBID %s: %s", mbid, exc)
+                # Only skip if already successfully ingested - allow retry for pending/skipped/failed
+                if existing.status == "ingested":
+                    logger.debug("Skipping already-ingested MBID %s", mbid)
+                    continue
+                
+                # Re-process pending/skipped/failed recommendations
+                logger.info("Re-processing MBID %s (was %s)", mbid, existing.status)
+                existing.status = "pending"  # Reset to pending for re-processing
+                try:
+                    session.flush()
+                except Exception as exc:
+                    logger.warning("DB flush failed resetting MBID %s status: %s", mbid, exc)
                 continue
 
             # ── Ingest new recommendation ──────────────────────────────────
@@ -347,6 +352,15 @@ class ListenBrainzDiscovery:
             logger.debug("Track with spotify_uri=%r already exists; linking to LbRecommendation", spotify_uri)
             lb_rec.track_id = existing_track.id
             lb_rec.status   = "ingested"
+            
+            # Update existing track with MusicBrainz metadata if better than what we have
+            if title and (not existing_track.title or len(title) > len(existing_track.title)):
+                existing_track.title = title
+            if artist and (not existing_track.artist or len(artist) > len(existing_track.artist)):
+                existing_track.artist = artist
+            # Always update MBID if we have it
+            existing_track.mb_recording_id = mbid
+            
             try:
                 session.flush()
             except Exception as exc:

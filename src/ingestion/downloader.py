@@ -28,7 +28,7 @@ import yt_dlp  # type: ignore[import-untyped]
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from src.exceptions import DownloadError, OrganiserError, SpotiFLACError, TaggingError
+from src.exceptions import DownloadError, OrganiserError, TaggingError
 from src.models import DownloadAttempt, Track, TrackStatus
 from src.rate_limiter import ServiceRateLimiter, ServiceThrottle
 
@@ -458,9 +458,6 @@ class DownloadOrchestrator:
                 self._rate_limiter.record_failure("spotiflac")
                 _SPOTIFLAC_SEMAPHORE.release()
                 return None
-            finally:
-                # Only release if we haven't already released it in the exception handlers
-                # The semaphore release is handled in each branch above
 
             # Check for downloaded files
             for root, _, files in os.walk(out_dir):
@@ -870,7 +867,8 @@ class DownloadOrchestrator:
             else:
                 # Docker mounts cookies.txt :ro — yt-dlp tries to write-lock it
                 # on open, causing EROFS. Copy to a writable temp file instead.
-                import shutil, tempfile
+                import shutil
+                import tempfile
                 try:
                     tmp = tempfile.NamedTemporaryFile(
                         suffix=".txt", delete=False, dir=TEMP_DIR

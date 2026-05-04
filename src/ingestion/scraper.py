@@ -26,7 +26,7 @@ from spotipy.oauth2 import SpotifyPKCE
 from sqlalchemy.orm import Session
 
 from src.exceptions import SpotifyRateLimitError
-from src.models import Source, SourceType, Track, TrackStatus, track_sources
+from src.models import Source, SourceType, Track, TrackStatus
 from src.rate_limiter import ServiceRateLimiter
 
 logger = logging.getLogger(__name__)
@@ -245,23 +245,24 @@ class SpotifyScraper:
                 logger.debug("Playlist '%s' unchanged (snapshot_id match). Skipping.", source.name)
                 continue
 
-            # Snapshot changed — fetch only new tracks from stored offset onward
-            offset = source.track_count  # start from where we left off
+            # Snapshot changed — fetch all tracks (re-fetch entire playlist)
+            # Using snapshot_id change detection with full fetch avoids offset bugs.
+            # De-duplication in _upsert_tracks() prevents duplicate inserts.
             logger.info(
-                "Playlist '%s' changed. Fetching from offset %d…",
+                "Playlist '%s' changed (snapshot %s != %s). Re-fetching all tracks for de-duplication.",
                 source.name,
-                offset,
+                current_snapshot[:8] if current_snapshot else "none",
+                (source.snapshot_id[:8] if source.snapshot_id else "none"),
             )
 
-            new_raw_tracks = self.get_playlist_tracks(pl_id, offset=offset)
+            new_raw_tracks = self.get_playlist_tracks(pl_id, offset=0)
             added = self._upsert_tracks(session, new_raw_tracks, source)
             new_count += added
 
-            # Update snapshot_id and track_count
-            new_total = source.track_count + len(new_raw_tracks)
-            self._update_source(session, source, current_snapshot, new_total)
+            # Update snapshot_id and track_count to current total
+            self._update_source(session, source, current_snapshot, len(new_raw_tracks))
             logger.info(
-                "Playlist '%s': %d new tracks added.", source.name, added
+                "Playlist '%s': %d tracks upserted (%d new).", source.name, len(new_raw_tracks), added
             )
 
         # ── Liked Songs — always re-fetch ──────────────────────────────────────
@@ -570,7 +571,6 @@ class SpotifyScraper:
 
         album = track.get("album") or {}
         artists = track.get("artists") or []
-        album_artists = album.get("artists") or []
 
         # Primary artist name
         artist = artists[0]["name"] if artists else "Unknown Artist"
