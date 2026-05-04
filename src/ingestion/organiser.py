@@ -44,6 +44,13 @@ logger = logging.getLogger(__name__)
 # Characters forbidden in file/directory names on Windows and most POSIX systems.
 _FORBIDDEN_RE = re.compile(r'[<>:"/\\|?*]')
 
+# Windows reserved device names that cannot be used as filenames, even with extensions.
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
 
 class FileOrganiser:
     """Moves tagged audio files into the Plex directory structure."""
@@ -200,6 +207,7 @@ class FileOrganiser:
         - Replaces ``< > : " / \\ | ? *`` with ``_``.
         - Truncates to 200 characters.
         - Strips leading and trailing periods and spaces.
+        - Prefixes/suffixes Windows reserved device names to avoid filesystem errors.
 
         Parameters
         ----------
@@ -214,6 +222,14 @@ class FileOrganiser:
         sanitised = _FORBIDDEN_RE.sub("_", name)
         sanitised = sanitised[:200]
         sanitised = sanitised.strip(". ")
+        
+        # Check for Windows reserved names (case-insensitive check on stem only)
+        # Split at first dot to get the stem before extension
+        stem = sanitised.split(".", 1)[0]
+        if stem.upper() in _WINDOWS_RESERVED:
+            # Prefix with underscore to avoid reserved name (e.g., "_CON_")
+            sanitised = f"_{stem}_" + sanitised[len(stem):]
+        
         return sanitised
 
     # ── SHA-256 ────────────────────────────────────────────────────────────────
