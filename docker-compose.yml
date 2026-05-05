@@ -29,7 +29,7 @@ services:
       - ./plex/config:/config
       - ./plex/transcode:/transcode
     ports:
-      - "32400:32400"
+      - "0.0.0.0:32400:32400"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:32400/identity"]

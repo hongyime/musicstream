@@ -109,6 +109,10 @@ class DownloadOrchestrator:
     """
 
     def __init__(self) -> None:
+        # Check if Tier 1 (SpotiFLAC) is enabled
+        self._tier1_enabled = os.environ.get("ENABLE_TIER1", "true").lower() == "true"
+        logger.info("Tier 1 (SpotiFLAC) %s", "enabled" if self._tier1_enabled else "disabled via ENABLE_TIER1=false")
+        
         # Scale circuit breaker threshold based on concurrency
         # This prevents 4 concurrent workers from tripping a low threshold
         # when the same API fails for all workers simultaneously.
@@ -253,14 +257,17 @@ class DownloadOrchestrator:
         track.status = TrackStatus.DOWNLOADING.value
         session.flush()
 
+        # Build tiers list, optionally skipping Tier 1
         tiers = [
-            # Ordered: highest quality → most reliable fallback
-            ("tier1_spotiflac",        self._tier1_spotiflac),         # FLAC lossless
             ("tier2_ytdlp_ytm",        self._tier2_ytdlp_ytm),         # MP3 320, best YT matching
             ("tier3_spotdl",           self._tier3_spotdl),            # MP3 320, needs client_secret
             ("tier4_ytdlp_youtube",    self._tier4_ytdlp_youtube),     # MP3 320, reliable direct search
             ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),  # MP3 320, last resort
         ]
+        
+        # Add Tier 1 at the front if enabled (highest quality FLAc)
+        if self._tier1_enabled:
+            tiers.insert(0, ("tier1_spotiflac", self._tier1_spotiflac))
 
         for method_name, tier_fn in tiers:
             try:
