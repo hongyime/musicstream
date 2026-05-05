@@ -664,6 +664,18 @@ class DownloadOrchestrator:
             if client is None:
                 return None
 
+            # Ensure event loop is available for spotdl's internal async downloader
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_closed():
+                    loop = None
+            except RuntimeError:
+                loop = None
+            
+            if loop is None:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
             songs = client.search([track.spotify_uri])
             if not songs:
                 logger.warning("spotdl: no results for track %d ('%s')", track.id, track.title)
@@ -837,6 +849,9 @@ class DownloadOrchestrator:
         SpotifyClient is a class-level singleton inside spotdl — constructing a
         second Spotdl instance in the same process raises "already initialized".
         A single instance is created once and reused for all downloads.
+        
+        IMPORTANT: The event loop is set as the current loop for the thread to
+        handle async operations in ThreadPoolExecutor workers.
         """
         global _SPOTDL_CLIENT
         if not SPOTDL_AVAILABLE:
@@ -846,6 +861,7 @@ class DownloadOrchestrator:
         with _SPOTDL_CLIENT_LOCK:
             if _SPOTDL_CLIENT is None:
                 loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)  # Set as current loop for this thread
                 _SPOTDL_CLIENT = Spotdl(
                     client_id=client_id,
                     client_secret=client_secret,
