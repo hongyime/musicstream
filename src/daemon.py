@@ -723,7 +723,9 @@ def index():
 <html>
 <head>
     <title>Musicstream Dashboard</title>
-    <meta http-equiv="refresh" content="5">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Musicstream Dashboard</title>
     <style>
         body {{ 
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
@@ -776,10 +778,64 @@ def index():
 <body>
     <div class="header">
         <h1>🎵 Musicstream Dashboard</h1>
-        <div class="subtitle">Real-time Progress Monitoring • Auto-refresh every 5s</div>
+        <div class="subtitle">Real-time Progress Monitoring • Manual Refresh</div>
     </div>
     
-    <div class="auto-refresh">🔄 Auto-refreshing...</div>
+    <div style="display: flex; gap: 10px; margin-bottom: 20px;">
+        <button onclick="location.reload()" style="
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 10px 25px;
+            font-size: 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: bold;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            transition: transform 0.2s;
+        " onmouseover="this.style.transform='scale(1.05)'" onmouseout="this.style.transform='scale(1)'">
+            🔄 Refresh Dashboard
+        </button>
+        <a href="/api/coverage" style="
+            background: white;
+            color: #667eea;
+            border: 2px solid #667eea;
+            padding: 10px 20px;
+            font-size: 16px;
+            border-radius: 8px;
+            text-decoration: none;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            font-weight: bold;
+        " onmouseover="this.style.background='#667eea'; this.style.color='white'" onmouseout="this.style.background='white'; this.style.color='#667eea'">
+            📊 Coverage Report
+        </a>
+        <a href="/api/report" style="
+            background: white;
+            color: #e74c3c;
+            border: 2px solid #e74c3c;
+            padding: 10px 20px;
+            font-size: 16px;
+            border-radius: 8px;
+            text-decoration: none;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            font-weight: bold;
+        " onmouseover="this.style.background='#e74c3c'; this.style.color='white'" onmouseout="this.style.background='white'; this.style.color='#e74c3c'">
+            📋 Missing/Failed Report
+        </a>
+        <a href="/docs" style="
+            background: white;
+            color: #27ae60;
+            border: 2px solid #27ae60;
+            padding: 10px 20px;
+            font-size: 16px;
+            border-radius: 8px;
+            text-decoration: none;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            font-weight: bold;
+        " onmouseover="this.style.background='#27ae60'; this.style.color='white'" onmouseout="this.style.background='white'; this.style.color='#27ae60'">
+            📚 API Docs
+        </a>
+    </div>
     
     <div class="stats-grid">
         <div class="stat-card">
@@ -994,6 +1050,246 @@ def progress():
             "error": str(e),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }), 500
+
+
+
+@app.get("/api/coverage")
+def coverage():
+    """
+    GET /api/coverage
+    Coverage verification: checks disk vs database completeness.
+    
+    Returns:
+        - Count of unique artists on disk
+        - Count of unique albums on disk
+        - Count of unique artists in DB
+        - Count of unique albums in DB
+        - Coverage percentage
+        - Files matching DB records
+    """
+    try:
+        from src.db import get_session
+        from src.models import Track
+        import os
+        from pathlib import Path
+        from sqlalchemy import func
+        
+        with get_session() as session:
+            # DB stats
+            db_total_tracks = session.query(Track).count()
+            db_unique_artists = session.query(func.count(func.distinct(Track.artist))).scalar()
+            db_unique_albums = session.query(func.count(func.distinct(Track.album))).scalar()
+            db_downloaded = session.query(Track).filter(Track.file_path.isnot(None)).count()
+            
+            # Disk stats
+            media_dir = Path("/media")
+            if media_dir.exists():
+                artist_folders = [d for d in media_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+                unique_artists_on_disk = len(artist_folders)
+                
+                total_albums_on_disk = 0
+                for artist_dir in artist_folders:
+                    album_dirs = [d for d in artist_dir.iterdir() if d.is_dir()]
+                    total_albums_on_disk += len(album_dirs)
+            else:
+                unique_artists_on_disk = 0
+                total_albums_on_disk = 0
+            
+            # Coverage calculation
+            artist_coverage = (db_unique_artists / unique_artists_on_disk * 100) if unique_artists_on_disk > 0 else 100
+            track_coverage = (db_downloaded / db_total_tracks * 100) if db_total_tracks > 0 else 0
+            
+            return jsonify({
+                "status": "ok",
+                "database": {
+                    "total_tracks": db_total_tracks,
+                    "downloaded_tracks": db_downloaded,
+                    "unique_artists": db_unique_artists,
+                    "unique_albums": db_unique_albums,
+                    "completion_pct": round((db_downloaded / db_total_tracks * 100), 2) if db_total_tracks > 0 else 0,
+                },
+                "disk": {
+                    "unique_artists": unique_artists_on_disk,
+                    "total_albums": total_albums_on_disk,
+                },
+                "coverage": {
+                    "artist_coverage_pct": round(artist_coverage, 2),
+                    "track_coverage_pct": round(track_coverage, 2),
+                },
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }), 200
+            
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 500
+
+
+
+@app.get("/api/report")
+def report():
+    """
+    GET /api/report
+    Returns detailed report of missing and failed tracks/albums (not saved to file).
+    
+    Returns:
+        - List of missing albums (artist, album, track_count)
+        - List of failed downloads (track, artist, album, error_count)
+        - Retry statistics by tier
+    """
+    try:
+        from src.db import get_session
+        from src.models import Track, DownloadAttempt
+        from sqlalchemy import func, and_
+        
+        with get_session() as session:
+            # Missing albums (albums with pending tracks)
+            missing_albums = (
+                session.query(
+                    Track.artist, 
+                    Track.album, 
+                    func.count(Track.id).label("track_count")
+                )
+                .filter(Track.status == "pending")
+                .group_by(Track.artist, Track.album)
+                .order_by(Track.artist, Track.album)
+                .limit(50)
+                .all()
+            )
+            
+            # Failed tracks (tracks with 3+ failed attempts)
+            failed_tracks = (
+                session.query(
+                    Track.id,
+                    Track.title, 
+                    Track.artist, 
+                    Track.album,
+                    Track.status,
+                    func.count(DownloadAttempt.id).label("attempt_count")
+                )
+                .join(DownloadAttempt)
+                .group_by(Track.id)
+                .having(and_(
+                    Track.status.in_(["failed", "failed_validation", "timed_out"]),
+                    func.count(DownloadAttempt.id) >= 3
+                ))
+                .order_by(func.count(DownloadAttempt.id).desc())
+                .limit(50)
+                .all()
+            )
+            
+            # Missing by artist
+            missing_by_artist = (
+                session.query(Track.artist, func.count().label("missing_count"))
+                .filter(Track.status == "pending")
+                .group_by(Track.artist)
+                .order_by(Track.artist)
+                .limit(30)
+                .all()
+            )
+            
+            return jsonify({
+                "status": "ok",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "missing_albums": [
+                    {
+                        "artist": row.artist,
+                        "album": row.album,
+                        "track_count": row.track_count,
+                    } for row in missing_albums
+                ],
+                "failed_tracks": [
+                    {
+                        "id": row.id,
+                        "title": row.title,
+                        "artist": row.artist,
+                        "album": row.album,
+                        "status": row.status,
+                        "attempt_count": row.attempt_count,
+                    } for row in failed_tracks
+                ],
+                "missing_by_artist": [
+                    {
+                        "artist": row.artist,
+                        "missing_count": row.missing_count,
+                    } for row in missing_by_artist
+                ],
+                "summary": {
+                    "total_missing_albums": len(missing_albums),
+                    "total_failed_tracks": len(failed_tracks),
+                    "total_missing_by_artist": len(missing_by_artist),
+                },
+            }), 200
+            
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 500
+
+
+
+@app.get("/docs")
+def docs():
+    """
+    GET /docs
+    Returns API documentation for all endpoints.
+    """
+    docs_html = '''<!DOCTYPE html>\n<html>\n<head>\n    <title>Musicstream API Documentation</title>\n    <style>\n        body { font-family: 'Segoe UI', sans-serif; max-width: 900px; margin: 40px auto; padding: 20px; background: #f5f7fa; }\n        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }\n        h2 { color: #34495e; border-bottom: 1px solid #ddd; padding-bottom: 5px; margin-top: 30px; }\n        .endpoint { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3498db; }\n        .endpoint h3 { margin: 0 0 10px 0; color: #2196F3; }\n        .get { background: #27ae60; color: white; }\n        .post { background: #e74c3c; color: white; }\n    </style>\n</head>\n<body>\n    <h1>Musicstream API Documentation</h1>\n    <p>Base URL: <strong>http://localhost:9079</strong></p>\n    <div class="endpoint">\n        <h3><span class="get">GET</span> /</h3>\n        <p>Interactive web dashboard</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="get">GET</span> /api/progress</h3>\n        <p>Real-time download progress</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="get">GET</span> /api/coverage</h3>\n        <p>Disk vs database completeness</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="get">GET</span> /api/report</h3>\n        <p>Missing and failed tracks report</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="get">GET</span> /health, /status, /metrics</h3>\n        <p>Health checks and metrics</p>\n    </div>\n    <h2>Control Endpoints (requires authentication if DAEMON_API_TOKEN is set)</h2>\n    <div class="endpoint">\n        <h3><span class="post">POST</span> /sync</h3>\n        <p>Trigger Spotify sync + download</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="post">POST</span> /integrity</h3>\n        <p>Run integrity check</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="post">POST</span> /discover</h3>\n        <p>Fetch ListenBrainz recommendations</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="post">POST</span> /admin/reset-failed</h3>\n        <p>Reset all failed tracks to pending status for retry</p>\n    </div>\n</body>\n</html>'''
+    return docs_html, 200
+
+
+@app.post("/admin/reset-failed")
+def reset_failed_tracks():
+    """
+    POST /admin/reset-failed
+    Reset all tracks with status='failed', 'failed_validation', or 'missing' back to pending.
+    Clears file_path and file_sha256 so they can be re-downloaded.
+    """
+    from src.db import get_session
+    from src.models import Track, TrackStatus
+    
+    try:
+        with get_session() as session:
+            # Count tracks to reset before modification
+            reset_statuses = [
+                TrackStatus.FAILED.value,
+                TrackStatus.FAILED_VALIDATION.value,
+                TrackStatus.MISSING.value,
+            ]
+            
+            tracks_to_reset = session.query(Track).filter(
+                Track.status.in_(reset_statuses)
+            ).all()
+            
+            reset_count = len(tracks_to_reset)
+            
+            # Reset each track
+            for track in tracks_to_reset:
+                track.status = TrackStatus.PENDING.value
+                track.file_path = None
+                track.file_sha256 = None
+                # Keep download_attempts for audit
+            
+            session.commit()
+            
+            return jsonify({
+                "status": "ok",
+                "reset_count": reset_count,
+                "message": f"Reset {reset_count} failed tracks to pending status",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }), 200
+            
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 500
+
 
 
 @app.get("/health")
