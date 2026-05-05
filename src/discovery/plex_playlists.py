@@ -1,10 +1,10 @@
 """
-discovery/plex_playlists.py — Create/update monthly Plex discovery playlists
+discovery/plex_playlists.py — Create/update weekly Plex discovery playlists
 
 After each ListenBrainz discovery batch, this module creates or updates a
-Plex playlist named ``Discovered: {Month} {Year}`` (e.g. "Discovered: May 2026")
+Plex playlist named ``Discovered: Y{year} W{week}`` (e.g. "Discovered: Y2026 W18")
 containing all downloaded tracks that originated from lb_recommendations for
-that calendar month.
+that ISO calendar week.
 
 Plex API calls:
   POST /playlists                — create a new playlist
@@ -14,13 +14,18 @@ Environment variables:
   PLEX_TOKEN              — Plex authentication token
   PLEX_URL                — Base URL for Plex (default: http://localhost:32400)
   PLEX_LIBRARY_SECTION_ID — Library section ID for the music library
+
+Playlist Naming:
+  - Format: "Discovered: Y2026 W18" (ISO week number)
+  - Updated weekly after each ListenBrainz discovery run
+  - ListenBrainz discovery runs daily but playlists group by week
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import requests
@@ -39,12 +44,17 @@ DEFAULT_PLEX_URL = "http://localhost:32400"
 
 class PlexPlaylistSync:
     """
-    Creates or updates monthly Plex playlists from ListenBrainz discoveries.
+    Creates or updates weekly Plex playlists from ListenBrainz discoveries.
 
     Usage::
 
         sync = PlexPlaylistSync()
-        sync.sync_discovery_playlist(session, month="May", year=2026)
+        sync.sync_discovery_playlist(session, month="May", year=2026)  # month/year ignored
+    
+    Note:
+        Month and year parameters are maintained for backward compatibility but
+        ignored. The method always creates playlists for the current ISO week:
+        "Discovered: Y2026 W18"
     """
 
     def __init__(
@@ -81,8 +91,15 @@ class PlexPlaylistSync:
             session: SQLAlchemy session.
             month:   Full month name, e.g. "May".
             year:    Four-digit year, e.g. 2026.
+        
+        Note:
+            Month/year parameters maintained for backward compatibility but ignored
+            in favor of weekly-based naming. Playlist now follows format: "Discovered: Y{year} W{week}"
         """
-        playlist_name = f"Discovered: {month} {year}"
+        # Use week-based naming instead of monthly for better granularity
+        # ListenBrainz runs daily, so weekly playlists make sense
+        week_num = dt.now().isocalendar()[1]  # ISO week number (1-53)
+        playlist_name = f"Discovered: Y{year} W{week_num}"
         logger.info("Syncing Plex playlist: %r", playlist_name)
 
         # ── Find downloaded tracks for this month ──────────────────────────
@@ -117,33 +134,32 @@ class PlexPlaylistSync:
         """
         Return Plex rating keys (file paths) for all downloaded tracks that
         originated from lb_recommendations fetched during *month*/*year*.
+        
+        Note: For backward compatibility, month/year parameters are accepted but
+        ignored.  The method now always queries for the current week.
 
         A track qualifies if:
           - Its LbRecommendation.status == 'ingested'
-          - Its LbRecommendation.fetched_at falls within the given month/year
+          - Its LbRecommendation.fetched_at falls within the current ISO week
           - Its Track.status == 'downloaded'
           - Its Track.file_path is not None
         """
-        # Build month boundaries
-        try:
-            month_num = datetime.strptime(month, "%B").month
-        except ValueError:
-            logger.error("Invalid month name: %r", month)
-            return []
-
-        start = datetime(year, month_num, 1, tzinfo=timezone.utc)
-        if month_num == 12:
-            end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
-        else:
-            end = datetime(year, month_num + 1, 1, tzinfo=timezone.utc)
+        # Always query for current week regardless of passed month/year
+        now = dt.now()
+        year = now.year
+        week_num = now.isocalendar()[1]
+        
+        # Calculate ISO week boundaries
+        week_start = dt.fromisocalendar(year, week_num, 1, tzinfo=timezone.utc)
+        week_end = week_start + dt.timedelta(days=7)
 
         rows = (
             session.query(Track)
             .join(LbRecommendation, LbRecommendation.track_id == Track.id)
             .filter(
                 LbRecommendation.status == "ingested",
-                LbRecommendation.fetched_at >= start,
-                LbRecommendation.fetched_at < end,
+                LbRecommendation.fetched_at >= week_start,
+                LbRecommendation.fetched_at < week_end,
                 Track.status == TrackStatus.DOWNLOADED.value,
                 Track.file_path.isnot(None),
             )
