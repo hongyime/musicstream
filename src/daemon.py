@@ -637,6 +637,96 @@ def _check_auth() -> Optional[tuple]:
     return None
 
 
+@app.get("/")
+def index():
+    """
+    GET /
+    Returns a simple HTML page listing all available endpoints.
+    """
+    html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Musicstream Daemon</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; }
+        h1 { color: #333; }
+        .endpoint { background: #f5f5f5; padding: 15px; margin: 10px 0; border-radius: 5px; }
+        .endpoint h3 { margin: 0 0 10px 0; color: #2196F3; }
+        .endpoint pre { background: #e8e8e8; padding: 10px; border-radius: 3px; overflow-x: auto; }
+        .method { font-weight: bold; color: #4CAF50; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #2196F3; color: white; }
+        tr:hover { background: #f5f5f5; }
+    </style>
+</head>
+<body>
+    <h1>🎵 Musicstream Daemon API</h1>
+    <p>All endpoints are available at <code>http://localhost:9079</code></p>
+    
+    <h2>Available Endpoints</h2>
+    
+    <div class="endpoint">
+        <h3><span class="method">GET</span> /health</h3>
+        <pre>Health check and basic statistics</pre>
+    </div>
+    
+    <div class="endpoint">
+        <h3><span class="method">GET</span> /status</h3>
+        <pre>Recent daemon runs and execution history</pre>
+    </div>
+    
+    <div class="endpoint">
+        <h3><span class="method">GET</span> /metrics</h3>
+        <pre>Download attempt success rates per service/tier</pre>
+    </div>
+    
+    <div class="endpoint">
+        <h3><span class="method">POST</span> /sync</h3>
+        <pre>Trigger full Spotify sync + download pipeline (requires auth if DAEMON_API_TOKEN is set)</pre>
+    </div>
+    
+    <div class="endpoint">
+        <h3><span class="method">POST</span> /integrity</h3>
+        <pre>Run file integrity check and re-queue missing/corrupt tracks (requires auth if DAEMON_API_TOKEN is set)</pre>
+    </div>
+    
+    <div class="endpoint">
+        <h3><span class="method">POST</span> /discover</h3>
+        <pre>Fetch ListenBrainz CF recommendations (requires auth if DAEMON_API_TOKEN is set)</pre>
+    </div>
+    
+    <div class="endpoint">
+        <h3><span class="method">POST</span> /backup</h3>
+        <pre>PostgreSQL backup via pg_dump (requires auth if DAEMON_API_TOKEN is set)</pre>
+    </div>
+    
+    <h2>Quick Links</h2>
+    <table>
+        <tr>
+            <th>Service</th>
+            <th>URL</th>
+        </tr>
+        <tr>
+            <td>Plex Media Server</td>
+            <td><a href="http://localhost:32400" target="_blank">http://localhost:32400</a></td>
+        </tr>
+        <tr>
+            <td>Multi-Scrobbler</td>
+            <td><a href="http://localhost:9078" target="_blank">http://localhost:9078</a></td>
+        </tr>
+    </table>
+    
+    <p style="margin-top: 40px; font-size: 14px; color: #666;">
+        <em>Tip: Use <code>startup.bat</code> on Windows for easy management of the stack.</em>
+    </p>
+</body>
+</html>
+    """
+    return html, 200
+
+
 @app.get("/health")
 def health():
     """

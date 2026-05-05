@@ -69,11 +69,17 @@ except ImportError:
     SPOTDL_AVAILABLE = False
     logger.warning("spotdl not available; Tier 3 will be skipped")
 
-# ── Constants ──────────────────────────────────────────────────────────────────
+# ── Constants ───────────────────────────────────────────────────────────────────
 
 TEMP_DIR: str = os.environ.get("TEMP_DIR", "temp")
 _DURATION_TOLERANCE_S = 5  # ±5 seconds for duration validation
 _GIVE_UP_THRESHOLD = 25    # ~5 complete tier-chain runs before giving up
+
+# Worker concurrency — configurable via environment variable
+# Default: 4 workers, can be increased to 6 or 8 for faster downloads
+# Note: Increasing significantly may trigger API rate limits
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_WORKERS", "4"))
+logger.info("Worker concurrency set to: MAX_CONCURRENT=%d", MAX_CONCURRENT)
 
 # spotdl serialisation — Spotify's API rate-limits quickly under concurrent calls.
 # One active spotdl download at a time prevents 4 workers from hitting the limit together.
@@ -102,16 +108,16 @@ class DownloadOrchestrator:
     never raises an exception that stops other downloads.
     """
 
-    MAX_CONCURRENT = 4
-
     def __init__(self) -> None:
-        # Threshold=20 because 4 concurrent workers each failing the same tier
-        # simultaneously would trip a threshold=5 breaker in one batch pass,
-        # blocking the remaining tracks for the rest of the run.
-        # Cooldown=300s so a tripped breaker recovers within the same batch run
-        # rather than the default 30 minutes.
+        # Scale circuit breaker threshold based on concurrency
+        # This prevents 4 concurrent workers from tripping a low threshold
+        # when the same API fails for all workers simultaneously.
+        # Threshold=MAX_CONCURRENT*5 allows for burst failures while catching
+        # persistent issues. Cooldown=300s allows breaker to recover within
+        # the same batch run.
+        circuit_threshold = MAX_CONCURRENT * 5
         self._rate_limiter = ServiceRateLimiter(
-            circuit_breaker_threshold=20,
+            circuit_breaker_threshold=circuit_threshold,
             circuit_breaker_cooldown=300,
         )
         self._throttle = ServiceThrottle()
@@ -187,22 +193,44 @@ class DownloadOrchestrator:
 
         track_ids = [t.id for t in pending_tracks]
 
-        with ThreadPoolExecutor(max_workers=self.MAX_CONCURRENT) as executor:
-            futures = {executor.submit(_download_one, tid): tid for tid in track_ids}
-            for future in as_completed(futures):
-                tid = futures[future]
-                try:
-                    success = future.result()
-                except Exception as exc:
-                    logger.error(
-                        "Future for track id=%d raised unexpectedly: %s", tid, exc
-                    )
-                    success = False
+        # Process in batches with delays between batches to avoid rate limits
+        batch_size = MAX_CONCURRENT
+        total_batches = (len(track_ids) + batch_size - 1) // batch_size
 
-                if success:
-                    downloaded += 1
-                else:
-                    failed += 1
+        for batch_num in range(total_batches):
+            start_idx = batch_num * batch_size
+            end_idx = min(start_idx + batch_size, len(track_ids))
+            batch_track_ids = track_ids[start_idx:end_idx]
+
+            logger.info(
+                "Processing batch %d/%d (%d tracks)",
+                batch_num + 1,
+                total_batches,
+                len(batch_track_ids),
+            )
+
+            with ThreadPoolExecutor(max_workers=MAX_CONCURRENT) as executor:
+                futures = {executor.submit(_download_one, tid): tid for tid in batch_track_ids}
+                for future in as_completed(futures):
+                    tid = futures[future]
+                    try:
+                        success = future.result()
+                    except Exception as exc:
+                        logger.error(
+                            "Future for track id=%d raised unexpectedly: %s", tid, exc
+                        )
+                        success = False
+
+                    if success:
+                        downloaded += 1
+                    else:
+                        failed += 1
+
+            # Add delay between batches (except last) to prevent rate limiting
+            if batch_num < total_batches - 1:
+                delay_seconds = 10  # 10-second pause between batches
+                logger.debug("Pausing %d seconds before next batch...", delay_seconds)
+                time.sleep(delay_seconds)
 
         logger.info(
             "Download batch complete: downloaded=%d failed=%d", downloaded, failed
