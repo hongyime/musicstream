@@ -227,8 +227,9 @@ class DownloadOrchestrator:
                         failed += 1
 
             # Add delay between batches (except last) to prevent rate limiting
+            # Reduced to 5 seconds for 12 workers - balances speed + API safety
             if batch_num < total_batches - 1:
-                delay_seconds = 10  # 10-second pause between batches
+                delay_seconds = 5 if MAX_CONCURRENT >= 10 else 10  # 5s for 10+ workers, 10s for fewer
                 logger.debug("Pausing %d seconds before next batch...", delay_seconds)
                 time.sleep(delay_seconds)
 

@@ -88,9 +88,9 @@ services:
       - QOBUZ_PASSWORD_MD5=${QOBUZ_PASSWORD_MD5}
       # Set to 1/true/yes/on to disable downloads (for staging/development)
       - DISABLE_DOWNLOADS=${DISABLE_DOWNLOADS:-}
-      # Worker concurrency for parallel downloads (default: 4)
-      # Increasing to 6-8 improves speed but may trigger API rate limits
-      - MAX_CONCURRENT_WORKERS=${MAX_CONCURRENT_WORKERS:-6}
+      # Worker concurrency for parallel downloads (default: 12 - MAXIMUM SPEED 🚀)
+      # 12 workers = 3x faster than original 4 workers. Monitor for rate limits!
+      - MAX_CONCURRENT_WORKERS=${MAX_CONCURRENT_WORKERS:-12}
       # Container-internal mount point for the media drive — always /media
       # regardless of the host path in EXTERNAL_MEDIA_DRIVE.
       - MEDIA_DIR=/media

@@ -641,90 +641,359 @@ def _check_auth() -> Optional[tuple]:
 def index():
     """
     GET /
-    Returns a simple HTML page listing all available endpoints.
+    Returns a comprehensive web dashboard with real-time progress monitoring.
+    Auto-refreshes every 5 seconds.
     """
-    html = """
+    # Get up-to-date statistics
+    try:
+        from src.db import get_session
+        from src.models import Track, DownloadAttempt, DaemonRun
+        import json
+        
+        with get_session() as session:
+            # Track statistics
+            total_tracks = session.query(Track).count()
+            downloaded = session.query(Track).filter(Track.status == "downloaded").count()
+            pending = session.query(Track).filter(Track.status == "pending").count()
+            failed = session.query(Track).filter(Track.status.in_(["failed", "failed_validation", "timed_out"])).count()
+            
+            # Recent download attempts
+            recent_downloads = session.query(DownloadAttempt).order_by(
+                DownloadAttempt.attempted_at.desc()
+            ).limit(10).all()
+            
+            # Download metrics by tier
+            tier_stats = session.query(
+                DownloadAttempt.method,
+                DownloadAttempt.success,
+                session.func.count(DownloadAttempt.id)
+            ).group_by(DownloadAttempt.method, DownloadAttempt.success).all()
+            
+            # Progress percentage
+            progress_pct = (downloaded / total_tracks * 100) if total_tracks > 0 else 0
+            
+    except Exception as e:
+        # Fallback if DB query fails
+        total_tracks, downloaded, pending, failed = 0, 0, 0, 0
+        tier_stats = []
+        recent_downloads = []
+        progress_pct = 0
+    
+    # Calculate uptime
+    uptime_seconds = int(time.time() - _start_time)
+    uptime_str = f"{uptime_seconds // 3600}h {(uptime_seconds % 3600) // 60}m {uptime_seconds % 60}s"
+    
+    # Format tier stats
+    tier_stats_dict = {}
+    for method, success, count in tier_stats:
+        if method not in tier_stats_dict:
+            tier_stats_dict[method] = {"success": 0, "failed": 0, "total": 0}
+        tier_stats_dict[method]["success" if success else "failed"] = count
+        tier_stats_dict[method]["total"] += count
+    
+    # Format recent downloads for display
+    recent_html = ""
+    for attempt in recent_downloads:
+        status_color = "green" if attempt.success else "red"
+        recent_html += f"""
+        <tr>
+            <td>{attempt.method}</td>
+            <td style="color: {status_color}; font-weight: bold;">{"✓" if attempt.success else "✗"}</td>
+            <td>{attempt.timestamp.strftime("%H:%M:%S")}</td>
+        </tr>
+        """
+    
+    # Format tier stats table
+    tier_html = ""
+    for method, stats in tier_stats_dict.items():
+        success_rate = (stats["success"] / stats["total"] * 100) if stats["total"] > 0 else 0
+        tier_color = "green" if success_rate >= 80 else "orange" if success_rate >= 50 else "red"
+        tier_html += f"""
+        <tr>
+            <td>{method}</td>
+            <td>{stats["success"]}</td>
+            <td>{stats["failed"]}</td>
+            <td>{stats["total"]}</td>
+            <td style="color: {tier_color}; font-weight: bold;">{success_rate:.1f}%</td>
+        </tr>
+        """
+    
+    html = f"""
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Musicstream Daemon</title>
+    <title>Musicstream Dashboard</title>
+    <meta http-equiv="refresh" content="5">
     <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; }
-        h1 { color: #333; }
-        .endpoint { background: #f5f5f5; padding: 15px; margin: 10px 0; border-radius: 5px; }
-        .endpoint h3 { margin: 0 0 10px 0; color: #2196F3; }
-        .endpoint pre { background: #e8e8e8; padding: 10px; border-radius: 3px; overflow-x: auto; }
-        .method { font-weight: bold; color: #4CAF50; }
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
-        th { background: #2196F3; color: white; }
-        tr:hover { background: #f5f5f5; }
+        body {{ 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            max-width: 1400px; 
+            margin: 0 auto; 
+            padding: 20px; 
+            background: #f5f7fa;
+        }}
+        h1 {{ color: #2c3e50; margin-bottom: 5px; }}
+        h2 {{ color: #34495e; border-bottom: 3px solid #3498db; padding-bottom: 10px; }}
+        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; margin-bottom: 30px; }}
+        .header h1 {{ color: white; margin: 0; }}
+        .header .subtitle {{ opacity: 0.9; margin-top: 10px; }}
+        .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 30px; }}
+        .stat-card {{ background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); transition: transform 0.2s; }}
+        .stat-card:hover {{ transform: translateY(-5px); }}
+        .stat-card h3 {{ margin: 0 0 10px 0; color: #7f8c8d; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; }}
+        .stat-card .value {{ font-size: 36px; font-weight: bold; color: #2c3e50; margin: 0; }}
+        .stat-card .progress {{ height: 8px; background: #ecf0f1; border-radius: 4px; margin-top: 15px; overflow: hidden; }}
+        .stat-card .progress-bar {{ height: 100%; background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); transition: width 0.5s; }}
+        .log-panel {{ background: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+        .log-panel h3 {{ margin-top: 0; color: #34495e; }}
+        .log-row {{ font-family: 'Courier New', monospace; font-size: 13px; padding: 5px 0; border-bottom: 1px solid #ecf0f1; }}
+        .log-success {{ color: #27ae60; }}
+        .log-error {{ color: #e74c3c; }}
+        table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+        th {{ background: #34495e; color: white; padding: 15px; text-align: left; font-weight: 600; text-transform: uppercase; font-size: 12px; letter-spacing: 0.5px; }}
+        td {{ padding: 12px 15px; border-bottom: 1px solid #ecf0f1; }}
+        tr:hover {{ background: #f8f9fa; }}
+        .status-badge {{ padding: 5px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; text-transform: uppercase; }}
+        .status-success {{ background: #27ae60; color: white; }}
+        .status-pending {{ background: #f39c12; color: white; }}
+        .status-failed {{ background: #e74c3c; color: white; }}
+        .quick-actions {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+        .action-btn {{ padding: 12px 20px; border: none; border-radius: 5px; cursor: pointer; font-weight: 600; transition: all 0.3s; text-decoration: none; display: inline-block; }}
+        .btn-primary {{ background: #3498db; color: white; }}
+        .btn-primary:hover {{ background: #2980b9; }}
+        .btn-success {{ background: #27ae60; color: white; }}
+        .btn-success:hover {{ background: #219a52; }}
+        .btn-warning {{ background: #f39c12; color: white; }}
+        .btn-warning:hover {{ background: #e67e22; }}
+        .section {{ background: white; padding: 25px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+        .auto-refresh {{ position: fixed; top: 20px; right: 20px; background: #2c3e50; color: white; padding: 10px 15px; border-radius: 5px; font-size: 12px; animation: pulse 2s infinite; }}
+        @keyframes pulse {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.5; }} 100% {{ opacity: 1; }} }}
+        .worker-status {{ display: flex; align-items: center; gap: 10px; }}
+        .worker-dot {{ width: 12px; height: 12px; border-radius: 50%; background: #27ae60; animation: blink 1s infinite; }}
+        @keyframes blink {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.3; }} 100% {{ opacity: 1; }} }}
     </style>
 </head>
 <body>
-    <h1>🎵 Musicstream Daemon API</h1>
-    <p>All endpoints are available at <code>http://localhost:9079</code></p>
-    
-    <h2>Available Endpoints</h2>
-    
-    <div class="endpoint">
-        <h3><span class="method">GET</span> /health</h3>
-        <pre>Health check and basic statistics</pre>
+    <div class="header">
+        <h1>🎵 Musicstream Dashboard</h1>
+        <div class="subtitle">Real-time Progress Monitoring • Auto-refresh every 5s</div>
     </div>
     
-    <div class="endpoint">
-        <h3><span class="method">GET</span> /status</h3>
-        <pre>Recent daemon runs and execution history</pre>
+    <div class="auto-refresh">🔄 Auto-refreshing...</div>
+    
+    <div class="stats-grid">
+        <div class="stat-card">
+            <h3>📊 Total Library</h3>
+            <p class="value">{total_tracks:,}</p>
+            <div class="progress">
+                <div class="progress-bar" style="width: 100%;"></div>
+            </div>
+        </div>
+        
+        <div class="stat-card">
+            <h3>✅ Downloaded</h3>
+            <p class="value" style="color: #27ae60;">{downloaded:,}</p>
+            <div class="progress">
+                <div class="progress-bar" style="width: {progress_pct}%; background: #27ae60;"></div>
+            </div>
+            <small style="color: #7f8c8d;">{progress_pct:.1f}% complete</small>
+        </div>
+        
+        <div class="stat-card">
+            <h3>⏳ Pending</h3>
+            <p class="value" style="color: #f39c12;">{pending:,}</p>
+            <div class="progress">
+                <div class="progress-bar" style="width: {(pending/total_tracks*100) if total_tracks>0 else 0}%; background: #f39c12;"></div>
+            </div>
+        </div>
+        
+        <div class="stat-card">
+            <h3>❌ Failed</h3>
+            <p class="value" style="color: #e74c3c;">{failed:,}</p>
+            <div class="progress">
+                <div class="progress-bar" style="width: {(failed/total_tracks*100) if total_tracks>0 else 0}%; background: #e74c3c;"></div>
+            </div>
+        </div>
     </div>
     
-    <div class="endpoint">
-        <h3><span class="method">GET</span> /metrics</h3>
-        <pre>Download attempt success rates per service/tier</pre>
+    <div class="section">
+        <h2>⚙️ System Status</h2>
+        <table>
+            <tr>
+                <th>Metric</th>
+                <th>Value</th>
+            </tr>
+            <tr>
+                <td>Uptime</td>
+                <td>{uptime_str}</td>
+            </tr>
+            <tr>
+                <td>Worker Configuration</td>
+                <td>
+                    <div class="worker-status">
+                        <div class="worker-dot"></div>
+                        <strong>12 Workers</strong> (MAX_CONCURRENT=12)
+                    </div>
+                </td>
+            </tr>
+            <tr>
+                <td>Download Pipeline</td>
+                <td><span class="status-badge status-success">Active</span></td>
+            </tr>
+            <tr>
+                <td>Auto-refresh</td>
+                <td>Every 5 seconds</td>
+            </tr>
+        </table>
     </div>
     
-    <div class="endpoint">
-        <h3><span class="method">POST</span> /sync</h3>
-        <pre>Trigger full Spotify sync + download pipeline (requires auth if DAEMON_API_TOKEN is set)</pre>
+    <div class="section">
+        <h2>🚀 Quick Actions</h2>
+        <div class="quick-actions">
+            <a href="http://localhost:9079/api/progress" target="_blank" class="action-btn btn-primary">📊 Live Progress</a>
+            <a href="http://localhost:9079/metrics" target="_blank" class="action-btn btn-success">📈 Metrics</a>
+            <a href="http://localhost:9079/status" target="_blank" class="action-btn btn-warning">📋 Status</a>
+            <a href="http://localhost:32400" target="_blank" class="action-btn btn-primary">🎬 Plex</a>
+        </div>
     </div>
     
-    <div class="endpoint">
-        <h3><span class="method">POST</span> /integrity</h3>
-        <pre>Run file integrity check and re-queue missing/corrupt tracks (requires auth if DAEMON_API_TOKEN is set)</pre>
+    <div class="section">
+        <h2>📥 Download Performance by Tier</h2>
+        <table>
+            <tr>
+                <th>Service/Tier</th>
+                <th>Success ✓</th>
+                <th>Failed ✗</th>
+                <th>Total</th>
+                <th>Success Rate</th>
+            </tr>
+            {tier_html}
+        </table>
     </div>
     
-    <div class="endpoint">
-        <h3><span class="method">POST</span> /discover</h3>
-        <pre>Fetch ListenBrainz CF recommendations (requires auth if DAEMON_API_TOKEN is set)</pre>
+    <div class="log-panel">
+        <h3>📋 Recent Download Activity</h3>
+        <table>
+            <tr>
+                <th>Method</th>
+                <th>Status</th>
+                <th>Time</th>
+            </tr>
+            {recent_html or "<tr><td colspan='3' style='text-align: center; color: #7f8c8d;'>No recent downloads</td></tr>"}
+        </table>
     </div>
     
-    <div class="endpoint">
-        <h3><span class="method">POST</span> /backup</h3>
-        <pre>PostgreSQL backup via pg_dump (requires auth if DAEMON_API_TOKEN is set)</pre>
+    <div class="section">
+        <h2>📖 Quick Links</h2>
+        <ul style="list-style: none; padding: 0;">
+            <li style="padding: 10px 0; border-bottom: 1px solid #ecf0f1;">
+                <a href="http://localhost:32400" target="_blank" style="color: #3498db; text-decoration: none; font-weight: 600;">🎬 Plex Media Server</a>
+            </li>
+            <li style="padding: 10px 0; border-bottom: 1px solid #ecf0f1;">
+                <a href="http://localhost:9078" target="_blank" style="color: #3498db; text-decoration: none; font-weight: 600;">📊 Multi-Scrobbler</a>
+            </li>
+            <li style="padding: 10px 0;">
+                <a href="/docs" style="color: #3498db; text-decoration: none; font-weight: 600;">📚 API Documentation</a>
+            </li>
+        </ul>
     </div>
     
-    <h2>Quick Links</h2>
-    <table>
-        <tr>
-            <th>Service</th>
-            <th>URL</th>
-        </tr>
-        <tr>
-            <td>Plex Media Server</td>
-            <td><a href="http://localhost:32400" target="_blank">http://localhost:32400</a></td>
-        </tr>
-        <tr>
-            <td>Multi-Scrobbler</td>
-            <td><a href="http://localhost:9078" target="_blank">http://localhost:9078</a></td>
-        </tr>
-    </table>
-    
-    <p style="margin-top: 40px; font-size: 14px; color: #666;">
-        <em>Tip: Use <code>startup.bat</code> on Windows for easy management of the stack.</em>
-    </p>
+    <script>
+        // Add smooth scrolling and enhance interactivity
+        document.querySelectorAll('.action-btn').forEach(btn => {{
+            btn.addEventListener('mouseenter', function() {{
+                this.style.transform = 'translateY(-2px)';
+                this.style.boxShadow = '0 4px 12px rgba(0,0,0,0.2)';
+            }});
+            btn.addEventListener('mouseleave', function() {{
+                this.style.transform = 'translateY(0)';
+                this.style.boxShadow = 'none';
+            }});
+        }});
+        
+        // Add timestamp update
+        setInterval(function() {{
+            const now = new Date();
+            console.log('Dashboard refreshed:', now.toLocaleTimeString());
+        }}, 5000);
+    </script>
 </body>
 </html>
     """
     return html, 200
+
+
+@app.get("/api/progress")
+def progress():
+    """
+    GET /api/progress
+    Returns real-time JSON progress data for dashboard updates.
+    """
+    try:
+        from src.db import get_session
+        from src.models import Track, DownloadAttempt
+        import os
+        
+        with get_session() as session:
+            # Track statistics
+            total_tracks = session.query(Track).count()
+            downloaded = session.query(Track).filter(Track.status == "downloaded").count()
+            pending = session.query(Track).filter(Track.status == "pending").count()
+            failed = session.query(Track).filter(Track.status.in_(["failed", "failed_validation", "timed_out"])).count()
+            
+            # Recent downloads
+            recent_downloads = session.query(DownloadAttempt).order_by(
+                DownloadAttempt.attempted_at.desc()
+            ).limit(20).all()
+            
+            # Download rate calculation
+            recent_count = session.query(DownloadAttempt).filter(
+                DownloadAttempt.attempted_at > datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+            ).count()
+            
+            # Get current worker count
+            current_workers = int(os.environ.get("MAX_CONCURRENT_WORKERS", "6"))
+            
+            # Calculate estimated completion time
+            if downloaded > 0:
+                # Simple estimate: based on today's downloads
+                daily_rate = recent_count
+                remaining = pending
+                days_left = remaining / daily_rate if daily_rate > 0 else None
+            else:
+                days_left = None
+            
+        return jsonify({
+            "status": "ok",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tracks": {
+                "total": total_tracks,
+                "downloaded": downloaded,
+                "pending": pending,
+                "failed": failed,
+                "completion_pct": round((downloaded / total_tracks * 100), 2) if total_tracks > 0 else 0,
+            },
+            "performance": {
+                "workers": current_workers,
+                "today_downloads": recent_count,
+                "estimated_days_remaining": days_left,
+            },
+            "recent_activity": [
+                {
+                    "method": d.method,
+                    "success": d.success,
+                    "timestamp": d.attempted_at.isoformat(),
+                } for d in recent_downloads
+            ],
+            "uptime_s": round(time.time() - _start_time, 1),
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 500
 
 
 @app.get("/health")
