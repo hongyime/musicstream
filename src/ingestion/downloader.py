@@ -85,11 +85,6 @@ logger.info("Worker concurrency set to: MAX_CONCURRENT=%d", MAX_CONCURRENT)
 # One active spotdl download at a time prevents 4 workers from hitting the limit together.
 _SPOTDL_SEMAPHORE = threading.Semaphore(1)
 
-# spotdl process-wide singleton — SpotifyClient is a class-level singleton internally;
-# creating a second Spotdl instance in the same process raises "already initialized".
-_SPOTDL_CLIENT: Optional[Any] = None
-_SPOTDL_CLIENT_LOCK = threading.Lock()
-
 # SpotiFLAC serialisation — deezmate and monochrome.tf return 429 under concurrent load.
 # Two slots preserves some parallelism while halving the request rate.
 _SPOTIFLAC_SEMAPHORE = threading.Semaphore(2)
@@ -633,13 +628,14 @@ class DownloadOrchestrator:
 
     def _tier3_spotdl(self, track: Track) -> Optional[str]:
         """
-        Download via spotdl Python API using the Spotify URI. Output: MP3 320kbps to temp/.
+        Download via spotdl CLI using the Spotify URI. Output: MP3 320kbps to temp/.
         Returns temp file path or None.
         Requires SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET env vars.
+        
+        Using CLI instead of Python API to avoid asyncio/threading conflicts.
+        The spotdl Python API has a process-wide SpotifyClient singleton that
+        conflicts with ThreadPoolExecutor workers.
         """
-        if not SPOTDL_AVAILABLE:
-            return None
-
         if not self._rate_limiter.is_healthy("spotdl"):
             logger.warning("spotdl circuit breaker open; skipping Tier 3.")
             return None
@@ -660,37 +656,81 @@ class DownloadOrchestrator:
             return None
 
         try:
-            client = self._get_spotdl_client(client_id, client_secret)
-            if client is None:
-                return None
-
-            # Ensure event loop is available for spotdl's internal async downloader
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_closed():
-                    loop = None
-            except RuntimeError:
-                loop = None
+            import subprocess
+            import shutil
             
-            if loop is None:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-
-            songs = client.search([track.spotify_uri])
-            if not songs:
-                logger.warning("spotdl: no results for track %d ('%s')", track.id, track.title)
+            # Check if spotdl CLI is available
+            spotdl_path = shutil.which("spotdl")
+            if not spotdl_path:
+                logger.warning("spotdl CLI not found; skipping Tier 3.")
                 self._rate_limiter.record_failure("spotdl")
                 return None
 
-            _song, path = client.download(songs[0])
-            if path is None or not path.exists():
+            spotify_uri = track.spotify_uri
+            if not spotify_uri:
+                logger.warning("Tier 3 skipped for track %d ('%s'): no spotify_uri", track.id, track.title)
+                return None
+            
+            # Use a unique output directory for this download
+            out_dir = os.path.join(TEMP_DIR, f"spotdl_{track.id}_{uuid.uuid4().hex[:8]}")
+            os.makedirs(out_dir, exist_ok=True)
+
+            # Build spotdl command
+            cmd = [
+                spotdl_path,
+                "--output", out_dir,
+                "--format", "mp3",
+                "--bitrate", "320k",
+                "--log-level", "ERROR",
+                "--client-id", client_id,
+                "--client-secret", client_secret,
+                spotify_uri,
+            ]
+
+            logger.debug("Running spotdl CLI for track %d: %s", track.id, " ".join(cmd[:4] + ["..."]))
+
+            # Run spotdl subprocess
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,  # 2 minute timeout
+            )
+
+            if result.returncode != 0:
+                logger.warning(
+                    "spotdl CLI failed for track %d ('%s'): returncode=%d, stderr=%s",
+                    track.id, track.title, result.returncode, result.stderr[:200],
+                )
+                self._rate_limiter.record_failure("spotdl")
+                return None
+
+            # Find downloaded file
+            downloaded_file = None
+            for root, _, files in os.walk(out_dir):
+                for fname in files:
+                    if fname.endswith((".mp3", ".m4a", ".flac", ".ogg", ".opus")):
+                        full_path = os.path.join(root, fname)
+                        if os.path.getsize(full_path) > 0:
+                            downloaded_file = full_path
+                            break
+                if downloaded_file:
+                    break
+
+            if not downloaded_file:
+                logger.warning("spotdl CLI did not produce a file for track %d", track.id)
                 self._rate_limiter.record_failure("spotdl")
                 return None
 
             self._rate_limiter.record_success("spotdl")
             self._throttle.on_success("spotdl")
-            return str(path)
+            logger.info("spotdl CLI successfully downloaded track %d via %s", track.id, os.path.basename(downloaded_file))
+            return downloaded_file
 
+        except subprocess.TimeoutExpired:
+            logger.warning("spotdl CLI timeout for track %d", track.id)
+            self._rate_limiter.record_failure("spotdl")
+            return None
         except Exception as exc:
             msg = str(exc)
             if "rate" in msg.lower() or "limit" in msg.lower() or "retry will occur" in msg.lower():
@@ -844,38 +884,53 @@ class DownloadOrchestrator:
 
     @staticmethod
     def _get_spotdl_client(client_id: str, client_secret: str) -> Optional[Any]:
-        """Return the process-wide Spotdl singleton, creating it on first call.
+        """Return a thread-local Spotdl instance, creating one if needed.
 
-        SpotifyClient is a class-level singleton inside spotdl — constructing a
-        second Spotdl instance in the same process raises "already initialized".
-        A single instance is created once and reused for all downloads.
+        Each worker thread gets its own Spotdl instance with its own event loop.
+        This avoids async/threading conflicts while preventing multiple instances
+        in the same thread (which would trigger "already initialized" errors).
         
-        IMPORTANT: The event loop is set as the current loop for the thread to
-        handle async operations in ThreadPoolExecutor workers.
+        Using threading.local() is cleaner than process-wide singletons with
+        shared event loops that fail in ThreadPoolExecutor environments.
         """
-        global _SPOTDL_CLIENT
         if not SPOTDL_AVAILABLE:
             return None
-        if _SPOTDL_CLIENT is not None:
-            return _SPOTDL_CLIENT
+        
+        # Check if this thread already has a client
+        if hasattr(_SPOTDL_THREAD_LOCAL, 'client'):
+            return _SPOTDL_THREAD_LOCAL.client
+        
         with _SPOTDL_CLIENT_LOCK:
-            if _SPOTDL_CLIENT is None:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)  # Set as current loop for this thread
-                _SPOTDL_CLIENT = Spotdl(
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    downloader_settings={
-                        "output": os.path.abspath(TEMP_DIR),
-                        "format": "mp3",
-                        "bitrate": "320k",
-                        "overwrite": "force",
-                        "log_level": "ERROR",
-                    },
-                    loop=loop,
-                )
-                logger.info("spotdl singleton initialised (client_id=%s…)", client_id[:8])
-        return _SPOTDL_CLIENT
+            # Double-check after acquiring lock
+            if hasattr(_SPOTDL_THREAD_LOCAL, 'client'):
+                return _SPOTDL_THREAD_LOCAL.client
+            
+            # Create a new event loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            # Create Spotdl instance for this thread
+            client = Spotdl(
+                client_id=client_id,
+                client_secret=client_secret,
+                downloader_settings={
+                    "output": os.path.abspath(TEMP_DIR),
+                    "format": "mp3",
+                    "bitrate": "320k",
+                    "overwrite": "force",
+                    "log_level": "ERROR",
+                },
+                loop=loop,
+            )
+            
+            # Store in thread-local storage
+            _SPOTDL_THREAD_LOCAL.client = client
+            _SPOTDL_THREAD_LOCAL.loop = loop
+            
+            logger.info("spotdl thread-local client created (thread=%s, client_id=%s…)", 
+                       threading.current_thread().name, client_id[:8])
+        
+        return _SPOTDL_THREAD_LOCAL.client
 
     def _build_mp3_opts(self, out_stem: str) -> dict:
         """
