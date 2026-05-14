@@ -3,8 +3,8 @@ rate_limiter.py — Per-service rate limiting with exponential backoff, jitter,
 and a circuit breaker for the musicstream daemon.
 
 Services covered (PRD §11):
-  spotify, spotiflac, youtube, ytmusicapi, spotdl,
-  musicbrainz, acoustid, listenbrainz, coverart
+  spotify, librespot, youtube, ytmusicapi, spotdl,
+  musicbrainz, acoustid, listenbrainz, coverart, soundcloud
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ class ServiceRateLimiter:
 
     CONFIGS: Dict[str, ServiceRateConfig] = {
         "spotify":      ServiceRateConfig(base=3.0,  max=3600, concurrent=10),
-        "spotiflac":    ServiceRateConfig(base=10.0, max=600,  concurrent=2),  # Increased base/backoff for Deezer 429
+        "librespot":    ServiceRateConfig(base=5.0,  max=120,  concurrent=1),   # Tier 0: direct Spotify CDN, serialised
         "youtube":      ServiceRateConfig(base=4.0,  max=600,  concurrent=3),
         "ytmusicapi":   ServiceRateConfig(base=2.5,  max=300,  concurrent=5),
         "spotdl":       ServiceRateConfig(base=3.0,  max=180,  concurrent=3),

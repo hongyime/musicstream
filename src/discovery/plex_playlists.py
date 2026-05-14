@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime as dt, timezone, timedelta
 from typing import Optional
 
 import requests
@@ -96,7 +96,7 @@ class PlexPlaylistSync:
             Month/year parameters maintained for backward compatibility but ignored
             in favor of weekly-based naming. Playlist now follows format: "Discovered: Y{year} W{week}"
         """
-        # Use week-based naming instead of monthly for better granularity
+        from datetime import datetime as dt
         # ListenBrainz runs daily, so weekly playlists make sense
         week_num = dt.now().isocalendar()[1]  # ISO week number (1-53)
         playlist_name = f"Discovered: Y{year} W{week_num}"

@@ -14,7 +14,6 @@ MAX_CONCURRENT = 4 parallel workers via ThreadPoolExecutor.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import threading
@@ -22,7 +21,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
 import yt_dlp  # type: ignore[import-untyped]
 from sqlalchemy import func, select
@@ -35,21 +34,61 @@ from src.rate_limiter import ServiceRateLimiter, ServiceThrottle
 logger = logging.getLogger(__name__)
 errors_logger = logging.getLogger("errors")
 
-# ── SpotiFLAC optional import ──────────────────────────────────────────────────
+# ── librespot optional import (Tier 0: direct Spotify CDN) ───────────────────
 
 try:
-    from spotiflac import SpotiFLAC as _SpotiFLAC
-    SPOTIFLAC_AVAILABLE = True
+    from librespot.core import Session as _LibrespotSession
+    from librespot.metadata import TrackId as _TrackId
+    from librespot.audio.decoders import (
+        VorbisOnlyAudioQuality as _VorbisQuality,
+        AudioQuality as _AudioQuality,  # AudioQuality lives in decoders, not audio
+    )
+    LIBRESPOT_AVAILABLE = True
 except ImportError:
-    try:
-        from SpotiFLAC import SpotiFLAC as _SpotiFLAC
-        SPOTIFLAC_AVAILABLE = True
-    except ImportError:
-        SPOTIFLAC_AVAILABLE = False
-        logger.warning("SpotiFLAC not available (ImportError); Tier 1 skipped")
+    LIBRESPOT_AVAILABLE = False
+    logger.warning("librespot not available; Tier 0 skipped")
 
-if SPOTIFLAC_AVAILABLE:
-    logger.info("SpotiFLAC available — Tier 1 active")
+if LIBRESPOT_AVAILABLE:
+    logger.info("librespot available — Tier 0 active")
+
+# Module-level librespot session singleton (created once, reused across all workers)
+_librespot_session: Optional[object] = None
+_librespot_session_lock = threading.Lock()
+_LIBRESPOT_SEMAPHORE = threading.Semaphore(1)  # one CDN stream at a time
+
+
+def _get_librespot_session():
+    """Return the shared librespot Session, creating it on first call."""
+    global _librespot_session
+    if _librespot_session is not None:
+        return _librespot_session
+    with _librespot_session_lock:
+        if _librespot_session is not None:
+            return _librespot_session
+        cred_file = os.environ.get("LIBRESPOT_CREDENTIALS_FILE", "/app/data/librespot_credentials.json")
+        username = os.environ.get("SPOTIFY_USERNAME", "").strip()
+        password = os.environ.get("SPOTIFY_PASSWORD", "").strip()
+        # Ensure credential file directory exists inside container
+        import pathlib as _pl
+        _pl.Path(cred_file).parent.mkdir(parents=True, exist_ok=True)
+        conf = _LibrespotSession.Configuration.Builder() \
+            .set_stored_credential_file(cred_file) \
+            .build()
+        # Try stored credentials first (no password needed after first auth)
+        cred_exists = _pl.Path(cred_file).exists() and _pl.Path(cred_file).stat().st_size > 10
+        if cred_exists:
+            try:
+                _librespot_session = _LibrespotSession.Builder(conf).stored_file().create()
+                logger.info("librespot: authenticated from stored credential file")
+                return _librespot_session
+            except Exception as exc:
+                logger.warning("librespot: stored credential failed (%s), trying password", exc)
+        if not username or not password:
+            raise RuntimeError("SPOTIFY_USERNAME/PASSWORD not set and no valid credential file at " + cred_file)
+        _librespot_session = _LibrespotSession.Builder(conf).user_pass(username, password).create()
+        logger.info("librespot: authenticated with username/password → credentials saved to %s", cred_file)
+        return _librespot_session
+
 
 # ── ytmusicapi optional import ─────────────────────────────────────────────────
 
@@ -63,7 +102,7 @@ except ImportError:
 # ── spotdl optional import ─────────────────────────────────────────────────────
 
 try:
-    from spotdl import Spotdl  # type: ignore[import-untyped]
+    import spotdl  # type: ignore[import-untyped]  # noqa: F401
     SPOTDL_AVAILABLE = True
 except ImportError:
     SPOTDL_AVAILABLE = False
@@ -85,11 +124,6 @@ logger.info("Worker concurrency set to: MAX_CONCURRENT=%d", MAX_CONCURRENT)
 # One active spotdl download at a time prevents 4 workers from hitting the limit together.
 _SPOTDL_SEMAPHORE = threading.Semaphore(1)
 
-# SpotiFLAC serialisation — deezmate and monochrome.tf return 429 under concurrent load.
-# Two slots preserves some parallelism while halving the request rate.
-_SPOTIFLAC_SEMAPHORE = threading.Semaphore(2)
-
-
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -103,11 +137,9 @@ class DownloadOrchestrator:
     never raises an exception that stops other downloads.
     """
 
+    MAX_CONCURRENT: int = MAX_CONCURRENT
+
     def __init__(self) -> None:
-        # Check if Tier 1 (SpotiFLAC) is enabled
-        self._tier1_enabled = os.environ.get("ENABLE_TIER1", "true").lower() == "true"
-        logger.info("Tier 1 (SpotiFLAC) %s", "enabled" if self._tier1_enabled else "disabled via ENABLE_TIER1=false")
-        
         # Scale circuit breaker threshold based on concurrency
         # This prevents 4 concurrent workers from tripping a low threshold
         # when the same API fails for all workers simultaneously.
@@ -252,17 +284,17 @@ class DownloadOrchestrator:
         track.status = TrackStatus.DOWNLOADING.value
         session.flush()
 
-        # Build tiers list, optionally skipping Tier 1
+        # Build tiers list
         tiers = [
-            ("tier2_ytdlp_ytm",        self._tier2_ytdlp_ytm),         # MP3 320, best YT matching
-            ("tier3_spotdl",           self._tier3_spotdl),            # MP3 320, needs client_secret
-            ("tier4_ytdlp_youtube",    self._tier4_ytdlp_youtube),     # MP3 320, reliable direct search
-            ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),  # MP3 320, last resort
+            ("tier2_ytdlp_ytm",        self._tier2_ytdlp_ytm),         # MP3 320, YT Music match
+            ("tier3_spotdl",           self._tier3_spotdl),            # MP3 320, spotdl CLI
+            ("tier4_ytdlp_youtube",    self._tier4_ytdlp_youtube),     # MP3 320, YouTube direct
+            ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),  # MP3 320, SoundCloud
         ]
-        
-        # Add Tier 1 at the front if enabled (highest quality FLAc)
-        if self._tier1_enabled:
-            tiers.insert(0, ("tier1_spotiflac", self._tier1_spotiflac))
+
+        # Tier 0: librespot (direct Spotify CDN) — prepend if available
+        if LIBRESPOT_AVAILABLE:
+            tiers.insert(0, ("tier0_librespot", self._tier0_librespot))
 
         for method_name, tier_fn in tiers:
             try:
@@ -358,160 +390,98 @@ class DownloadOrchestrator:
 
         return False
 
-    # ── Tier 1: SpotiFLAC ─────────────────────────────────────────────────────
+    # ── Tier 0: librespot (direct Spotify CDN) ───────────────────────────────
 
-    def _tier1_spotiflac(self, track: Track) -> Optional[str]:
+    def _tier0_librespot(self, track: Track) -> Optional[str]:
         """
-        Attempt FLAC download via SpotiFLAC (qobuz → tidal → amazon → deezer).
-        Returns the downloaded file path, or None on failure.
-
-        Rate-limit handling:
-          - 429 / "Too Many Requests": soft-fail with retry (up to 3 attempts with exponential backoff)
-          - DNS / connection errors: CB failure — retrying immediately won't help.
-
-        Concurrency: _SPOTIFLAC_SEMAPHORE(2) caps parallel calls so backends
-        are not hammered by all 4 workers simultaneously.
-
-        Retry logic for 429 errors:
-          - First attempt: no delay
-          - Second attempt: 15 seconds wait
-          - Third attempt: 30 seconds wait
+        Download directly from Spotify's CDN via librespot.
+        Streams OGG Vorbis (320kbps equivalent) and converts to MP3 320k via FFmpeg.
+        Requires SPOTIFY_USERNAME + SPOTIFY_PASSWORD on first run only; subsequent
+        runs use the stored credential blob at LIBRESPOT_CREDENTIALS_FILE.
+        Returns temp MP3 path or None.
         """
-        if not SPOTIFLAC_AVAILABLE:
-            logger.warning("Tier 1 skipped for track %d ('%s'): SpotiFLAC not installed", track.id, track.title)
+        if not LIBRESPOT_AVAILABLE:
             return None
 
-        if not self._rate_limiter.is_healthy("spotiflac"):
-            logger.warning("SpotiFLAC circuit breaker open; skipping Tier 1 for track %d", track.id)
+        if not self._rate_limiter.is_healthy("librespot"):
+            logger.warning("librespot circuit breaker open; skipping Tier 0.")
             return None
 
         if not track.spotify_id:
-            logger.warning("Tier 1 skipped for track %d ('%s'): no spotify_id", track.id, track.title)
+            logger.debug("Tier 0 skipped for track %d: no spotify_id", track.id)
             return None
 
-        spotify_url = f"https://open.spotify.com/track/{track.spotify_id}"
+        if not _LIBRESPOT_SEMAPHORE.acquire(timeout=30):
+            logger.warning("librespot semaphore timeout for track %d", track.id)
+            return None
 
-        # Retry logic for 429 rate limit errors
-        max_retries = 3
-        retry_delays = [0, 15, 30]  # seconds: first try, then 15s, then 30s
+        try:
+            session = _get_librespot_session()
 
-        for attempt in range(max_retries):
-            if not self._throttle.wait("spotiflac"):
-                logger.info("Throttle skip: spotiflac track %d — will retry next run", track.id)
-                return None
+            track_id = _TrackId.from_uri(track.spotify_uri)
+            stream = session.content_feeder().load(
+                track_id,
+                _VorbisQuality(_AudioQuality.VERY_HIGH),
+                False,
+                None,
+            )
 
-            if not _SPOTIFLAC_SEMAPHORE.acquire(timeout=30):
-                logger.warning("SpotiFLAC semaphore timeout for track %d; skipping this run.", track.id)
-                return None
-
-            out_dir = os.path.join(TEMP_DIR, f"spotiflac_{uuid.uuid4().hex}")
+            # Write OGG Vorbis to temp file
+            out_dir = os.path.join(TEMP_DIR, f"librespot_{track.id}_{uuid.uuid4().hex[:8]}")
             os.makedirs(out_dir, exist_ok=True)
+            ogg_path = os.path.join(out_dir, f"{uuid.uuid4().hex}.ogg")
 
-            try:
-                # Wait before retry (not on first attempt)
-                if attempt > 0:
-                    delay = retry_delays[attempt]
-                    logger.info(
-                        "SpotiFLAC retry %d/%d for track %d ('%s'): waiting %ds due to rate limit",
-                        attempt + 1, max_retries, track.id, track.title, delay,
-                    )
-                    time.sleep(delay)
+            with open(ogg_path, "wb") as fh:
+                while True:
+                    chunk = stream.input_stream.stream().read(65536)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
 
-                # Run in a thread so we can impose a hard timeout — SpotiFLAC can
-                # hang indefinitely on a DNS failure before raising.
-                import concurrent.futures as _cf
-                
-                # Prepare Qobuz credentials if available
-                qobuz_email = os.environ.get("QOBUZ_EMAIL", "")
-                qobuz_password_md5 = os.environ.get("QOBUZ_PASSWORD_MD5", "")
-                
-                with _cf.ThreadPoolExecutor(max_workers=1) as ex:
-                    spotiflac_kwargs = {
-                        "url": spotify_url,
-                        "output_dir": out_dir,
-                        "services": ["qobuz", "tidal", "amazon", "deezer"],
-                    }
-                    # Only add Qobuz credentials if both are provided
-                    if qobuz_email and qobuz_password_md5:
-                        spotiflac_kwargs["qobuz_email"] = qobuz_email
-                        spotiflac_kwargs["qobuz_password_md5"] = qobuz_password_md5
-                        logger.debug("Using Qobuz authentication for track %d", track.id)
-                    
-                    fut = ex.submit(_SpotiFLAC, **spotiflac_kwargs)
-                    try:
-                        fut.result(timeout=150)
-                    except _cf.TimeoutError:
-                        logger.warning("SpotiFLAC timed out for track %d ('%s')", track.id, track.title)
-                        self._rate_limiter.record_failure("spotiflac")
-                        _SPOTIFLAC_SEMAPHORE.release()
-                        continue  # Try next retry
-
-            except Exception as exc:
-                # Walk the full exception chain — SpotiFLAC wraps backend 429s in
-                # generic messages ("Deezer download failed"), so str(exc) alone misses them.
-                if self._exc_contains_rate_limit(exc):
-                    logger.warning(
-                        "SpotiFLAC rate-limited for track %d ('%s') (attempt %d/%d) — backend overloaded",
-                        track.id, track.title, attempt + 1, max_retries,
-                    )
-                    self._throttle.on_rate_limit("spotiflac")
-                    _SPOTIFLAC_SEMAPHORE.release()
-
-                    # If we haven't exhausted retries, continue to the next attempt
-                    if attempt < max_retries - 1:
-                        continue
-                    else:
-                        logger.warning(
-                            "SpotiFLAC exhausted all retries for track %d ('%s') — will retry next run",
-                            track.id, track.title,
-                        )
-                        return None
-
-                # "Failed all services" means every backend had a transient error
-                # (DNS/-3, 429 wrapped, etc.) — SpotiFLAC itself is healthy.
-                msg = str(exc).lower()
-                if "failed all services" in msg or "all services failed" in msg:
-                    logger.warning(
-                        "SpotiFLAC all-services transient failure for track %d ('%s') (attempt %d/%d): %s",
-                        track.id, track.title, attempt + 1, max_retries, exc,
-                    )
-                    _SPOTIFLAC_SEMAPHORE.release()
-
-                    # Check if this might be a rate limit in the exception chain
-                    if self._exc_contains_rate_limit(exc):
-                        if attempt < max_retries - 1:
-                            continue
-                        else:
-                            return None
-                    return None
-
-                logger.warning("SpotiFLAC failed for track %d ('%s'): %s", track.id, track.title, exc)
-                self._rate_limiter.record_failure("spotiflac")
-                _SPOTIFLAC_SEMAPHORE.release()
+            if not os.path.exists(ogg_path) or os.path.getsize(ogg_path) < 1024:
+                logger.warning("librespot: empty stream for track %d ('%s')", track.id, track.title)
+                self._rate_limiter.record_failure("librespot")
                 return None
 
-            # Check for downloaded files
-            for root, _, files in os.walk(out_dir):
-                for fname in files:
-                    if fname.endswith((".flac", ".m4a", ".mp3", ".ogg", ".opus")):
-                        found = os.path.join(root, fname)
-                        if os.path.getsize(found) > 0:
-                            ext = os.path.splitext(fname)[1]
-                            dest = os.path.join(out_dir, f"{uuid.uuid4().hex}_spotiflac{ext}")
-                            os.rename(found, dest)
-                            self._rate_limiter.record_success("spotiflac")
-                            self._throttle.on_success("spotiflac")
-                            logger.info("SpotiFLAC: track %d downloaded → %s (attempt %d/%d)", track.id, os.path.basename(dest), attempt + 1, max_retries)
-                            _SPOTIFLAC_SEMAPHORE.release()
-                            return dest
+            # Convert OGG → MP3 320k
+            mp3_path = ogg_path.replace(".ogg", ".mp3")
+            import subprocess as _sp
+            ffmpeg_result = _sp.run(
+                [
+                    "ffmpeg", "-i", ogg_path,
+                    "-codec:a", "libmp3lame", "-b:a", "320k",
+                    "-y", "-loglevel", "error",
+                    mp3_path,
+                ],
+                capture_output=True,
+                timeout=120,
+            )
+            try:
+                os.remove(ogg_path)
+            except OSError:
+                pass
 
-            logger.warning("SpotiFLAC: no file produced for track %d ('%s') (attempt %d/%d)", track.id, track.title, attempt + 1, max_retries)
-            _SPOTIFLAC_SEMAPHORE.release()
+            if ffmpeg_result.returncode != 0 or not os.path.exists(mp3_path):
+                logger.warning(
+                    "librespot: ffmpeg conversion failed for track %d: %s",
+                    track.id, ffmpeg_result.stderr.decode(errors="replace")[:200],
+                )
+                self._rate_limiter.record_failure("librespot")
+                return None
 
-        # All retries exhausted
-        logger.warning("SpotiFLAC: exhausted all retries for track %d ('%s')", track.id, track.title)
-        self._rate_limiter.record_failure("spotiflac")
-        return None
+            self._rate_limiter.record_success("librespot")
+            logger.info("librespot: track %d ('%s') downloaded OK", track.id, track.title)
+            return mp3_path
+
+        except Exception as exc:
+            self._rate_limiter.record_failure("librespot")
+            logger.warning("librespot failed for track %d ('%s'): %s", track.id, track.title, exc)
+            # Invalidate session so next call tries to reconnect
+            global _librespot_session
+            _librespot_session = None
+            return None
+        finally:
+            _LIBRESPOT_SEMAPHORE.release()
 
     # ── Tier 2: yt-dlp + ytmusicapi ───────────────────────────────────────────
 
@@ -675,8 +645,9 @@ class DownloadOrchestrator:
             out_dir = os.path.join(TEMP_DIR, f"spotdl_{track.id}_{uuid.uuid4().hex[:8]}")
             os.makedirs(out_dir, exist_ok=True)
 
-            # Build spotdl command
-            cmd = [
+            # Build spotdl command — try Spotify CDN first (higher quality, exact match),
+            # fall back to YouTube Music if Spotify source fails.
+            base_cmd = [
                 spotdl_path,
                 "--output", out_dir,
                 "--format", "mp3",
@@ -684,18 +655,31 @@ class DownloadOrchestrator:
                 "--log-level", "ERROR",
                 "--client-id", client_id,
                 "--client-secret", client_secret,
-                spotify_uri,
             ]
 
-            logger.debug("Running spotdl CLI for track %d: %s", track.id, " ".join(cmd[:4] + ["..."]))
-
-            # Run spotdl subprocess
+            # Attempt 1: --audio spotify (direct CDN — best quality, exact track)
+            cmd_spotify = base_cmd + ["--audio", "spotify", spotify_uri]
+            logger.debug("Running spotdl (spotify audio) for track %d", track.id)
             result = subprocess.run(
-                cmd,
+                cmd_spotify,
                 capture_output=True,
                 text=True,
-                timeout=120,  # 2 minute timeout
+                timeout=120,
             )
+
+            # Attempt 2: fallback to default (YouTube Music) if Spotify source failed
+            if result.returncode != 0:
+                logger.info(
+                    "spotdl --audio spotify failed for track %d ('%s'); falling back to YouTube: %s",
+                    track.id, track.title, result.stderr[:120],
+                )
+                cmd_yt = base_cmd + ["--audio", "youtube-music", spotify_uri]
+                result = subprocess.run(
+                    cmd_yt,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
 
             if result.returncode != 0:
                 logger.warning(
@@ -882,56 +866,6 @@ class DownloadOrchestrator:
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
-    @staticmethod
-    def _get_spotdl_client(client_id: str, client_secret: str) -> Optional[Any]:
-        """Return a thread-local Spotdl instance, creating one if needed.
-
-        Each worker thread gets its own Spotdl instance with its own event loop.
-        This avoids async/threading conflicts while preventing multiple instances
-        in the same thread (which would trigger "already initialized" errors).
-        
-        Using threading.local() is cleaner than process-wide singletons with
-        shared event loops that fail in ThreadPoolExecutor environments.
-        """
-        if not SPOTDL_AVAILABLE:
-            return None
-        
-        # Check if this thread already has a client
-        if hasattr(_SPOTDL_THREAD_LOCAL, 'client'):
-            return _SPOTDL_THREAD_LOCAL.client
-        
-        with _SPOTDL_CLIENT_LOCK:
-            # Double-check after acquiring lock
-            if hasattr(_SPOTDL_THREAD_LOCAL, 'client'):
-                return _SPOTDL_THREAD_LOCAL.client
-            
-            # Create a new event loop for this thread
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            # Create Spotdl instance for this thread
-            client = Spotdl(
-                client_id=client_id,
-                client_secret=client_secret,
-                downloader_settings={
-                    "output": os.path.abspath(TEMP_DIR),
-                    "format": "mp3",
-                    "bitrate": "320k",
-                    "overwrite": "force",
-                    "log_level": "ERROR",
-                },
-                loop=loop,
-            )
-            
-            # Store in thread-local storage
-            _SPOTDL_THREAD_LOCAL.client = client
-            _SPOTDL_THREAD_LOCAL.loop = loop
-            
-            logger.info("spotdl thread-local client created (thread=%s, client_id=%s…)", 
-                       threading.current_thread().name, client_id[:8])
-        
-        return _SPOTDL_THREAD_LOCAL.client
-
     def _build_mp3_opts(self, out_stem: str) -> dict:
         """
         Build yt-dlp options for bestaudio → FFmpeg → MP3 320kbps output.
@@ -1051,12 +985,10 @@ class DownloadOrchestrator:
         Map internal tier name + file path to the canonical download_method label.
 
         Labels per spec:
-          spotiflac | ytdlp_ytm | spotdl | ytdlp_yt | ytdlp_soundcloud
+          librespot | ytdlp_ytm | spotdl | ytdlp_yt | ytdlp_soundcloud
         """
-        if tier_name == "tier1_spotiflac":
-            # SpotiFLAC names output files by track title, not by service —
-            # there is no reliable way to recover which backend succeeded.
-            return "spotiflac"
+        if tier_name == "tier0_librespot":
+            return "librespot"
         elif tier_name == "tier2_ytdlp_ytm":
             return "ytdlp_ytm"
         elif tier_name == "tier3_spotdl":

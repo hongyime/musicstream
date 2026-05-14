@@ -11,41 +11,28 @@ Covers:
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
 # Mock spotipy before importing scraper
 _mock_spotipy = MagicMock()
 sys.modules.setdefault("spotipy", _mock_spotipy)
 sys.modules.setdefault("spotipy.oauth2", _mock_spotipy.oauth2)
+# Mock the cache handler module as well
+sys.modules.setdefault("spotipy.cache_handler", MagicMock())
 
-from src.models import Base, Source, SourceType, Track, TrackStatus
-from src.ingestion.scraper import SpotifyScraper
+from src.models import Source, SourceType, Track, TrackStatus  # noqa: E402
+from src.ingestion.scraper import SpotifyScraper  # noqa: E402
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
-@pytest.fixture(scope="module")
-def engine():
-    eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
-    Base.metadata.create_all(eng)
-    return eng
-
-
-@pytest.fixture
-def session(engine):
-    Session = sessionmaker(bind=engine, expire_on_commit=False)
-    sess = Session()
-    yield sess
-    sess.rollback()
-    sess.close()
+# Use centralized fixtures from conftest.py - remove duplicate definitions
+# These fixtures are now provided by tests/conftest.py
 
 
 @pytest.fixture
@@ -298,6 +285,5 @@ class TestUpdateSource:
         )
         session.add(src)
         session.flush()
-        before = datetime.now(timezone.utc)
         scraper._update_source(session, src, "snap", 5)
         assert src.last_scraped_at is not None

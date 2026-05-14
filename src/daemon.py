@@ -582,7 +582,7 @@ def _register_scheduler_jobs() -> None:
     scheduler.add_job(
         full_download_pipeline,
         "cron",
-        hour=3,
+        hour="*/2",
         id="download_pipeline",
         replace_existing=True,
     )
@@ -609,7 +609,7 @@ def _register_scheduler_jobs() -> None:
         id="db_backup",
         replace_existing=True,
     )
-    logger.info("APScheduler jobs registered: spotify_sync, download_pipeline, lb_discovery, integrity_check, db_backup")
+    logger.info("APScheduler jobs registered: spotify_sync (*/15min), download_pipeline (every 2h), lb_discovery, integrity_check, db_backup")
 
 
 # ── Flask HTTP control plane ──────────────────────────────────────────────────
@@ -641,341 +641,341 @@ def _check_auth() -> Optional[tuple]:
 def index():
     """
     GET /
-    Returns a comprehensive web dashboard with real-time progress monitoring.
-    Auto-refreshes every 5 seconds.
+    Dashboard: progress, active downloads, pending queue, failed tracks, error log tail.
+    Refreshes every 60 seconds via meta tag.
     """
-    # Get up-to-date statistics
+    from sqlalchemy import func as sqlfunc, text as sqltext
+
+    # ── DB queries ────────────────────────────────────────────────────────────
+    total_tracks = downloaded = pending_count = failed_count = active_count = 0
+    progress_pct = 0.0
+    active_rows: list = []
+    pending_rows: list = []
+    failed_rows: list = []
+    tier_stats_dict: dict = {}
+    last_run_str = "never"
+    workers = int(os.environ.get("MAX_CONCURRENT_WORKERS", "4"))
+    disable_dl = os.environ.get("DISABLE_DOWNLOADS", "").lower() in ("1", "true", "yes", "on")
+
     try:
         from src.db import get_session
         from src.models import Track, DownloadAttempt, DaemonRun
-        import json
-        
+
         with get_session() as session:
-            # Track statistics
-            total_tracks = session.query(Track).count()
-            downloaded = session.query(Track).filter(Track.status == "downloaded").count()
-            pending = session.query(Track).filter(Track.status == "pending").count()
-            failed = session.query(Track).filter(Track.status.in_(["failed", "failed_validation", "timed_out"])).count()
-            
-            # Recent download attempts
-            recent_downloads = session.query(DownloadAttempt).order_by(
-                DownloadAttempt.attempted_at.desc()
-            ).limit(10).all()
-            
-            # Download metrics by tier
-            tier_stats = session.query(
-                DownloadAttempt.method,
-                DownloadAttempt.success,
-                session.func.count(DownloadAttempt.id)
-            ).group_by(DownloadAttempt.method, DownloadAttempt.success).all()
-            
-            # Progress percentage
-            progress_pct = (downloaded / total_tracks * 100) if total_tracks > 0 else 0
-            
-    except Exception as e:
-        # Fallback if DB query fails
-        total_tracks, downloaded, pending, failed = 0, 0, 0, 0
-        tier_stats = []
-        recent_downloads = []
-        progress_pct = 0
-    
-    # Calculate uptime
-    uptime_seconds = int(time.time() - _start_time)
-    uptime_str = f"{uptime_seconds // 3600}h {(uptime_seconds % 3600) // 60}m {uptime_seconds % 60}s"
-    
-    # Format tier stats
-    tier_stats_dict = {}
-    for method, success, count in tier_stats:
-        if method not in tier_stats_dict:
-            tier_stats_dict[method] = {"success": 0, "failed": 0, "total": 0}
-        tier_stats_dict[method]["success" if success else "failed"] = count
-        tier_stats_dict[method]["total"] += count
-    
-    # Format recent downloads for display
-    recent_html = ""
-    for attempt in recent_downloads:
-        status_color = "green" if attempt.success else "red"
-        recent_html += f"""
-        <tr>
-            <td>{attempt.method}</td>
-            <td style="color: {status_color}; font-weight: bold;">{"✓" if attempt.success else "✗"}</td>
-            <td>{attempt.timestamp.strftime("%H:%M:%S")}</td>
-        </tr>
-        """
-    
-    # Format tier stats table
+            total_tracks  = session.query(Track).count()
+            downloaded     = session.query(Track).filter(Track.status == "downloaded").count()
+            pending_count  = session.query(Track).filter(Track.status == "pending").count()
+            failed_count   = session.query(Track).filter(Track.status.in_(["failed", "failed_validation", "timed_out"])).count()
+            active_count   = session.query(Track).filter(Track.status == "downloading").count()
+            progress_pct   = (downloaded / total_tracks * 100) if total_tracks > 0 else 0.0
+
+            # Currently downloading
+            active_rows = (
+                session.query(Track)
+                .filter(Track.status == "downloading")
+                .order_by(Track.updated_at.desc())
+                .limit(20).all()
+            )
+
+            # Pending: worst-stuck (most failed attempts) first
+            attempt_count_sub = (
+                session.query(
+                    DownloadAttempt.track_id,
+                    sqlfunc.count(DownloadAttempt.id).label("attempts"),
+                )
+                .filter(DownloadAttempt.success == False)  # noqa: E712
+                .group_by(DownloadAttempt.track_id)
+                .subquery()
+            )
+            pending_rows = (
+                session.query(Track, attempt_count_sub.c.attempts)
+                .outerjoin(attempt_count_sub, Track.id == attempt_count_sub.c.track_id)
+                .filter(Track.status == "pending")
+                .order_by(sqlfunc.coalesce(attempt_count_sub.c.attempts, 0).desc())
+                .limit(50).all()
+            )
+
+            # Failed: with last error message
+            last_err_sub = (
+                session.query(
+                    DownloadAttempt.track_id,
+                    sqlfunc.max(DownloadAttempt.attempted_at).label("last_at"),
+                )
+                .group_by(DownloadAttempt.track_id)
+                .subquery()
+            )
+            failed_rows = (
+                session.query(Track, DownloadAttempt.error, DownloadAttempt.method)
+                .join(last_err_sub, Track.id == last_err_sub.c.track_id)
+                .join(
+                    DownloadAttempt,
+                    (DownloadAttempt.track_id == Track.id)
+                    & (DownloadAttempt.attempted_at == last_err_sub.c.last_at),
+                )
+                .filter(Track.status.in_(["failed", "failed_validation", "timed_out"]))
+                .order_by(Track.updated_at.desc())
+                .limit(50).all()
+            )
+
+            # Tier stats
+            tier_raw = (
+                session.query(
+                    DownloadAttempt.method,
+                    DownloadAttempt.success,
+                    sqlfunc.count(DownloadAttempt.id),
+                )
+                .group_by(DownloadAttempt.method, DownloadAttempt.success)
+                .all()
+            )
+            for method, success, cnt in tier_raw:
+                if method not in tier_stats_dict:
+                    tier_stats_dict[method] = {"success": 0, "failed": 0, "total": 0}
+                tier_stats_dict[method]["success" if success else "failed"] = cnt
+                tier_stats_dict[method]["total"] += cnt
+
+            # Last daemon run
+            last_run = (
+                session.query(DaemonRun)
+                .order_by(DaemonRun.started_at.desc())
+                .first()
+            )
+            if last_run and last_run.started_at:
+                try:
+                    import zoneinfo
+                    sgt = zoneinfo.ZoneInfo("Asia/Singapore")
+                    last_run_str = last_run.started_at.astimezone(sgt).strftime("%Y-%m-%d %H:%M SGT")
+                except Exception:
+                    last_run_str = last_run.started_at.strftime("%Y-%m-%d %H:%M UTC")
+
+    except Exception as exc:
+        logger.warning("Dashboard DB query failed: %s", exc)
+
+    # ── Error log tail ────────────────────────────────────────────────────────
+    error_log_lines: list[str] = []
+    try:
+        with open(_LOG_DIR / "errors.log", encoding="utf-8", errors="replace") as fh:
+            error_log_lines = fh.readlines()[-30:]
+    except OSError:
+        pass
+
+    # ── Uptime ────────────────────────────────────────────────────────────────
+    uptime_s = int(time.time() - _start_time)
+    uptime_str = f"{uptime_s // 3600}h {(uptime_s % 3600) // 60}m {uptime_s % 60}s"
+
+    # ── HTML helpers ──────────────────────────────────────────────────────────
+    def _esc(s: object) -> str:
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    def _badge(status: str) -> str:
+        colours = {
+            "downloading": "#3498db",
+            "pending": "#f39c12",
+            "failed": "#e74c3c",
+            "failed_validation": "#e74c3c",
+            "timed_out": "#c0392b",
+            "downloaded": "#27ae60",
+        }
+        c = colours.get(status, "#95a5a6")
+        return f'<span style="background:{c};color:white;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600">{_esc(status)}</span>'
+
+    # ── Build HTML sections ───────────────────────────────────────────────────
+    # Active
+    if active_rows:
+        active_html = "".join(
+            f"<tr><td>{_esc(t.title)}</td><td>{_esc(t.artist)}</td>"
+            f"<td>{_esc(t.album or '')}</td></tr>"
+            for t in active_rows
+        )
+    else:
+        active_html = "<tr><td colspan='3' style='color:#7f8c8d;text-align:center'>No active downloads right now</td></tr>"
+
+    # Pending
+    if pending_rows:
+        pending_html = "".join(
+            f"<tr><td>{_esc(t.title)}</td><td>{_esc(t.artist)}</td>"
+            f"<td>{_esc(t.album or '')}</td>"
+            f"<td style='text-align:center;color:{'#e74c3c' if (att or 0)>10 else '#f39c12'};font-weight:bold'>{att or 0}</td></tr>"
+            for t, att in pending_rows
+        )
+    else:
+        pending_html = "<tr><td colspan='4' style='color:#7f8c8d;text-align:center'>No pending tracks</td></tr>"
+
+    # Failed
+    if failed_rows:
+        failed_html = "".join(
+            f"<tr><td>{_esc(t.title)}</td><td>{_esc(t.artist)}</td>"
+            f"<td>{_esc(t.album or '')}</td>"
+            f"<td style='font-size:11px;color:#7f8c8d'>{_esc((err or '')[:80])}</td>"
+            f"<td style='font-size:11px'>{_esc(method or '')}</td></tr>"
+            for t, err, method in failed_rows
+        )
+    else:
+        failed_html = "<tr><td colspan='5' style='color:#7f8c8d;text-align:center'>No failed tracks</td></tr>"
+
+    # Tier stats
     tier_html = ""
-    for method, stats in tier_stats_dict.items():
-        success_rate = (stats["success"] / stats["total"] * 100) if stats["total"] > 0 else 0
-        tier_color = "green" if success_rate >= 80 else "orange" if success_rate >= 50 else "red"
-        tier_html += f"""
-        <tr>
-            <td>{method}</td>
-            <td>{stats["success"]}</td>
-            <td>{stats["failed"]}</td>
-            <td>{stats["total"]}</td>
-            <td style="color: {tier_color}; font-weight: bold;">{success_rate:.1f}%</td>
-        </tr>
-        """
-    
-    html = f"""
-<!DOCTYPE html>
-<html>
+    for method, s in tier_stats_dict.items():
+        rate = (s["success"] / s["total"] * 100) if s["total"] > 0 else 0
+        col = "#27ae60" if rate >= 80 else "#f39c12" if rate >= 50 else "#e74c3c"
+        tier_html += (
+            f"<tr><td>{_esc(method)}</td><td>{s['success']}</td>"
+            f"<td>{s['failed']}</td><td>{s['total']}</td>"
+            f"<td style='color:{col};font-weight:bold'>{rate:.1f}%</td></tr>"
+        )
+    if not tier_html:
+        tier_html = "<tr><td colspan='5' style='color:#7f8c8d;text-align:center'>No download attempts recorded yet</td></tr>"
+
+    # Error log
+    log_html = ""
+    for line in reversed(error_log_lines):
+        line = line.rstrip()
+        if not line:
+            continue
+        col = "#e74c3c" if "ERROR" in line or "CRITICAL" in line else "#f39c12" if "WARNING" in line else "#ecf0f1"
+        log_html += f'<div style="font-family:monospace;font-size:11px;padding:2px 0;color:{col};border-bottom:1px solid #2c3e50">{_esc(line)}</div>'
+    if not log_html:
+        log_html = '<div style="color:#7f8c8d;font-size:12px">No errors logged.</div>'
+
+    disable_banner = (
+        '<div style="background:#c0392b;color:white;padding:12px 20px;border-radius:8px;margin-bottom:16px;font-weight:bold">'
+        'DOWNLOADS DISABLED (DISABLE_DOWNLOADS is set)</div>'
+        if disable_dl else ""
+    )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
 <head>
-    <title>Musicstream Dashboard</title>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Musicstream Dashboard</title>
-    <style>
-        body {{ 
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-            max-width: 1400px; 
-            margin: 0 auto; 
-            padding: 20px; 
-            background: #f5f7fa;
-        }}
-        h1 {{ color: #2c3e50; margin-bottom: 5px; }}
-        h2 {{ color: #34495e; border-bottom: 3px solid #3498db; padding-bottom: 10px; }}
-        .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; margin-bottom: 30px; }}
-        .header h1 {{ color: white; margin: 0; }}
-        .header .subtitle {{ opacity: 0.9; margin-top: 10px; }}
-        .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 30px; }}
-        .stat-card {{ background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); transition: transform 0.2s; }}
-        .stat-card:hover {{ transform: translateY(-5px); }}
-        .stat-card h3 {{ margin: 0 0 10px 0; color: #7f8c8d; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; }}
-        .stat-card .value {{ font-size: 36px; font-weight: bold; color: #2c3e50; margin: 0; }}
-        .stat-card .progress {{ height: 8px; background: #ecf0f1; border-radius: 4px; margin-top: 15px; overflow: hidden; }}
-        .stat-card .progress-bar {{ height: 100%; background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); transition: width 0.5s; }}
-        .log-panel {{ background: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-        .log-panel h3 {{ margin-top: 0; color: #34495e; }}
-        .log-row {{ font-family: 'Courier New', monospace; font-size: 13px; padding: 5px 0; border-bottom: 1px solid #ecf0f1; }}
-        .log-success {{ color: #27ae60; }}
-        .log-error {{ color: #e74c3c; }}
-        table {{ width: 100%; border-collapse: collapse; background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-        th {{ background: #34495e; color: white; padding: 15px; text-align: left; font-weight: 600; text-transform: uppercase; font-size: 12px; letter-spacing: 0.5px; }}
-        td {{ padding: 12px 15px; border-bottom: 1px solid #ecf0f1; }}
-        tr:hover {{ background: #f8f9fa; }}
-        .status-badge {{ padding: 5px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; text-transform: uppercase; }}
-        .status-success {{ background: #27ae60; color: white; }}
-        .status-pending {{ background: #f39c12; color: white; }}
-        .status-failed {{ background: #e74c3c; color: white; }}
-        .quick-actions {{ display: flex; gap: 10px; flex-wrap: wrap; }}
-        .action-btn {{ padding: 12px 20px; border: none; border-radius: 5px; cursor: pointer; font-weight: 600; transition: all 0.3s; text-decoration: none; display: inline-block; }}
-        .btn-primary {{ background: #3498db; color: white; }}
-        .btn-primary:hover {{ background: #2980b9; }}
-        .btn-success {{ background: #27ae60; color: white; }}
-        .btn-success:hover {{ background: #219a52; }}
-        .btn-warning {{ background: #f39c12; color: white; }}
-        .btn-warning:hover {{ background: #e67e22; }}
-        .section {{ background: white; padding: 25px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-        .auto-refresh {{ position: fixed; top: 20px; right: 20px; background: #2c3e50; color: white; padding: 10px 15px; border-radius: 5px; font-size: 12px; animation: pulse 2s infinite; }}
-        @keyframes pulse {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.5; }} 100% {{ opacity: 1; }} }}
-        .worker-status {{ display: flex; align-items: center; gap: 10px; }}
-        .worker-dot {{ width: 12px; height: 12px; border-radius: 50%; background: #27ae60; animation: blink 1s infinite; }}
-        @keyframes blink {{ 0% {{ opacity: 1; }} 50% {{ opacity: 0.3; }} 100% {{ opacity: 1; }} }}
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="60">
+<title>Musicstream</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'Segoe UI',sans-serif;background:#1a1a2e;color:#e0e0e0;padding:16px;max-width:1400px;margin:0 auto}}
+h2{{color:#a29bfe;border-bottom:2px solid #6c5ce7;padding-bottom:6px;margin:20px 0 12px}}
+.hdr{{background:linear-gradient(135deg,#6c5ce7,#a29bfe);padding:20px 24px;border-radius:10px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center}}
+.hdr h1{{color:white;font-size:22px}}
+.hdr small{{color:rgba(255,255,255,.8);font-size:12px}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px}}
+.card{{background:#16213e;padding:16px;border-radius:8px;border-left:4px solid #6c5ce7}}
+.card .lbl{{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#a29bfe;margin-bottom:4px}}
+.card .val{{font-size:28px;font-weight:700}}
+.card .bar{{height:6px;background:#0f3460;border-radius:3px;margin-top:8px;overflow:hidden}}
+.card .fill{{height:100%;border-radius:3px;transition:width .4s}}
+.sec{{background:#16213e;border-radius:8px;padding:16px;margin-bottom:16px}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}
+th{{background:#0f3460;color:#a29bfe;padding:8px 10px;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px}}
+td{{padding:7px 10px;border-bottom:1px solid #0f3460;vertical-align:top}}
+tr:hover td{{background:#0f3460}}
+.actions{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}}
+.btn{{padding:8px 16px;border:none;border-radius:6px;cursor:pointer;font-weight:600;font-size:13px;text-decoration:none;display:inline-block}}
+.btn-reload{{background:#6c5ce7;color:white}}
+.btn-sec{{background:#0f3460;color:#a29bfe;border:1px solid #6c5ce7}}
+.logbox{{background:#0a0a1a;border-radius:6px;padding:12px;max-height:300px;overflow-y:auto}}
+</style>
 </head>
 <body>
-    <div class="header">
-        <h1>🎵 Musicstream Dashboard</h1>
-        <div class="subtitle">Real-time Progress Monitoring • Manual Refresh</div>
-    </div>
-    
-    <div style="display: flex; gap: 10px; margin-bottom: 20px;">
-        <button onclick="location.reload()" style="
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            padding: 10px 25px;
-            font-size: 16px;
-            border-radius: 8px;
-            cursor: pointer;
-            font-weight: bold;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            transition: transform 0.2s;
-        " onmouseover="this.style.transform='scale(1.05)'" onmouseout="this.style.transform='scale(1)'">
-            🔄 Refresh Dashboard
-        </button>
-        <a href="/api/coverage" style="
-            background: white;
-            color: #667eea;
-            border: 2px solid #667eea;
-            padding: 10px 20px;
-            font-size: 16px;
-            border-radius: 8px;
-            text-decoration: none;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            font-weight: bold;
-        " onmouseover="this.style.background='#667eea'; this.style.color='white'" onmouseout="this.style.background='white'; this.style.color='#667eea'">
-            📊 Coverage Report
-        </a>
-        <a href="/api/report" style="
-            background: white;
-            color: #e74c3c;
-            border: 2px solid #e74c3c;
-            padding: 10px 20px;
-            font-size: 16px;
-            border-radius: 8px;
-            text-decoration: none;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            font-weight: bold;
-        " onmouseover="this.style.background='#e74c3c'; this.style.color='white'" onmouseout="this.style.background='white'; this.style.color='#e74c3c'">
-            📋 Missing/Failed Report
-        </a>
-        <a href="/docs" style="
-            background: white;
-            color: #27ae60;
-            border: 2px solid #27ae60;
-            padding: 10px 20px;
-            font-size: 16px;
-            border-radius: 8px;
-            text-decoration: none;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            font-weight: bold;
-        " onmouseover="this.style.background='#27ae60'; this.style.color='white'" onmouseout="this.style.background='white'; this.style.color='#27ae60'">
-            📚 API Docs
-        </a>
-    </div>
-    
-    <div class="stats-grid">
-        <div class="stat-card">
-            <h3>📊 Total Library</h3>
-            <p class="value">{total_tracks:,}</p>
-            <div class="progress">
-                <div class="progress-bar" style="width: 100%;"></div>
-            </div>
-        </div>
-        
-        <div class="stat-card">
-            <h3>✅ Downloaded</h3>
-            <p class="value" style="color: #27ae60;">{downloaded:,}</p>
-            <div class="progress">
-                <div class="progress-bar" style="width: {progress_pct}%; background: #27ae60;"></div>
-            </div>
-            <small style="color: #7f8c8d;">{progress_pct:.1f}% complete</small>
-        </div>
-        
-        <div class="stat-card">
-            <h3>⏳ Pending</h3>
-            <p class="value" style="color: #f39c12;">{pending:,}</p>
-            <div class="progress">
-                <div class="progress-bar" style="width: {(pending/total_tracks*100) if total_tracks>0 else 0}%; background: #f39c12;"></div>
-            </div>
-        </div>
-        
-        <div class="stat-card">
-            <h3>❌ Failed</h3>
-            <p class="value" style="color: #e74c3c;">{failed:,}</p>
-            <div class="progress">
-                <div class="progress-bar" style="width: {(failed/total_tracks*100) if total_tracks>0 else 0}%; background: #e74c3c;"></div>
-            </div>
-        </div>
-    </div>
-    
-    <div class="section">
-        <h2>⚙️ System Status</h2>
-        <table>
-            <tr>
-                <th>Metric</th>
-                <th>Value</th>
-            </tr>
-            <tr>
-                <td>Uptime</td>
-                <td>{uptime_str}</td>
-            </tr>
-            <tr>
-                <td>Worker Configuration</td>
-                <td>
-                    <div class="worker-status">
-                        <div class="worker-dot"></div>
-                        <strong>12 Workers</strong> (MAX_CONCURRENT=12)
-                    </div>
-                </td>
-            </tr>
-            <tr>
-                <td>Download Pipeline</td>
-                <td><span class="status-badge status-success">Active</span></td>
-            </tr>
-            <tr>
-                <td>Auto-refresh</td>
-                <td>Every 5 seconds</td>
-            </tr>
-        </table>
-    </div>
-    
-    <div class="section">
-        <h2>🚀 Quick Actions</h2>
-        <div class="quick-actions">
-            <a href="http://localhost:9079/api/progress" target="_blank" class="action-btn btn-primary">📊 Live Progress</a>
-            <a href="http://localhost:9079/metrics" target="_blank" class="action-btn btn-success">📈 Metrics</a>
-            <a href="http://localhost:9079/status" target="_blank" class="action-btn btn-warning">📋 Status</a>
-            <a href="http://localhost:32400" target="_blank" class="action-btn btn-primary">🎬 Plex</a>
-        </div>
-    </div>
-    
-    <div class="section">
-        <h2>📥 Download Performance by Tier</h2>
-        <table>
-            <tr>
-                <th>Service/Tier</th>
-                <th>Success ✓</th>
-                <th>Failed ✗</th>
-                <th>Total</th>
-                <th>Success Rate</th>
-            </tr>
-            {tier_html}
-        </table>
-    </div>
-    
-    <div class="log-panel">
-        <h3>📋 Recent Download Activity</h3>
-        <table>
-            <tr>
-                <th>Method</th>
-                <th>Status</th>
-                <th>Time</th>
-            </tr>
-            {recent_html or "<tr><td colspan='3' style='text-align: center; color: #7f8c8d;'>No recent downloads</td></tr>"}
-        </table>
-    </div>
-    
-    <div class="section">
-        <h2>📖 Quick Links</h2>
-        <ul style="list-style: none; padding: 0;">
-            <li style="padding: 10px 0; border-bottom: 1px solid #ecf0f1;">
-                <a href="http://localhost:32400" target="_blank" style="color: #3498db; text-decoration: none; font-weight: 600;">🎬 Plex Media Server</a>
-            </li>
-            <li style="padding: 10px 0; border-bottom: 1px solid #ecf0f1;">
-                <a href="http://localhost:9078" target="_blank" style="color: #3498db; text-decoration: none; font-weight: 600;">📊 Multi-Scrobbler</a>
-            </li>
-            <li style="padding: 10px 0;">
-                <a href="/docs" style="color: #3498db; text-decoration: none; font-weight: 600;">📚 API Documentation</a>
-            </li>
-        </ul>
-    </div>
-    
-    <script>
-        // Add smooth scrolling and enhance interactivity
-        document.querySelectorAll('.action-btn').forEach(btn => {{
-            btn.addEventListener('mouseenter', function() {{
-                this.style.transform = 'translateY(-2px)';
-                this.style.boxShadow = '0 4px 12px rgba(0,0,0,0.2)';
-            }});
-            btn.addEventListener('mouseleave', function() {{
-                this.style.transform = 'translateY(0)';
-                this.style.boxShadow = 'none';
-            }});
-        }});
-        
-        // Add timestamp update
-        setInterval(function() {{
-            const now = new Date();
-            console.log('Dashboard refreshed:', now.toLocaleTimeString());
-        }}, 5000);
-    </script>
+
+<div class="hdr">
+  <div>
+    <h1>Musicstream</h1>
+    <small>Uptime: {uptime_str} &nbsp;|&nbsp; Last run: {_esc(last_run_str)} &nbsp;|&nbsp; Workers: {workers} &nbsp;|&nbsp; Page refreshes every 60s</small>
+  </div>
+  <div style="text-align:right;font-size:13px;color:rgba(255,255,255,.8)">
+    {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
+  </div>
+</div>
+
+{disable_banner}
+
+<div class="actions">
+  <button class="btn btn-reload" onclick="location.reload()">Refresh Now</button>
+  <a class="btn btn-sec" href="/metrics">Tier Metrics (JSON)</a>
+  <a class="btn btn-sec" href="/status">Run History (JSON)</a>
+  <a class="btn btn-sec" href="/api/coverage">Coverage (JSON)</a>
+  <a class="btn btn-sec" href="/api/artwork-report">Artwork Report</a>
+  <a class="btn btn-sec" href="/docs">API Docs</a>
+</div>
+
+<!-- Progress bar -->
+<div class="cards">
+  <div class="card">
+    <div class="lbl">Total library</div>
+    <div class="val">{total_tracks:,}</div>
+  </div>
+  <div class="card" style="border-color:#27ae60">
+    <div class="lbl">Downloaded</div>
+    <div class="val" style="color:#27ae60">{downloaded:,}</div>
+    <div class="bar"><div class="fill" style="width:{min(progress_pct,100):.1f}%;background:#27ae60"></div></div>
+    <div style="font-size:11px;color:#7f8c8d;margin-top:4px">{progress_pct:.1f}% complete</div>
+  </div>
+  <div class="card" style="border-color:#3498db">
+    <div class="lbl">Downloading now</div>
+    <div class="val" style="color:#3498db">{active_count}</div>
+  </div>
+  <div class="card" style="border-color:#f39c12">
+    <div class="lbl">Pending</div>
+    <div class="val" style="color:#f39c12">{pending_count:,}</div>
+    <div class="bar"><div class="fill" style="width:{min((pending_count/total_tracks*100) if total_tracks else 0,100):.1f}%;background:#f39c12"></div></div>
+  </div>
+  <div class="card" style="border-color:#e74c3c">
+    <div class="lbl">Failed</div>
+    <div class="val" style="color:#e74c3c">{failed_count:,}</div>
+    <div class="bar"><div class="fill" style="width:{min((failed_count/total_tracks*100) if total_tracks else 0,100):.1f}%;background:#e74c3c"></div></div>
+  </div>
+</div>
+
+<!-- Active downloads -->
+<div class="sec">
+  <h2>Currently Downloading ({active_count})</h2>
+  <table>
+    <tr><th>Title</th><th>Artist</th><th>Album</th></tr>
+    {active_html}
+  </table>
+</div>
+
+<!-- Pending queue -->
+<div class="sec">
+  <h2>Pending Queue — top 50 by failed attempts (stuck tracks first)</h2>
+  <table>
+    <tr><th>Title</th><th>Artist</th><th>Album</th><th>Failed attempts</th></tr>
+    {pending_html}
+  </table>
+</div>
+
+<!-- Failed tracks -->
+<div class="sec">
+  <h2>Failed Tracks — top 50 most recent</h2>
+  <table>
+    <tr><th>Title</th><th>Artist</th><th>Album</th><th>Last error</th><th>Last method</th></tr>
+    {failed_html}
+  </table>
+  <div style="margin-top:10px;font-size:12px;color:#7f8c8d">
+    <a href="/admin/reset-failed" style="color:#f39c12" onclick="return confirm('Reset ALL failed tracks to pending?')">
+      POST /admin/reset-failed
+    </a> — re-queue all failed tracks
+  </div>
+</div>
+
+<!-- Tier performance -->
+<div class="sec">
+  <h2>Download Tier Performance (all-time)</h2>
+  <table>
+    <tr><th>Tier / Method</th><th>Success</th><th>Failed</th><th>Total</th><th>Rate</th></tr>
+    {tier_html}
+  </table>
+</div>
+
+<!-- Error log tail -->
+<div class="sec">
+  <h2>Error Log Tail (last 30 lines)</h2>
+  <div class="logbox">
+    {log_html}
+  </div>
+</div>
+
 </body>
-</html>
-    """
+</html>"""
     return html, 200
 
 
@@ -1052,6 +1052,526 @@ def progress():
         }), 500
 
 
+@app.post("/api/refresh-artwork")
+def refresh_artwork():
+    """
+    POST /api/artwork-refresh
+    Refresh artwork for tracks based on mode parameter.
+    
+    Query params:
+    - mode: 'missing' (only tracks without artwork) or 'all' (all tracks)
+    - limit: max number of tracks to process (default: 10)
+    - dry_run: if '1', only report what would be done without actually doing it
+    
+    Returns summary of refreshed tracks with source breakdown.
+    """
+    try:
+        # Get query parameters
+        mode = flask_request.args.get("mode", "missing")
+        limit = int(flask_request.args.get("limit", "10"))
+        dry_run = flask_request.args.get("dry_run", "false").lower() == "true"
+        
+        # Validate mode
+        if mode not in ["missing", "all"]:
+            return jsonify({
+                "status": "error",
+                "error": f"Invalid mode '{mode}'. Must be 'missing' or 'all'",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }), 400
+        
+        # Validate limit
+        if limit < 1 or limit > 1000:
+            return jsonify({
+                "status": "error",
+                "error": "Limit must be between 1 and 1000",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }), 400
+        
+        import requests
+        from src.db import get_session
+        from src.ingestion.artwork_checker import check_embedded_artwork, extract_first_artwork
+        from src.models import Track
+        from pathlib import Path
+        
+        with get_session() as session:
+            # Query target tracks
+            query = session.query(Track)
+            
+            if mode == "missing":
+                query = query.filter(
+                    (Track.cover_art_url.is_(None)) | (Track.cover_art_url == "")
+                )
+            
+            # Apply limit
+            tracks = query.limit(limit).all()
+            
+            if not tracks:
+                return jsonify({
+                    "status": "ok",
+                    "message": "No tracks found to refresh",
+                    "refreshed": 0,
+                    "dry_run": dry_run,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }), 200
+            
+            refreshed = 0
+            errors = []
+            source_breakdown = {
+                "spotify": 0,
+                "musicbrainz": 0, 
+                "embedded": 0,
+                "failed": 0
+            }
+            
+            for track in tracks:
+                try:
+                    if not track.file_path or not Path(track.file_path).exists():
+                        logger.debug("Skipping track %d: no file path or file missing", track.id)
+                        source_breakdown["failed"] += 1
+                        continue
+                    
+                    # Check if artwork refresh is needed
+                    has_embedded = False
+                    try:
+                        has_embedded = check_embedded_artwork(track.file_path)
+                    except Exception as e:
+                        logger.debug("Artwork check failed for track %d: %s", track.id, e)
+                    
+                    has_db_url = bool(track.cover_art_url and track.cover_art_url != "")
+                    
+                    # Skip if both present (unless mode='all' and dry_run)
+                    if mode == "missing" and has_embedded and has_db_url:
+                        logger.debug("Skipping track %d: already has artwork embedded and in DB", track.id)
+                        continue
+                    
+                    if not dry_run:
+                        # Priority 1: Try Spotify existing cover_art_url
+                        artwork_data = None
+                        source = None
+                        
+                        if track.cover_art_url and track.cover_art_url != "":
+                            try:
+                                resp = requests.get(track.cover_art_url, timeout=10)
+                                if resp.status_code == 200 and resp.content:
+                                    artwork_data = resp.content
+                                    source = "spotify"
+                            except Exception as e:
+                                logger.debug("Failed to fetch from Spotify: %s", e)
+                        
+                        # Priority 2: Try MusicBrainz (if we had release ID) - placeholder
+                        if not artwork_data and track.mb_release_id:
+                            try:
+                                # Try Cover Art Archive as fallback
+                                caa_url = f"https://coverartarchive.org/release/{track.mb_release_id}/front-250"
+                                resp = requests.get(caa_url, timeout=10)
+                                if resp.status_code == 200 and resp.content:
+                                    artwork_data = resp.content
+                                    source = "musicbrainz"
+                            except Exception as e:
+                                logger.debug("Failed to fetch from MusicBrainz: %s", e)
+                        
+                        # Priority 3: Try extracting from embedded artwork in the file itself
+                        if not artwork_data and has_embedded:
+                            artwork_data = extract_first_artwork(track.file_path)
+                            if artwork_data:
+                                source = "embedded"
+                        
+                        # If we got artwork, write it to the file
+                        if artwork_data:
+                            try:
+                                _write_artwork_track(track.file_path, artwork_data)
+                                
+                                # Update DB
+                                if source:
+                                    track.cover_art_source = f"refresh_{source}"
+                                
+                                session.commit()
+                                refreshed += 1
+                                source_breakdown[source] += 1
+                                logger.info("Refreshed artwork for track %d ('%s') from %s", 
+                                           track.id, track.title, source)
+                            except Exception as e:
+                                logger.warning("Failed to write artwork to file %s for track %d: %s", 
+                                               track.file_path, track.id, e)
+                                source_breakdown["failed"] += 1
+                                errors.append({"track_id": track.id, "title": track.title, "error": str(e)})
+                        else:
+                            logger.debug("No artwork found for track %d", track.id)
+                            source_breakdown["failed"] += 1
+                    else:
+                        # Dry run mode - just report
+                        refreshed += 1
+                        if has_db_url:
+                            source_breakdown["spotify"] += 1
+                        elif has_embedded:
+                            source_breakdown["embedded"] += 1
+                        else:
+                            source_breakdown["musicbrainz"] += 1
+                
+                except Exception as e:
+                    logger.error("Error processing track %d ('%s'): %s", track.id, track.title, e)
+                    errors.append({"track_id": track.id, "title": track.title, "error": str(e)})
+                    source_breakdown["failed"] += 1
+        
+        return jsonify({
+            "status": "ok",
+            "summary": {
+                "refreshed": refreshed,
+                "processed": len(tracks),
+                "errors": len(errors),
+            },
+            "source_breakdown": source_breakdown,
+            "errors": errors[:10],  # Limit error details
+            "dry_run": dry_run,
+            "message": f"{'Dry run ' + str(dry_run) + ' - ' if dry_run else ''}Processed {len(tracks)} tracks, refreshed {refreshed} artwork",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "refreshed": 0,
+            "dry_run": False, 
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 500
+
+
+def _write_artwork_track(file_path: str, artwork_data: bytes) -> None:
+    """Write artwork data to a track file, preserving existing tags."""
+    try:
+        from mutagen import File as AudioFile
+        ext = Path(file_path).suffix.lower()
+        
+        audio = AudioFile(file_path)
+        
+        if ext == ".mp3":
+            from mutagen.id3 import ID3, ID3NoHeaderError
+            try:
+                audio = ID3(file_path)
+            except ID3NoHeaderError:
+                audio = ID3()
+            
+            # Remove existing APIC frames
+            audio.delall("APIC")
+            # Add new artwork
+            from mutagen.id3 import APIC
+            audio["APIC"] = APIC(
+                encoding=3,
+                mime_type="image/jpeg",
+                type=3,  # Cover (front)
+                desc="Cover",
+                data=artwork_data
+            )
+            audio.save()
+            
+        elif ext == ".flac":
+            from mutagen.flac import FLAC, Picture
+            audio = FLAC(file_path)
+            # Remove all pictures
+            audio.clear_pictures()
+            # Add new artwork
+            pic = Picture()
+            pic.type = 3  # Cover (front) 
+            pic.desc = "Cover"
+            pic.data = artwork_data
+            audio.add_picture(pic)
+            audio.save()
+            
+        elif ext in (".m4a", ".mp4", ".aac"):
+            from mutagen.mp4 import MP4
+            from mutagen.mp4 import MP4Cover
+            audio = MP4(file_path)
+            # Remove existing cover
+            if "covr" in audio:
+                del audio["covr"]
+            # Add new artwork
+            audio["covr"] = [MP4Cover(artwork_data, imageformat=MP4Cover.FORMAT_JPEG)]
+            audio.save()
+            
+        else:
+            logger.warning("Unsupported format %r for artwork writing", ext)
+            
+    except Exception as e:
+        logger.error("Failed to write artwork to %s: %s", file_path, e)
+
+
+@app.get("/api/artwork-report")
+def artwork_report():
+    """
+    GET /api/artwork-report
+    Report on artwork coverage across the library.
+    
+    Returns:
+        - Count of tracks with/without cover_art_url in DB
+        - Count of tracks without embedded artwork in files
+        - Aggregation by album and artist
+        - Top missing albums/artists
+    """
+    try:
+        from src.db import get_session
+        from src.models import Track
+        from src.ingestion.artwork_checker import check_embedded_artwork
+        from sqlalchemy import func
+        from pathlib import Path
+        
+        with get_session() as session:
+            # DB-level artwork stats
+            total_tracks = session.query(Track).count()
+            tracks_with_cover_url = session.query(Track).filter(
+                Track.cover_art_url.isnot(None),
+                Track.cover_art_url != ""
+            ).count()
+            tracks_without_cover_url = total_tracks - tracks_with_cover_url
+            
+            # File-level artwork check (downloaded tracks only)
+            downloaded_tracks = session.query(Track).filter(
+                Track.file_path.isnot(None),
+                Track.file_path != ""
+            ).all()
+            
+            tracks_without_embedded = 0
+            checked_files = 0
+            
+            # Check a sample for embedded artwork (avoid full scan on large libraries)
+            sample_size = min(100, len(downloaded_tracks))
+            sample_tracks = downloaded_tracks[:sample_size]
+            
+            for track in sample_tracks:
+                if track.file_path and Path(track.file_path).exists():
+                    checked_files += 1
+                    if not check_embedded_artwork(track.file_path):
+                        tracks_without_embedded += 1
+            
+            # Estimate total without embedded art based on sample
+            if checked_files > 0:
+                estimated_without_embedded = int(
+                    (tracks_without_embedded / checked_files) * len(downloaded_tracks)
+                )
+            else:
+                estimated_without_embedded = 0
+            
+            # Missing by album
+            missing_by_album = session.query(
+                Track.album,
+                Track.artist,
+                func.count(Track.id).label("missing_count")
+            ).filter(
+                (Track.cover_art_url.is_(None)) | (Track.cover_art_url == "")
+            ).group_by(Track.album, Track.artist).order_by(
+                func.count(Track.id).desc()
+            ).limit(10).all()
+            
+            # Missing by artist
+            missing_by_artist = session.query(
+                Track.artist,
+                func.count(Track.id).label("missing_count")
+            ).filter(
+                (Track.cover_art_url.is_(None)) | (Track.cover_art_url == "")
+            ).group_by(Track.artist).order_by(
+                func.count(Track.id).desc()
+            ).limit(10).all()
+            
+            # Coverage statistics
+            cover_url_coverage = (tracks_with_cover_url / total_tracks * 100) if total_tracks > 0 else 0
+            embedded_coverage = ((len(downloaded_tracks) - estimated_without_embedded) / len(downloaded_tracks) * 100) if downloaded_tracks else 0
+            
+        return jsonify({
+            "status": "ok",
+            "database": {
+                "total_tracks": total_tracks,
+                "tracks_with_cover_art_url": tracks_with_cover_url,
+                "tracks_without_cover_art_url": tracks_without_cover_url,
+                "coverage_percentage": round(cover_url_coverage, 2),
+            },
+            "embedded_artwork": {
+                "sample_checked": checked_files,
+                "sample_without_embedded": tracks_without_embedded,
+                "estimated_total_without_embedded": estimated_without_embedded,
+                "total_downloaded_tracks": len(downloaded_tracks),
+                "coverage_percentage": round(embedded_coverage, 2),
+            },
+            "missing_by_album": [
+                {
+                    "album": row.album,
+                    "artist": row.artist,
+                    "missing_count": row.missing_count
+                } for row in missing_by_album
+            ],
+            "missing_by_artist": [
+                {
+                    "artist": row.artist,
+                    "missing_count": row.missing_count
+                } for row in missing_by_artist
+            ],
+            "summary": {
+                "total_missing_albums": len(missing_by_album),
+                "total_missing_artists": len(missing_by_artist),
+                "artwork_health": "good" if cover_url_coverage > 90 else "fair" if cover_url_coverage > 70 else "poor"
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 500
+
+
+@app.post("/admin/validate-invalid-tracks")
+def validate_invalid_tracks():
+    """
+    POST /admin/validate-invalid-tracks
+    Query tracks with empty artist/album and validate against Spotify API.
+    
+    Returns summary: checked/updated/marked_not_found/errors.
+    """
+    from src.db import get_session
+    from src.models import Track
+    from src.ingestion.scraper import SpotifyScraper
+    
+    # Auth check
+    if (auth_err := _check_auth()) is not None:
+        return auth_err
+    
+    checked = 0
+    updated = 0
+    marked_not_found = 0
+    errors = []
+    
+    try:
+        # Initialize Spotify scraper
+        client_id = os.environ.get("SPOTIFY_CLIENT_ID")
+        if not client_id:
+            return jsonify({
+                "status": "error",
+                "error": "SPOTIFY_CLIENT_ID not configured",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }), 500
+
+        scraper = SpotifyScraper(client_id=client_id)
+        
+        with get_session() as session:
+            # Find tracks with empty artist/album
+            invalid_tracks = session.query(Track).filter(
+                (Track.artist.is_(None)) | (Track.artist == "") |
+                (Track.album.is_(None)) | (Track.album == "")
+            ).all()
+            
+            logger.info("Found %d invalid tracks for validation", len(invalid_tracks))
+            
+            for track in invalid_tracks:
+                checked += 1
+                try:
+                    if not track.spotify_id:
+                        logger.warning("Track %d has no spotify_id, marking as not found", track.id)
+                        track.status = "failed"
+                        marked_not_found += 1
+                        continue
+                    
+                    # Query Spotify API for track metadata
+                    spotify_track = scraper.sp.track(f"spotify:track:{track.spotify_id}")
+                    
+                    if spotify_track:
+                        # Update metadata from Spotify
+                        track.artist = spotify_track['artists'][0]['name'] if spotify_track['artists'] else track.artist or ""
+                        track.album = spotify_track['album']['name'] if spotify_track['album'] else track.album or ""
+                        track.title = spotify_track['name'] or track.title
+                        track.spotify_album_id = spotify_track['album']['id'] if spotify_track['album'] else None
+                        
+                        updated += 1
+                        logger.info("Updated track %d: '%s' by '%s'", track.id, track.title, track.artist)
+                    else:
+                        # Track not found on Spotify
+                        track.status = "failed"
+                        marked_not_found += 1
+                        logger.warning("Track %d not found on Spotify: %s", track.id, track.spotify_id)
+                        
+                except Exception as e:
+                    error_msg = f"Track {track.id}: {str(e)}"
+                    errors.append(error_msg)
+                    logger.error("Error validating track %d: %s", track.id, e)
+            
+            session.commit()
+            
+        return jsonify({
+            "status": "ok",
+            "summary": {
+                "checked": checked,
+                "updated": updated,
+                "marked_not_found": marked_not_found,
+                "errors": len(errors),
+            },
+            "errors": errors[:10],  # Limit error details
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "checked": checked,
+            "updated": updated,
+            "marked_not_found": marked_not_found,
+            "errors": errors,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 500
+
+
+@app.post("/admin/cleanup-invalid-tracks")
+def cleanup_invalid_tracks():
+    """
+    POST /admin/cleanup-invalid-tracks
+    Delete tracks marked as invalid (status='failed') with empty artist/album.
+    
+    Requires auth if DAEMON_API_TOKEN is set.
+    Returns deletion count.
+    """
+    from src.db import get_session
+    from src.models import Track
+    
+    # Auth check
+    if (auth_err := _check_auth()) is not None:
+        return auth_err
+    
+    deleted_count = 0
+    
+    try:
+        with get_session() as session:
+            # Only delete tracks explicitly marked as failed with empty artist/album
+            tracks_to_delete = session.query(Track).filter(
+                Track.status == "failed",
+                (Track.artist.is_(None)) | (Track.artist == "") |
+                (Track.album.is_(None)) | (Track.album == "")
+            ).all()
+            
+            deleted_count = len(tracks_to_delete)
+            
+            for track in tracks_to_delete:
+                logger.info("Deleting invalid track %d: '%s'", track.id, track.title)
+                session.delete(track)
+            
+            session.commit()
+            
+        return jsonify({
+            "status": "ok",
+            "deleted": deleted_count,
+            "message": f"Deleted {deleted_count} invalid tracks",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "deleted": deleted_count,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 500
+
+
+
 
 @app.get("/api/coverage")
 def coverage():
@@ -1070,7 +1590,6 @@ def coverage():
     try:
         from src.db import get_session
         from src.models import Track
-        import os
         from pathlib import Path
         from sqlalchemy import func
         
@@ -1232,13 +1751,235 @@ def report():
 
 
 
+_retag_state: dict = {"running": False, "processed": 0, "updated": 0, "errors": 0, "done": False, "started_at": None}
+
+
+@app.post("/admin/retag-tracks")
+def retag_tracks():
+    """
+    POST /admin/retag-tracks
+    Retroactively apply TCMP/compilation and multi-artist TPE1 tags.
+    Runs in background thread; returns immediately. Poll /admin/retag-tracks/status.
+
+    Query params:
+      dry_run=1        — report counts only, touch nothing (default)
+      scope=all        — all downloaded tracks (default)
+      scope=various    — only Various Artists compilations
+      scope=multiartist— only tracks with multiple artists
+    """
+    if (auth_err := _check_auth()) is not None:
+        return auth_err
+
+    if _retag_state["running"]:
+        return jsonify({
+            "status": "already_running",
+            "progress": _retag_state,
+        }), 409
+
+    dry_run = flask_request.args.get("dry_run", "1") not in ("0", "false", "no")
+    scope = flask_request.args.get("scope", "all")
+
+    if dry_run:
+        # Dry-run: synchronous quick count, no file I/O
+        from src.db import get_session
+        from src.models import Track
+        with get_session() as session:
+            q = session.query(Track).filter(Track.status == "downloaded", Track.file_path.isnot(None))
+            if scope == "various":
+                q = q.filter(Track.album_artist.ilike("%various artists%"))
+            elif scope == "multiartist":
+                q = q.filter(Track.artist.contains(", "))
+            count = q.count()
+        return jsonify({"status": "ok", "dry_run": True, "scope": scope, "would_process": count}), 200
+
+    # Live run: background thread so HTTP returns immediately
+    import threading
+
+    def _run():
+        _retag_state.update({"running": True, "processed": 0, "updated": 0, "errors": 0, "done": False,
+                              "started_at": datetime.now(timezone.utc).isoformat()})
+        try:
+            from pathlib import Path as _Path
+            from src.db import get_session
+            from src.models import Track
+
+            # Fetch IDs only — avoids holding 12K ORM objects in memory
+            with get_session() as session:
+                q = session.query(Track.id).filter(Track.status == "downloaded", Track.file_path.isnot(None))
+                if scope == "various":
+                    q = q.filter(Track.album_artist.ilike("%various artists%"))
+                elif scope == "multiartist":
+                    q = q.filter(Track.artist.contains(", "))
+                track_ids = [row[0] for row in q.all()]
+
+            # Process each track in its own session so SHA256 is committed
+            for track_id in track_ids:
+                with get_session() as session:
+                    track = session.get(Track, track_id)
+                    if not track or not track.file_path or not _Path(track.file_path).exists():
+                        continue
+                    _retag_state["processed"] += 1
+                    try:
+                        _retag_file(track)  # modifies file + updates track.file_sha256
+                        _retag_state["updated"] += 1
+                    except Exception as exc:
+                        _retag_state["errors"] += 1
+                        logger.warning("retag failed for track %d: %s", track_id, exc)
+
+            logger.info("retag complete: processed=%d updated=%d errors=%d",
+                        _retag_state["processed"], _retag_state["updated"], _retag_state["errors"])
+        except Exception as exc:
+            logger.error("retag background thread failed: %s", exc)
+        finally:
+            _retag_state["running"] = False
+            _retag_state["done"] = True
+
+    threading.Thread(target=_run, daemon=True, name="retag").start()
+    return jsonify({"status": "started", "scope": scope, "poll": "/admin/retag-tracks/status"}), 202
+
+
+@app.get("/admin/retag-tracks/status")
+def retag_tracks_status():
+    """GET /admin/retag-tracks/status — poll live retag progress."""
+    return jsonify(_retag_state), 200
+
+
+def _retag_file(track) -> None:
+    """Apply TCMP and multi-artist tags; update track.file_sha256 in DB."""
+    from pathlib import Path as _P
+    ext = _P(track.file_path).suffix.lower()
+
+    if ext == ".mp3":
+        from mutagen.id3 import ID3, ID3NoHeaderError, TPE1, TCMP
+        try:
+            audio = ID3(track.file_path)
+        except ID3NoHeaderError:
+            return
+        artists = [a.strip() for a in (track.artist or "").split(", ") if a.strip()]
+        if artists:
+            audio["TPE1"] = TPE1(encoding=3, text=artists)
+        album_artist = track.album_artist or track.artist or ""
+        if album_artist.lower() == "various artists":
+            audio["TCMP"] = TCMP(encoding=3, text="1")
+        audio.save(v2_version=3)
+
+    elif ext == ".flac":
+        from mutagen.flac import FLAC
+        audio = FLAC(track.file_path)
+        artists = [a.strip() for a in (track.artist or "").split(", ") if a.strip()]
+        if artists:
+            audio["artist"] = artists
+        album_artist = track.album_artist or track.artist or ""
+        if album_artist.lower() == "various artists":
+            audio["compilation"] = ["1"]
+        audio.save()
+
+    elif ext in (".m4a", ".mp4", ".aac"):
+        from mutagen.mp4 import MP4
+        audio = MP4(track.file_path)
+        artists = [a.strip() for a in (track.artist or "").split(", ") if a.strip()]
+        if artists:
+            audio["\xa9ART"] = artists
+        album_artist = track.album_artist or track.artist or ""
+        if album_artist.lower() == "various artists":
+            audio["cpil"] = [True]
+        audio.save()
+
+    else:
+        return  # unsupported format — nothing written, hash unchanged
+
+    # Update the stored SHA-256 so integrity check won't flag the modified file
+    from src.utils import compute_sha256
+    track.file_sha256 = compute_sha256(track.file_path)
+
+
+@app.post("/admin/recover-pending")
+def recover_pending():
+    """
+    POST /admin/recover-pending
+    For pending tracks whose file_path was cleared by the integrity checker
+    (due to retag SHA256 mismatch), reconstruct the expected path and restore
+    status=downloaded if the file still exists on disk.
+    """
+    if (auth_err := _check_auth()) is not None:
+        return auth_err
+
+    import re as _re
+    from pathlib import Path as _Path
+    from src.db import get_session
+    from src.models import Track, TrackStatus
+    from src.utils import compute_sha256
+
+    _FORBIDDEN_RE = _re.compile(r'[<>:"/\\|?*]')
+
+    def _sanitize(name: str) -> str:
+        s = _FORBIDDEN_RE.sub("_", name)[:200].strip(". ")
+        return s
+
+    media_dir = os.environ.get("MEDIA_DIR", "/media")
+    recovered = skipped = errors = 0
+
+    try:
+        with get_session() as session:
+            # Candidates: pending, no file_path, have metadata (were downloaded before)
+            candidates = (
+                session.query(Track)
+                .filter(
+                    Track.status == TrackStatus.PENDING.value,
+                    Track.file_path.is_(None),
+                    Track.album_artist.isnot(None),
+                    Track.title.isnot(None),
+                    Track.format.isnot(None),
+                )
+                .all()
+            )
+
+            for track in candidates:
+                try:
+                    aa = _sanitize(track.album_artist or track.artist or "Unknown Artist")
+                    alb = track.album or "Unknown Album"
+                    alb_folder = _sanitize(f"{alb} ({track.year})") if track.year else _sanitize(alb)
+                    ext = f".{track.format}"
+                    if track.track_number is not None:
+                        nn = str(track.track_number).zfill(2)
+                        fname = _sanitize(f"{nn} - {track.title}") + ext
+                    else:
+                        fname = _sanitize(track.title) + ext
+
+                    expected = os.path.join(media_dir, aa, alb_folder, fname)
+
+                    if _Path(expected).exists():
+                        sha = compute_sha256(expected)
+                        track.file_path = expected
+                        track.file_sha256 = sha
+                        track.status = TrackStatus.DOWNLOADED.value
+                        recovered += 1
+                    else:
+                        skipped += 1
+
+                except Exception as exc:
+                    errors += 1
+                    logger.warning("recover-pending: track %d failed: %s", track.id, exc)
+
+        return jsonify({
+            "status": "ok",
+            "recovered": recovered,
+            "left_pending": skipped,
+            "errors": errors,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }), 200
+
+    except Exception as exc:
+        return jsonify({"status": "error", "error": str(exc)}), 500
+
+
 @app.get("/docs")
 def docs():
     """
     GET /docs
     Returns API documentation for all endpoints.
     """
-    docs_html = '''<!DOCTYPE html>\n<html>\n<head>\n    <title>Musicstream API Documentation</title>\n    <style>\n        body { font-family: 'Segoe UI', sans-serif; max-width: 900px; margin: 40px auto; padding: 20px; background: #f5f7fa; }\n        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }\n        h2 { color: #34495e; border-bottom: 1px solid #ddd; padding-bottom: 5px; margin-top: 30px; }\n        .endpoint { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3498db; }\n        .endpoint h3 { margin: 0 0 10px 0; color: #2196F3; }\n        .get { background: #27ae60; color: white; }\n        .post { background: #e74c3c; color: white; }\n    </style>\n</head>\n<body>\n    <h1>Musicstream API Documentation</h1>\n    <p>Base URL: <strong>http://localhost:9079</strong></p>\n    <div class="endpoint">\n        <h3><span class="get">GET</span> /</h3>\n        <p>Interactive web dashboard</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="get">GET</span> /api/progress</h3>\n        <p>Real-time download progress</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="get">GET</span> /api/coverage</h3>\n        <p>Disk vs database completeness</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="get">GET</span> /api/report</h3>\n        <p>Missing and failed tracks report</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="get">GET</span> /health, /status, /metrics</h3>\n        <p>Health checks and metrics</p>\n    </div>\n    <h2>Control Endpoints (requires authentication if DAEMON_API_TOKEN is set)</h2>\n    <div class="endpoint">\n        <h3><span class="post">POST</span> /sync</h3>\n        <p>Trigger Spotify sync + download</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="post">POST</span> /integrity</h3>\n        <p>Run integrity check</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="post">POST</span> /discover</h3>\n        <p>Fetch ListenBrainz recommendations</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="post">POST</span> /admin/reset-failed</h3>\n        <p>Reset all failed tracks to pending status for retry</p>\n    </div>\n</body>\n</html>'''
+    docs_html = '''<!DOCTYPE html>\n<html>\n<head>\n    <title>Musicstream API Documentation</title>\n    <style>\n        body { font-family: "Segoe UI", sans-serif; max-width: 900px; margin: 40px auto; padding: 20px; background: #f5f7fa; }\n        h1 { color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }\n        h2 { color: #34495e; border-bottom: 1px solid #ddd; padding-bottom: 5px; margin-top: 30px; }\n        .endpoint { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #3498db; }\n        .endpoint h3 { margin: 0 0 10px 0; color: #2196F3; }\n        .get { background: #27ae60; color: white; }\n        .post { background: #e74c3c; color: white; }\n    </style>\n</head>\n<body>\n    <h1>Musicstream API Documentation</h1>\n    <p>Base URL: <strong>http://localhost:9079</strong></p>\n    <div class="endpoint">\n        <h3><span class="get">GET</span> /</h3>\n        <p>Interactive web dashboard</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="get">GET</span> /api/progress</h3>\n        <p>Real-time download progress</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="get">GET</span> /api/coverage</h3>\n        <p>Disk vs database completeness</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="get">GET</span> /api/report</h3>\n        <p>Missing and failed tracks report</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="get">GET</span> /api/artwork-report</h3>\n        <p>Artwork coverage report (DB URLs, embedded files, aggregation by album/artist)</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="post">POST</span> /api/refresh-artwork</h3>\n        <p>Refresh artwork for tracks (mode=missing or mode=all, limit=N). Supports dry_run mode for testing. Returns breakdown by source (spotify/musicbrainz/embedded)</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="get">GET</span> /health, /status, /metrics</h3>\n        <p>Health checks and metrics</p>\n    </div>\n    <h2>Control Endpoints (requires authentication if DAEMON_API_TOKEN is set)</h2>\n    <div class="endpoint">\n        <h3><span class="post">POST</span> /sync</h3>\n        <p>Trigger Spotify sync + download</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="post">POST</span> /integrity</h3>\n        <p>Run integrity check</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="post">POST</span> /discover</h3>\n        <p>Fetch ListenBrainz recommendations</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="post">POST</span> /admin/reset-failed</h3>\n        <p>Reset all failed tracks to pending status for retry</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="post">POST</span> /admin/validate-invalid-tracks</h3>\n        <p>Validate tracks with empty artist/album against Spotify API. Returns: checked/updated/marked_not_found/errors</p>\n    </div>\n    <div class="endpoint">\n        <h3><span class="post">POST</span> /admin/cleanup-invalid-tracks</h3>\n        <p>Delete tracks marked as invalid (status=failed) with empty artist/album</p>\n    </div>\n</body>\n</html>'''
     return docs_html, 200
 
 

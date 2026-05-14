@@ -44,6 +44,7 @@ try:
         ID3,
         ID3NoHeaderError,
         TALB,
+        TCMP,
         TDRC,
         TIT2,
         TPE1,
@@ -548,11 +549,19 @@ class MetadataTagger:
         if tags.title:
             audio["TIT2"] = TIT2(encoding=3, text=tags.title)
         if tags.artist:
-            audio["TPE1"] = TPE1(encoding=3, text=tags.artist)
+            # Split ", "-joined multi-artist string into separate ID3v2.4 values
+            # so Plex links each artist individually. Single artists unaffected.
+            artists = [a.strip() for a in tags.artist.split(", ") if a.strip()]
+            audio["TPE1"] = TPE1(encoding=3, text=artists)
 
         # TPE2/ALBUMARTIST is NEVER empty — falls back to TPE1 at minimum
         album_artist = tags.album_artist or tags.artist or ""
         audio["TPE2"] = TPE2(encoding=3, text=album_artist)
+
+        # TCMP=1 marks compilation albums so Plex groups them correctly and
+        # still shows individual track artists instead of "Various Artists".
+        if album_artist.lower() == "various artists":
+            audio["TCMP"] = TCMP(encoding=3, text="1")
 
         if tags.album:
             audio["TALB"] = TALB(encoding=3, text=tags.album)
@@ -578,11 +587,17 @@ class MetadataTagger:
         if tags.title:
             audio["title"] = [tags.title]
         if tags.artist:
-            audio["artist"] = [tags.artist]
+            # Multiple Vorbis artist values — one entry per artist
+            artists = [a.strip() for a in tags.artist.split(", ") if a.strip()]
+            audio["artist"] = artists
 
         # ALBUMARTIST is NEVER empty — falls back to ARTIST at minimum
         album_artist = tags.album_artist or tags.artist or ""
         audio["albumartist"] = [album_artist]
+
+        # COMPILATION=1 tells Plex this is a Various Artists album
+        if album_artist.lower() == "various artists":
+            audio["compilation"] = ["1"]
 
         if tags.album:
             audio["album"] = [tags.album]
@@ -609,11 +624,17 @@ class MetadataTagger:
         if tags.title:
             audio["\xa9nam"] = [tags.title]
         if tags.artist:
-            audio["\xa9ART"] = [tags.artist]
+            # Multiple MP4 artist values — one entry per artist
+            artists = [a.strip() for a in tags.artist.split(", ") if a.strip()]
+            audio["\xa9ART"] = artists
 
         # aART (album artist) is NEVER empty — falls back to artist at minimum
         album_artist = tags.album_artist or tags.artist or ""
         audio["aART"] = [album_artist]
+
+        # cpil=True marks compilation albums in iTunes/Plex for M4A files
+        if album_artist.lower() == "various artists":
+            audio["cpil"] = [True]
 
         if tags.album:
             audio["\xa9alb"] = [tags.album]
