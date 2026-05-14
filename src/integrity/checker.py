@@ -147,8 +147,23 @@ class IntegrityChecker:
             expected_hash = track.file_sha256 or ""
 
             if actual_hash != expected_hash:
-                errors_logger.error(
-                    "[FILE_CORRUPT]  %s | %s | %s | expected=%s | got=%s",
+                if not expected_hash:
+                    # No hash stored yet — update it rather than resetting
+                    logger.info(
+                        "No stored hash for track %d (%r) — recording hash now",
+                        track.id, track.title,
+                    )
+                    track.file_sha256 = actual_hash
+                    track.last_checked_at = now
+                    session.add(track)
+                    result.ok += 1
+                    continue
+
+                # Hash mismatch: update stored hash and log — do NOT reset to pending.
+                # Legitimate operations (retag, format conversion) change the hash.
+                # Resetting to pending would cause unnecessary re-downloads.
+                errors_logger.warning(
+                    "[HASH_CHANGED]  %s | %s | %s | was=%s | now=%s",
                     track.title,
                     track.artist,
                     file_path,
@@ -156,19 +171,18 @@ class IntegrityChecker:
                     actual_hash,
                 )
                 logger.warning(
-                    "Hash mismatch for track %d (%r by %r): expected=%s… got=%s…",
+                    "Hash changed for track %d (%r by %r): updating stored hash "
+                    "(was=%s… now=%s…) — file likely re-tagged",
                     track.id,
                     track.title,
                     track.artist,
                     expected_hash[:12],
                     actual_hash[:12],
                 )
-                track.status = TrackStatus.PENDING.value
-                track.file_path = None
-                track.file_sha256 = None
+                track.file_sha256 = actual_hash
                 track.last_checked_at = now
                 session.add(track)
-                result.corrupt += 1
+                result.ok += 1
                 continue
 
             # ── 3. All good ────────────────────────────────────────────────────

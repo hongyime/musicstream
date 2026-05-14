@@ -67,6 +67,9 @@ services:
       - ${EXTERNAL_MEDIA_DRIVE}:/media
       - ./logs:/app/logs
       - ./backups:/app/backups
+      # data/ persists librespot credential blob across rebuilds.
+      # gitignored — never committed. Created by daemon on first librespot auth.
+      - ./data:/app/data
     # cookies.txt and spotify_token.json are baked into the image via COPY . .
     # File bind-mounts with spaces in the host path fail on Docker Desktop / WSL2.
     ports:
@@ -86,6 +89,11 @@ services:
       - ACOUSTID_API_KEY=${ACOUSTID_API_KEY}
       - QOBUZ_EMAIL=${QOBUZ_EMAIL}
       - QOBUZ_PASSWORD_MD5=${QOBUZ_PASSWORD_MD5}
+      # Tier 0: librespot (direct Spotify CDN — requires Premium account)
+      # After first auth the credential blob is saved; password not needed again.
+      - SPOTIFY_USERNAME=${SPOTIFY_USERNAME:-}
+      - SPOTIFY_PASSWORD=${SPOTIFY_PASSWORD:-}
+      - LIBRESPOT_CREDENTIALS_FILE=/app/data/librespot_credentials.json
       # Set to 1/true/yes/on to disable downloads (for staging/development)
       - DISABLE_DOWNLOADS=${DISABLE_DOWNLOADS:-}
       # Worker concurrency for parallel downloads (default: 12 - MAXIMUM SPEED 🚀)

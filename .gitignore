@@ -6,6 +6,10 @@ cookies.txt
 headers_auth.json
 spotify_token*
 .spotify_cache*
+# librespot credential blob — generated on first auth, never commit
+librespot_credentials.json
+# persistent data volume directory
+/data/
 
 # ── Database backups ───────────────────────────────────────────────────────────
 /backups/

@@ -11,6 +11,7 @@ Covers:
 """
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,8 +27,8 @@ from sqlalchemy.orm import sessionmaker
 for _mod in ("yt_dlp", "spotipy", "spotipy.oauth2", "ytmusicapi", "spotdl"):
     sys.modules.setdefault(_mod, MagicMock())
 
-from src.models import Base, DownloadAttempt, Track, TrackStatus
-from src.ingestion.downloader import DownloadOrchestrator, _GIVE_UP_THRESHOLD
+from src.models import Base, DownloadAttempt, Track, TrackStatus  # noqa: E402
+from src.ingestion.downloader import DownloadOrchestrator, _GIVE_UP_THRESHOLD, TEMP_DIR  # noqa: E402
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -82,8 +83,13 @@ def _add_failed_attempts(session, track_id, count):
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 class TestConstants:
-    def test_max_concurrent_is_4(self):
-        assert DownloadOrchestrator.MAX_CONCURRENT == 4
+    def test_max_concurrent_from_env(self):
+        # Test that MAX_CONCURRENT reads from environment variable with sensible default
+        import os
+        expected = int(os.environ.get("MAX_CONCURRENT_WORKERS", "4"))
+        assert DownloadOrchestrator.MAX_CONCURRENT == expected
+        # Also verify it's a reasonable value (1-20 range supported)
+        assert 1 <= DownloadOrchestrator.MAX_CONCURRENT <= 20
 
     def test_give_up_threshold_is_25(self):
         assert _GIVE_UP_THRESHOLD == 25
@@ -380,7 +386,7 @@ class TestBug1YouTubeFormatSelectorExploration:
 # They should PASS on UNFIXED code to establish baseline behavior to preserve.
 
 try:
-    from hypothesis import given, strategies as st, settings, assume, HealthCheck
+    from hypothesis import given, strategies as st, settings, HealthCheck
     HYPOTHESIS_AVAILABLE = True
 except ImportError:
     HYPOTHESIS_AVAILABLE = False
@@ -644,6 +650,10 @@ class TestBug2SpotiFLACLogLevelExploration:
     EXPECTED OUTCOME after fix: Test PASSES (log_level removed from code)
     """
     
+    @pytest.mark.skipif(
+        not os.environ.get("ENABLE_TIER1", "true").lower() == "true",
+        reason="Tier 1 (SpotiFLAC) is disabled via ENABLE_TIER1=false"
+    )
     def test_tier1_spotiflac_code_contains_log_level_parameter(self):
         """
         Code inspection test: Verify _tier1_spotiflac contains log_level parameter.
@@ -670,17 +680,21 @@ class TestBug2SpotiFLACLogLevelExploration:
             log_level_lines = [line for line in lines if "log_level=" in line]
             
             pytest.fail(
-                f"BUG CONFIRMED: _tier1_spotiflac contains unsupported log_level parameter.\n"
-                f"Found in code:\n" + "\n".join(f"  {line.strip()}" for line in log_level_lines) + "\n"
-                f"\nThis parameter is not supported in SpotiFLAC 0.2.6 and causes TypeError.\n"
-                f"Expected behavior: SpotiFLAC should be called WITHOUT log_level parameter.\n"
-                f"\nThis test FAILS on unfixed code (expected for exploration test).\n"
-                f"After fix (removing log_level parameter), this test should PASS."
+                "BUG CONFIRMED: _tier1_spotiflac contains unsupported log_level parameter.\n"
+                "Found in code:\n" + "\n".join(f"  {line.strip()}" for line in log_level_lines) + "\n"
+                "\nThis parameter is not supported in SpotiFLAC 0.2.6 and causes TypeError.\n"
+                "Expected behavior: SpotiFLAC should be called WITHOUT log_level parameter.\n"
+                "\nThis test FAILS on unfixed code (expected for exploration test).\n"
+                "After fix (removing log_level parameter), this test should PASS."
             )
         else:
             # Fix has been applied: log_level parameter removed
             assert True, "log_level parameter has been removed (fix applied)"
     
+    @pytest.mark.skipif(
+        not os.environ.get("ENABLE_TIER1", "true").lower() == "true",
+        reason="Tier 1 (SpotiFLAC) is disabled via ENABLE_TIER1=false"
+    )
     def test_tier1_spotiflac_method_calls_with_log_level_mock(self, session):
         """
         Mock-based test: Verify _tier1_spotiflac calls SpotiFLAC with log_level.
@@ -691,8 +705,7 @@ class TestBug2SpotiFLACLogLevelExploration:
         On unfixed code: Test FAILS (log_level detected in call - bug confirmed)
         After fix: Test PASSES (log_level not in call)
         """
-        import logging
-        from unittest.mock import patch, MagicMock, call
+        from unittest.mock import patch, MagicMock
         
         # Create a track with spotify_id
         track = _make_track(session, "spotify:track:3n3Ppam7vgaVa1iaRUc9Lp")
@@ -724,8 +737,8 @@ class TestBug2SpotiFLACLogLevelExploration:
         
         with patch.object(downloader, "_SpotiFLAC", side_effect=mock_spotiflac):
             try:
-                result = orch._tier1_spotiflac(track)
-                
+                orch._tier1_spotiflac(track)
+
                 # If we reach here without TypeError, check if log_level was in the call
                 if "log_level" in call_kwargs:
                     pytest.fail(
@@ -841,20 +854,20 @@ class TestBug2SpotiFLACLogLevelExploration:
         if has_api_comment and has_log_level_param:
             # BUG CONFIRMED: Code acknowledges API limitations but still uses log_level
             pytest.fail(
-                f"BUG CONFIRMED: Code has API documentation but still uses unsupported log_level.\n"
-                f"\nThe code contains comments about SpotiFLAC 0.2.6 API limitations,\n"
-                f"acknowledging that 'quality=' does not exist in 0.2.6,\n"
-                f"but it still incorrectly uses 'log_level=' parameter which is also unsupported.\n"
-                f"\nThis demonstrates the bug: log_level parameter was overlooked\n"
-                f"when other unsupported parameters (quality) were identified and removed.\n"
-                f"\nThis test FAILS on unfixed code (expected for exploration test).\n"
-                f"After fix, log_level should be removed like quality was."
+                "BUG CONFIRMED: Code has API documentation but still uses unsupported log_level.\n"
+                "\nThe code contains comments about SpotiFLAC 0.2.6 API limitations,\n"
+                "acknowledging that 'quality=' does not exist in 0.2.6,\n"
+                "but it still incorrectly uses 'log_level=' parameter which is also unsupported.\n"
+                "\nThis demonstrates the bug: log_level parameter was overlooked\n"
+                "when other unsupported parameters (quality) were identified and removed.\n"
+                "\nThis test FAILS on unfixed code (expected for exploration test).\n"
+                "After fix, log_level should be removed like quality was."
             )
         elif has_log_level_param:
             # Bug exists but no API comments
             pytest.fail(
-                f"BUG CONFIRMED: Code uses unsupported log_level parameter.\n"
-                f"This test FAILS on unfixed code (expected for exploration test)."
+                "BUG CONFIRMED: Code uses unsupported log_level parameter.\n"
+                "This test FAILS on unfixed code (expected for exploration test)."
             )
         else:
             # Fix has been applied
@@ -892,7 +905,7 @@ class TestProperty2PreservationSpotiFLACDownloads:
             max_size=22
         )
     )
-    @settings(max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(max_examples=20, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
     def test_spotiflac_supported_parameters_only(self, spotify_id, session):
         """
         Property: For all valid Spotify IDs, SpotiFLAC should instantiate
@@ -910,16 +923,22 @@ class TestProperty2PreservationSpotiFLACDownloads:
         if not downloader.SPOTIFLAC_AVAILABLE:
             pytest.skip("SpotiFLAC not available")
         
-        # Create a track with the generated spotify_id
-        track = _make_track(session, f"spotify:track:{spotify_id}")
-        track.spotify_id = spotify_id
-        session.flush()
-        
+        # Create track without session to avoid unique constraint violations across Hypothesis examples
+        track = Track(
+            spotify_uri=f"spotify:track:{spotify_id}",
+            spotify_id=spotify_id,
+            title="Test Track",
+            artist="Test Artist",
+            status=TrackStatus.PENDING.value,
+            cover_art_source="none",
+        )
+        track.id = 1  # dummy id for logging
+
         # Create orchestrator
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         orch._rate_limiter = MagicMock()
         orch._rate_limiter.is_healthy.return_value = True
-        
+
         # Mock SpotiFLAC to verify it's called with correct parameters
         call_kwargs = {}
         
@@ -939,7 +958,7 @@ class TestProperty2PreservationSpotiFLACDownloads:
         
         with patch.object(downloader, "_SpotiFLAC", side_effect=mock_spotiflac):
             # This should not raise TypeError
-            result = orch._tier1_spotiflac(track)
+            orch._tier1_spotiflac(track)
             
             # Verify the call was made with correct parameters
             assert "url" in call_kwargs, "url parameter should be present"
@@ -960,7 +979,7 @@ class TestProperty2PreservationSpotiFLACDownloads:
             unique=True
         )
     )
-    @settings(max_examples=15, suppress_health_check=[HealthCheck.function_scoped_fixture])
+    @settings(max_examples=15, suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
     def test_spotiflac_services_parameter_flexibility(self, services_list, session):
         """
         Property: For all valid service combinations, SpotiFLAC should accept
@@ -974,16 +993,22 @@ class TestProperty2PreservationSpotiFLACDownloads:
         if not downloader.SPOTIFLAC_AVAILABLE:
             pytest.skip("SpotiFLAC not available")
         
-        # Create a track
-        track = _make_track(session, "spotify:track:test123")
-        track.spotify_id = "test123"
-        session.flush()
-        
+        # Create track without session to avoid unique constraint violations across Hypothesis examples
+        track = Track(
+            spotify_uri="spotify:track:test123",
+            spotify_id="test123",
+            title="Test Track",
+            artist="Test Artist",
+            status=TrackStatus.PENDING.value,
+            cover_art_source="none",
+        )
+        track.id = 1  # dummy id for logging
+
         # Create orchestrator
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         orch._rate_limiter = MagicMock()
         orch._rate_limiter.is_healthy.return_value = True
-        
+
         # Mock SpotiFLAC to verify services parameter
         received_services = []
         
@@ -1039,8 +1064,8 @@ class TestProperty2PreservationSpotiFLACDownloads:
         with patch.object(downloader, "_SpotiFLAC", side_effect=mock_spotiflac):
             orch._tier1_spotiflac(track)
             
-            # Verify URL format
-            assert len(captured_url) == 1
+            # Verify URL format (SpotiFLAC may be called multiple times due to retry logic)
+            assert len(captured_url) >= 1
             assert captured_url[0] == "https://open.spotify.com/track/3n3Ppam7vgaVa1iaRUc9Lp", \
                 "Spotify URL format should be preserved"
     
@@ -1077,8 +1102,8 @@ class TestProperty2PreservationSpotiFLACDownloads:
         with patch.object(downloader, "_SpotiFLAC", side_effect=mock_spotiflac):
             orch._tier1_spotiflac(track)
             
-            # Verify output_dir was provided
-            assert len(captured_dirs) == 1
+            # Verify output_dir was provided (SpotiFLAC may be called multiple times due to retry logic)
+            assert len(captured_dirs) >= 1
             output_dir = captured_dirs[0]
             
             # Verify it's in TEMP_DIR
@@ -1145,16 +1170,22 @@ class TestProperty2PreservationSpotiFLACDownloads:
         if not downloader.SPOTIFLAC_AVAILABLE:
             pytest.skip("SpotiFLAC not available")
         
-        # Create a track
-        track = _make_track(session, "spotify:track:testfile")
-        track.spotify_id = "testfile"
-        session.flush()
-        
+        # Create track without session to avoid unique constraint violations across Hypothesis examples
+        track = Track(
+            spotify_uri="spotify:track:testfile",
+            spotify_id="testfile",
+            title="Test Track",
+            artist="Test Artist",
+            status=TrackStatus.PENDING.value,
+            cover_art_source="none",
+        )
+        track.id = 1  # dummy id for logging
+
         # Create orchestrator
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         orch._rate_limiter = MagicMock()
         orch._rate_limiter.is_healthy.return_value = True
-        
+
         # Mock SpotiFLAC
         def mock_spotiflac(*args, **kwargs):
             return MagicMock()
@@ -1171,7 +1202,7 @@ class TestProperty2PreservationSpotiFLACDownloads:
                 with patch("os.walk", return_value=[(tmpdir, [], [f"test{file_extension}"])]):
                     with patch("os.path.getsize", return_value=1000):
                         with patch("os.rename") as mock_rename:
-                            result = orch._tier1_spotiflac(track)
+                            orch._tier1_spotiflac(track)
                             
                             # Verify file was detected and renamed
                             assert mock_rename.called, \

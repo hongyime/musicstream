@@ -13,34 +13,18 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
-from src.models import Base, Track, TrackStatus
+from src.models import Track, TrackStatus
 from src.ingestion.tagger import MBData, MetadataTagger, TagData, TagResult
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
-@pytest.fixture(scope="module")
-def engine():
-    eng = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
-    Base.metadata.create_all(eng)
-    return eng
-
-
-@pytest.fixture
-def session(engine):
-    Session = sessionmaker(bind=engine, expire_on_commit=False)
-    sess = Session()
-    yield sess
-    sess.rollback()
-    sess.close()
+# Use centralized fixtures from conftest.py - remove duplicate definitions
 
 
 def _make_tagger():
@@ -283,8 +267,8 @@ class TestWriteTagsDispatch:
 
     def test_unknown_extension_does_not_raise(self):
         tags = TagData(title="T", artist="A", album_artist="A")
-        # Should log a warning but not raise
-        self.tagger._write_tags("/tmp/song.ogg", tags)
+        # Should log a warning but not raise (use truly unsupported extension)
+        self.tagger._write_tags("/tmp/song.wma", tags)
 
 
 # ── Bug Condition Exploration: ISRC Response Parsing ──────────────────────────
