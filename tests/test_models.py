@@ -255,7 +255,7 @@ class TestDownloadAttemptModel:
         attempt = DownloadAttempt(
             track_id=track.id,
             attempted_at=_utcnow(),
-            method="tier1_spotiflac",
+            method="tier2_ytdlp_ytm",
         )
         session.add(attempt)
         session.flush()

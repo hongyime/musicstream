@@ -287,12 +287,34 @@ def download_pipeline() -> tuple[int, int]:
         from src.db import get_session
         from src.ingestion.downloader import DownloadOrchestrator
         orchestrator = DownloadOrchestrator()
+
+        # Phase 1: librespot — every track gets a genuine Spotify CDN attempt first.
+        # Single worker, no semaphore, bounded at 2h so phases 2+3 still run.
+        try:
+            with get_session() as session:
+                lib_dl, lib_fail = orchestrator.download_pending_librespot(session)
+            logger.info("librespot sweep: downloaded=%d failed=%d", lib_dl, lib_fail)
+        except Exception as exc:
+            logger.error("librespot sweep failed (non-fatal): %s", exc, exc_info=True)
+            lib_dl = 0
+
+        # Phase 2: 12-worker batch — tier2 → tier4 → tier5 for remaining tracks.
         with get_session() as session:
             downloaded, failed = orchestrator.download_pending(session)
         logger.info(
             "Download pipeline complete: downloaded=%d failed=%d",
             downloaded, failed,
         )
+        downloaded += lib_dl
+
+        # Phase 3: spotdl — single worker, top 100 still-pending tracks.
+        try:
+            with get_session() as session:
+                sdl_dl, sdl_fail = orchestrator.download_pending_spotdl(session)
+            logger.info("spotdl sweep: downloaded=%d failed=%d", sdl_dl, sdl_fail)
+            downloaded += sdl_dl
+        except Exception as exc:
+            logger.error("spotdl sweep failed (non-fatal): %s", exc, exc_info=True)
         return downloaded, failed
     except Exception as exc:
         logger.error("Download pipeline failed: %s", exc, exc_info=True)

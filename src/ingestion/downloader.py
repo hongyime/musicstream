@@ -2,7 +2,6 @@
 musicstream/ingestion/downloader.py — 5-tier download orchestrator
 
 Implements the full tier chain for downloading tracks:
-  Tier 1: SpotiFLAC (qobuz/tidal/amazon/deezer) — FLAC lossless
   Tier 2: yt-dlp + ytmusicapi (songs→videos→no filter) — MP3 320kbps, ±5s duration check
   Tier 3: spotdl Python API — MP3 320kbps, requires Spotify credentials
   Tier 4: yt-dlp YouTube direct search (ytsearch12) — MP3 320kbps
@@ -54,7 +53,6 @@ if LIBRESPOT_AVAILABLE:
 # Module-level librespot session singleton (created once, reused across all workers)
 _librespot_session: Optional[object] = None
 _librespot_session_lock = threading.Lock()
-_LIBRESPOT_SEMAPHORE = threading.Semaphore(1)  # one CDN stream at a time
 
 
 def _get_librespot_session():
@@ -120,10 +118,6 @@ _GIVE_UP_THRESHOLD = 25    # ~5 complete tier-chain runs before giving up
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_WORKERS", "4"))
 logger.info("Worker concurrency set to: MAX_CONCURRENT=%d", MAX_CONCURRENT)
 
-# spotdl serialisation — Spotify's API rate-limits quickly under concurrent calls.
-# One active spotdl download at a time prevents 4 workers from hitting the limit together.
-_SPOTDL_SEMAPHORE = threading.Semaphore(1)
-
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -140,13 +134,11 @@ class DownloadOrchestrator:
     MAX_CONCURRENT: int = MAX_CONCURRENT
 
     def __init__(self) -> None:
-        # Scale circuit breaker threshold based on concurrency
-        # This prevents 4 concurrent workers from tripping a low threshold
-        # when the same API fails for all workers simultaneously.
-        # Threshold=MAX_CONCURRENT*5 allows for burst failures while catching
-        # persistent issues. Cooldown=300s allows breaker to recover within
-        # the same batch run.
-        circuit_threshold = MAX_CONCURRENT * 5
+        # Trip after one full round of all workers failing plus a small buffer.
+        # MAX_CONCURRENT*5 (=60) was too lenient — a broken service would rack up
+        # 60 consecutive failures before the breaker opened.  MAX_CONCURRENT+5
+        # trips within two bad rounds, which is fast enough to matter.
+        circuit_threshold = MAX_CONCURRENT + 5
         self._rate_limiter = ServiceRateLimiter(
             circuit_breaker_threshold=circuit_threshold,
             circuit_breaker_cooldown=300,
@@ -184,6 +176,22 @@ class DownloadOrchestrator:
         Returns:
             (downloaded, failed) counts.
         """
+        # Tracks left in DOWNLOADING from a previous crashed/restarted run are
+        # permanently stuck — no worker will pick them up again.  Reset them here
+        # before querying PENDING so they re-enter the queue this run.
+        stuck = (
+            session.execute(
+                select(Track).where(Track.status == TrackStatus.DOWNLOADING.value)
+            )
+            .scalars()
+            .all()
+        )
+        if stuck:
+            for t in stuck:
+                t.status = TrackStatus.PENDING.value
+            session.flush()
+            logger.info("Reset %d stuck DOWNLOADING tracks to PENDING", len(stuck))
+
         pending_tracks = (
             session.execute(
                 select(Track).where(Track.status == TrackStatus.PENDING.value)
@@ -269,9 +277,150 @@ class DownloadOrchestrator:
         )
         return downloaded, failed
 
-    def download_track(self, track: Track, session: Session) -> bool:
+    def download_pending_librespot(
+        self,
+        session: Session,
+        per_track_timeout: float = 90.0,
+        max_seconds: float = 7200.0,
+    ) -> tuple[int, int]:
         """
-        Run the full 5-tier chain for a single track.
+        Single-worker librespot pre-sweep: every pending track gets a genuine
+        Spotify CDN attempt before the 12-worker batch tries YouTube sources.
+
+        Two-level time control:
+          per_track_timeout — max seconds for a single track's librespot attempt.
+            stream.read() is blocking, so we run each attempt in a thread and
+            join with this timeout.  Prevents one hung connection blocking the sweep.
+          max_seconds — total budget for the whole sweep.  Stops early so the
+            12-worker batch + spotdl sweep still run in the same cycle.
+
+        Returns:
+            (downloaded, failed) counts.
+        """
+        if not LIBRESPOT_AVAILABLE:
+            logger.info("librespot not available; skipping pre-sweep.")
+            return 0, 0
+
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+        from src.db import get_session
+
+        pending = (
+            session.execute(
+                select(Track).where(Track.status == TrackStatus.PENDING.value)
+            )
+            .scalars()
+            .all()
+        )
+
+        if not pending:
+            return 0, 0
+
+        logger.info(
+            "librespot pre-sweep: %d pending tracks (per_track=%.0fs total=%.0fs)",
+            len(pending), per_track_timeout, max_seconds,
+        )
+        downloaded = 0
+        failed = 0
+        sweep_start = time.monotonic()
+        _lib_tiers = [("tier0_librespot", self._tier0_librespot)]
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            for track in pending:
+                if time.monotonic() - sweep_start > max_seconds:
+                    logger.info("librespot pre-sweep: total time limit reached after %.0fs", max_seconds)
+                    break
+                if not track.spotify_id:
+                    continue
+                try:
+                    with get_session() as ts:
+                        t = ts.get(Track, track.id)
+                        if t is None or t.status != TrackStatus.PENDING.value:
+                            continue
+                        future = executor.submit(
+                            self.download_track, t, ts, _lib_tiers
+                        )
+                        try:
+                            success = future.result(timeout=per_track_timeout)
+                        except FuturesTimeout:
+                            future.cancel()
+                            logger.warning(
+                                "librespot per-track timeout (%.0fs) for track %d ('%s')",
+                                per_track_timeout, track.id, track.title,
+                            )
+                            success = False
+                        if success:
+                            downloaded += 1
+                        else:
+                            failed += 1
+                except Exception as exc:
+                    logger.error("librespot sweep error for track %d: %s", track.id, exc, exc_info=True)
+                    failed += 1
+
+        elapsed = time.monotonic() - sweep_start
+        logger.info(
+            "librespot pre-sweep done: downloaded=%d failed=%d elapsed=%.0fs",
+            downloaded, failed, elapsed,
+        )
+        return downloaded, failed
+
+    def download_pending_spotdl(self, session: Session, max_seconds: float = 3600.0) -> tuple[int, int]:
+        """
+        Single-worker spotdl sweep run after the main 12-worker batch.
+
+        Processes ALL still-PENDING tracks (not a fixed top-N — spotdl's
+        Spotify-metadata search has genuinely different coverage from tier2's
+        raw query, so every remaining track deserves an attempt).
+
+        Stops after max_seconds so the daemon cycle doesn't overrun.
+
+        Returns:
+            (downloaded, failed) counts.
+        """
+        from src.db import get_session
+
+        candidates = (
+            session.execute(
+                select(Track).where(Track.status == TrackStatus.PENDING.value)
+            )
+            .scalars()
+            .all()
+        )
+
+        if not candidates:
+            logger.info("spotdl sweep: no pending tracks to process.")
+            return 0, 0
+
+        logger.info("spotdl sweep: %d tracks (max %.0fs)", len(candidates), max_seconds)
+        downloaded = 0
+        failed = 0
+        sweep_start = time.monotonic()
+        _spotdl_tiers = [("tier3_spotdl", self._tier3_spotdl)]
+
+        for track in candidates:
+            if time.monotonic() - sweep_start > max_seconds:
+                logger.info("spotdl sweep: time limit reached after %.0fs", max_seconds)
+                break
+            try:
+                with get_session() as ts:
+                    t = ts.get(Track, track.id)
+                    if t is None or t.status != TrackStatus.PENDING.value:
+                        continue
+                    success = self.download_track(t, ts, tiers_override=_spotdl_tiers)
+                    if success:
+                        downloaded += 1
+                    else:
+                        failed += 1
+            except Exception as exc:
+                logger.error("spotdl sweep unhandled error for track %d: %s", track.id, exc, exc_info=True)
+                failed += 1
+
+        elapsed = time.monotonic() - sweep_start
+        logger.info("spotdl sweep done: downloaded=%d failed=%d elapsed=%.0fs", downloaded, failed, elapsed)
+        return downloaded, failed
+
+    def download_track(self, track: Track, session: Session, tiers_override=None) -> bool:
+        """
+        Run the tier chain for a single track.
 
         Records every attempt in download_attempts. On success, updates
         track.status and track.download_method. On exhaustion, marks
@@ -284,17 +433,15 @@ class DownloadOrchestrator:
         track.status = TrackStatus.DOWNLOADING.value
         session.flush()
 
-        # Build tiers list
-        tiers = [
-            ("tier2_ytdlp_ytm",        self._tier2_ytdlp_ytm),         # MP3 320, YT Music match
-            ("tier3_spotdl",           self._tier3_spotdl),            # MP3 320, spotdl CLI
-            ("tier4_ytdlp_youtube",    self._tier4_ytdlp_youtube),     # MP3 320, YouTube direct
-            ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),  # MP3 320, SoundCloud
+        # Tier 0 (librespot) and tier 3 (spotdl) are single-worker sweeps that
+        # run before/after this batch — not in the 12-worker pool.  Both require
+        # serialised access; running them here would block 11/12 workers on a
+        # semaphore or produce 11x the Spotify API hammering.
+        tiers = tiers_override if tiers_override is not None else [
+            ("tier2_ytdlp_ytm",        self._tier2_ytdlp_ytm),
+            ("tier4_ytdlp_youtube",    self._tier4_ytdlp_youtube),
+            ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),
         ]
-
-        # Tier 0: librespot (direct Spotify CDN) — prepend if available
-        if LIBRESPOT_AVAILABLE:
-            tiers.insert(0, ("tier0_librespot", self._tier0_librespot))
 
         for method_name, tier_fn in tiers:
             try:
@@ -411,12 +558,10 @@ class DownloadOrchestrator:
             logger.debug("Tier 0 skipped for track %d: no spotify_id", track.id)
             return None
 
-        if not _LIBRESPOT_SEMAPHORE.acquire(timeout=30):
-            logger.warning("librespot semaphore timeout for track %d", track.id)
-            return None
-
         try:
+            _librespot_auth_ok = False
             session = _get_librespot_session()
+            _librespot_auth_ok = True
 
             track_id = _TrackId.from_uri(track.spotify_uri)
             stream = session.content_feeder().load(
@@ -461,10 +606,11 @@ class DownloadOrchestrator:
             except OSError:
                 pass
 
-            if ffmpeg_result.returncode != 0 or not os.path.exists(mp3_path):
+            mp3_size = os.path.getsize(mp3_path) if os.path.exists(mp3_path) else 0
+            if ffmpeg_result.returncode != 0 or mp3_size < 10_240:
                 logger.warning(
-                    "librespot: ffmpeg conversion failed for track %d: %s",
-                    track.id, ffmpeg_result.stderr.decode(errors="replace")[:200],
+                    "librespot: ffmpeg conversion failed for track %d (size=%d): %s",
+                    track.id, mp3_size, ffmpeg_result.stderr.decode(errors="replace")[:200],
                 )
                 self._rate_limiter.record_failure("librespot")
                 return None
@@ -476,12 +622,18 @@ class DownloadOrchestrator:
         except Exception as exc:
             self._rate_limiter.record_failure("librespot")
             logger.warning("librespot failed for track %d ('%s'): %s", track.id, track.title, exc)
-            # Invalidate session so next call tries to reconnect
-            global _librespot_session
-            _librespot_session = None
+            # Only invalidate the session on auth failures or explicit auth signals.
+            # Transient stream errors (IOError, empty chunk, decode error) don't
+            # mean the session is dead — nuking it on every blip forces expensive
+            # full re-auth on the next call.
+            exc_str = str(exc).lower()
+            is_auth_failure = not _librespot_auth_ok or any(
+                kw in exc_str for kw in ("auth", "credential", "login", "token", "unauthorized", "403", "invalid")
+            )
+            if is_auth_failure:
+                global _librespot_session
+                _librespot_session = None
             return None
-        finally:
-            _LIBRESPOT_SEMAPHORE.release()
 
     # ── Tier 2: yt-dlp + ytmusicapi ───────────────────────────────────────────
 
@@ -620,11 +772,6 @@ class DownloadOrchestrator:
             logger.info("Throttle skip: spotdl track %d — will retry next run", track.id)
             return None
 
-        # Serialise — Spotify's API rate-limits quickly under concurrent load.
-        if not _SPOTDL_SEMAPHORE.acquire(timeout=60):
-            logger.warning("spotdl semaphore timeout for track %d; skipping Tier 3 this run.", track.id)
-            return None
-
         try:
             import subprocess
             import shutil
@@ -645,10 +792,11 @@ class DownloadOrchestrator:
             out_dir = os.path.join(TEMP_DIR, f"spotdl_{track.id}_{uuid.uuid4().hex[:8]}")
             os.makedirs(out_dir, exist_ok=True)
 
-            # Build spotdl command — try Spotify CDN first (higher quality, exact match),
-            # fall back to YouTube Music if Spotify source fails.
+            # URI must come BEFORE --audio: spotdl's --audio uses nargs=* and will
+            # greedily consume the URI as an audio-source value, failing argparse validation.
             base_cmd = [
                 spotdl_path,
+                spotify_uri,
                 "--output", out_dir,
                 "--format", "mp3",
                 "--bitrate", "320k",
@@ -657,23 +805,23 @@ class DownloadOrchestrator:
                 "--client-secret", client_secret,
             ]
 
-            # Attempt 1: --audio spotify (direct CDN — best quality, exact track)
-            cmd_spotify = base_cmd + ["--audio", "spotify", spotify_uri]
-            logger.debug("Running spotdl (spotify audio) for track %d", track.id)
+            # Attempt 1: youtube-music (Spotify-matched, most accurate)
+            cmd_ytm = base_cmd + ["--audio", "youtube-music"]
+            logger.debug("Running spotdl (youtube-music) for track %d", track.id)
             result = subprocess.run(
-                cmd_spotify,
+                cmd_ytm,
                 capture_output=True,
                 text=True,
                 timeout=120,
             )
 
-            # Attempt 2: fallback to default (YouTube Music) if Spotify source failed
+            # Attempt 2: fallback to plain youtube search
             if result.returncode != 0:
                 logger.info(
-                    "spotdl --audio spotify failed for track %d ('%s'); falling back to YouTube: %s",
+                    "spotdl --audio youtube-music failed for track %d ('%s'); falling back to youtube: %s",
                     track.id, track.title, result.stderr[:120],
                 )
-                cmd_yt = base_cmd + ["--audio", "youtube-music", spotify_uri]
+                cmd_yt = base_cmd + ["--audio", "youtube"]
                 result = subprocess.run(
                     cmd_yt,
                     capture_output=True,
@@ -726,8 +874,6 @@ class DownloadOrchestrator:
                 return None
             self._rate_limiter.record_failure("spotdl")
             raise DownloadError(f"Tier 3 spotdl failed: {exc}") from exc
-        finally:
-            _SPOTDL_SEMAPHORE.release()
 
     # ── Tier 4: yt-dlp YouTube direct search ─────────────────────────────────
 
@@ -934,9 +1080,8 @@ class DownloadOrchestrator:
     def _exc_contains_rate_limit(exc: BaseException) -> bool:
         """Walk the full exception chain looking for 429/rate-limit signals.
 
-        SpotiFLAC wraps backend 429s in generic messages like "Deezer download
-        failed", so str(exc) alone misses them.  Checking __cause__/__context__
-        catches the original HTTPError before it gets re-wrapped.
+        Walk the full exception chain — some backends wrap 429s in generic messages,
+        so checking __cause__/__context__ catches re-wrapped HTTPErrors.
         """
         seen: set[int] = set()
         current: Optional[BaseException] = exc

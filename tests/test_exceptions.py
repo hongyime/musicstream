@@ -21,7 +21,6 @@ from src.exceptions import (
     MusicStreamError,
     OrganiserError,
     RateLimitError,
-    SpotiFLACError,
     SpotifyRateLimitError,
     TaggingError,
     YouTubeMusicRateLimitError,
@@ -40,7 +39,6 @@ class TestExceptionHierarchy:
             IntegrityError,
             ListenBrainzError,
             MusicBrainzError,
-            SpotiFLACError,
             DatabaseError,
         ]:
             assert issubclass(cls, MusicStreamError), f"{cls.__name__} must inherit MusicStreamError"
@@ -91,7 +89,7 @@ class TestYouTubeMusicRateLimitError:
 class TestSimpleExceptions:
     @pytest.mark.parametrize("cls", [
         DownloadError, TaggingError, OrganiserError, IntegrityError,
-        ListenBrainzError, MusicBrainzError, SpotiFLACError, DatabaseError,
+        ListenBrainzError, MusicBrainzError, DatabaseError,
     ])
     def test_can_be_raised_and_caught(self, cls):
         with pytest.raises(cls):
@@ -99,7 +97,7 @@ class TestSimpleExceptions:
 
     @pytest.mark.parametrize("cls", [
         DownloadError, TaggingError, OrganiserError, IntegrityError,
-        ListenBrainzError, MusicBrainzError, SpotiFLACError, DatabaseError,
+        ListenBrainzError, MusicBrainzError, DatabaseError,
     ])
     def test_catchable_as_musicstream_error(self, cls):
         with pytest.raises(MusicStreamError):
