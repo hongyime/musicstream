@@ -28,11 +28,11 @@ from src.rate_limiter import (
 
 class TestServiceRateLimiterConfigs:
     REQUIRED_SERVICES = {
-        "spotify", "spotiflac", "youtube", "ytmusicapi", "spotdl",
-        "musicbrainz", "acoustid", "listenbrainz", "coverart",
+        "spotify", "librespot", "youtube", "ytmusicapi", "spotdl",
+        "soundcloud", "musicbrainz", "acoustid", "listenbrainz", "coverart",
     }
 
-    def test_all_nine_services_configured(self):
+    def test_all_services_configured(self):
         rl = ServiceRateLimiter()
         assert self.REQUIRED_SERVICES == set(rl.CONFIGS.keys())
 

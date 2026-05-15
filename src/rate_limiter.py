@@ -271,7 +271,6 @@ class ServiceThrottle:
     """
 
     CONFIGS: Dict[str, ThrottleConfig] = {
-        "spotiflac":  ThrottleConfig(floor=10.0, ceiling=120.0),  # Increased to reduce Deezer 429 errors
         "youtube":    ThrottleConfig(floor=4.5, ceiling=60.0),   # random(4.5, 6.75)
         "soundcloud": ThrottleConfig(floor=1.5, ceiling=30.0),   # random(1.5, 2.25)
         "spotdl":     ThrottleConfig(floor=4.5, ceiling=60.0),   # random(4.5, 6.75)

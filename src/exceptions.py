@@ -63,10 +63,6 @@ class MusicBrainzError(MusicStreamError):
     """Raised when a MusicBrainz API request fails."""
 
 
-class SpotiFLACError(MusicStreamError):
-    """Raised when SpotiFLAC fails or is unavailable for Tier 1 download."""
-
-
 # ── Database ───────────────────────────────────────────────────────────────────
 
 class DatabaseError(MusicStreamError):
