@@ -148,10 +148,12 @@ class PlexPlaylistSync:
         now = dt.now()
         year = now.year
         week_num = now.isocalendar()[1]
-        
-        # Calculate ISO week boundaries
-        week_start = dt.fromisocalendar(year, week_num, 1, tzinfo=timezone.utc)
-        week_end = week_start + dt.timedelta(days=7)
+
+        # datetime.fromisocalendar() returns a naive datetime and does NOT accept
+        # tzinfo as a kwarg; attach UTC after construction. timedelta is imported
+        # at module level (it is NOT an attribute of the `dt` alias).
+        week_start = dt.fromisocalendar(year, week_num, 1).replace(tzinfo=timezone.utc)
+        week_end = week_start + timedelta(days=7)
 
         rows = (
             session.query(Track)
