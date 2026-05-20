@@ -153,7 +153,7 @@ def _register_scheduler_jobs():
     scheduler.add_job(tasks.spotify_incremental_sync, "cron", minute="*/15", id="spotify_sync", replace_existing=True)
     scheduler.add_job(tasks.full_download_pipeline, "cron", hour=3, id="download_pipeline", replace_existing=True)
     scheduler.add_job(tasks.listenbrainz_discovery, "cron", hour=4, id="lb_discovery", replace_existing=True)
-    scheduler.add_job(tasks.full_integrity_check, "cron", day_of_week="sun", hour=5, id="integrity_check", replace_existing=True)
+    scheduler.add_job(tasks.full_integrity_check, "cron", day_of_week="wed,sun", hour=5, id="integrity_check", replace_existing=True)
     scheduler.add_job(tasks.db_backup, "cron", day_of_week="sun", hour=5, id="db_backup", replace_existing=True)
 
 # ── API Routes ────────────────────────────────────────────────────────────────
