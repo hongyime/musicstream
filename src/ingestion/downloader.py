@@ -55,6 +55,22 @@ _librespot_session: Optional[object] = None
 _librespot_session_lock = threading.Lock()
 
 
+# ── SpotiFLAC optional import (Tier 1: Lossless from other services) ──────────
+
+try:
+    from SpotiFLAC import SpotiFLAC as _SpotiFLAC
+    SPOTIFLAC_AVAILABLE = True
+except ImportError:
+    SPOTIFLAC_AVAILABLE = False
+    logger.warning("SpotiFLAC not available; Tier 1 will be skipped")
+
+if SPOTIFLAC_AVAILABLE:
+    logger.info("SpotiFLAC available — Tier 1 active")
+
+# SpotiFLAC serialisation — streaming services return 429 under concurrent load.
+_SPOTIFLAC_SEMAPHORE = threading.Semaphore(2)
+
+
 def _get_librespot_session():
     """Return the shared librespot Session, creating it on first call."""
     global _librespot_session
@@ -134,6 +150,21 @@ class DownloadOrchestrator:
     MAX_CONCURRENT: int = MAX_CONCURRENT
 
     def __init__(self) -> None:
+        # Check if Tier 1 (SpotiFLAC) is enabled
+        self._tier1_enabled = os.environ.get("ENABLE_TIER1", "true").lower() == "true"
+        logger.info("Tier 1 (SpotiFLAC) %s", "enabled" if self._tier1_enabled else "disabled via ENABLE_TIER1=false")
+
+        # SpotiFLAC sub-provider list (controllable via env).
+        # Default skips tidal+amazon — Tidal mirrors are returning 403/502/timeouts
+        # cluster-wide and Amazon Songlink resolution is broken upstream.  Order
+        # matters: first hit wins, so put healthy providers first.
+        # Override with: SPOTIFLAC_SERVICES=qobuz,deezer,youtube,tidal,amazon
+        _raw_services = os.environ.get("SPOTIFLAC_SERVICES", "qobuz,deezer,youtube")
+        self._spotiflac_services = [
+            s.strip().lower() for s in _raw_services.split(",") if s.strip()
+        ] or ["qobuz", "deezer", "youtube"]
+        logger.info("SpotiFLAC providers (in order): %s", ",".join(self._spotiflac_services))
+
         # Trip after one full round of all workers failing plus a small buffer.
         # MAX_CONCURRENT*5 (=60) was too lenient — a broken service would rack up
         # 60 consecutive failures before the breaker opened.  MAX_CONCURRENT+5
@@ -322,10 +353,18 @@ class DownloadOrchestrator:
         downloaded = 0
         failed = 0
         sweep_start = time.monotonic()
+
+        if not self._rate_limiter.is_healthy("librespot"):
+            logger.warning("librespot circuit breaker open; skipping Tier 0 pre-sweep entirely.")
+            return 0, 0
+
         _lib_tiers = [("tier0_librespot", self._tier0_librespot)]
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             for track in pending:
+                if not self._rate_limiter.is_healthy("librespot"):
+                    logger.warning("librespot circuit breaker tripped; aborting pre-sweep.")
+                    break
                 if time.monotonic() - sweep_start > max_seconds:
                     logger.info("librespot pre-sweep: total time limit reached after %.0fs", max_seconds)
                     break
@@ -438,10 +477,15 @@ class DownloadOrchestrator:
         # serialised access; running them here would block 11/12 workers on a
         # semaphore or produce 11x the Spotify API hammering.
         tiers = tiers_override if tiers_override is not None else [
+            ("tier1_spotiflac",        self._tier1_spotiflac),
+            ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),
             ("tier2_ytdlp_ytm",        self._tier2_ytdlp_ytm),
             ("tier4_ytdlp_youtube",    self._tier4_ytdlp_youtube),
-            ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),
         ]
+
+        # Filter out disabled tiers
+        if not self._tier1_enabled:
+            tiers = [t for t in tiers if t[0] != "tier1_spotiflac"]
 
         for method_name, tier_fn in tiers:
             try:
@@ -466,6 +510,7 @@ class DownloadOrchestrator:
                         logger.warning(
                             "Unexpected tagging error for track %d: %s",
                             track.id, tag_exc,
+                            exc_info=True,
                         )
 
                     # ── Move file into Plex library (fatal: no file = no point) ─
@@ -536,6 +581,98 @@ class DownloadOrchestrator:
             )
 
         return False
+
+    # ── Tier 1: SpotiFLAC ─────────────────────────────────────────────────────
+
+    def _tier1_spotiflac(self, track: Track) -> Optional[str]:
+        """
+        Attempt FLAC download via SpotiFLAC.
+        Tries services in order: qobuz, tidal, amazon, deezer, youtube.
+        Returns the path to the downloaded FLAC file, or None on failure.
+        """
+        if not SPOTIFLAC_AVAILABLE:
+            return None
+
+        if not self._rate_limiter.is_healthy("spotiflac"):
+            logger.warning("SpotiFLAC circuit breaker open; skipping Tier 1.")
+            return None
+
+        if not track.spotify_id:
+            logger.debug("Tier 1 skipped for track %d: no spotify_id (LB-only track)", track.id)
+            return None
+
+        # SpotiFLAC needs a Spotify track URL, not a URI
+        spotify_url = f"https://open.spotify.com/track/{track.spotify_id}"
+        out_dir = os.path.join(TEMP_DIR, f"spotiflac_{uuid.uuid4().hex}")
+        os.makedirs(out_dir, exist_ok=True)
+
+        services = list(self._spotiflac_services)
+
+        try:
+            with _SPOTIFLAC_SEMAPHORE:
+                # Iterate services manually to detect which one succeeds
+                for service in services:
+                    try:
+                        _SpotiFLAC(
+                            url=spotify_url,
+                            output_dir=out_dir,
+                            services=[service],
+                            quality="LOSSLESS",
+                            log_level=logging.WARNING,
+                        )
+
+                        # Find the downloaded file
+                        for root, _, files in os.walk(out_dir):
+                            for fname in files:
+                                if fname.endswith((".flac", ".m4a", ".mp3")):
+                                    found = os.path.join(root, fname)
+                                    if os.path.getsize(found) > 0:
+                                        # Labeled path: {uuid}_{service}.ext
+                                        ext = os.path.splitext(fname)[1]
+                                        labeled = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}_{service}{ext}")
+                                        os.rename(found, labeled)
+                                        self._rate_limiter.record_success("spotiflac")
+                                        return labeled
+                    except Exception as exc:
+                        logger.debug("SpotiFLAC service=%s failed for track %d: %s", service, track.id, exc)
+                        continue
+
+            self._rate_limiter.record_failure("spotiflac")
+            return None
+
+        except Exception as exc:
+            self._rate_limiter.record_failure("spotiflac")
+            logger.debug("SpotiFLAC failed for track %d: %s", track.id, exc)
+            return None
+
+    @staticmethod
+    def _resolve_method_label(tier_name: str, file_path: str) -> str:
+        """
+        Map internal tier name + file path to the canonical download_method label.
+
+        Labels per spec:
+          spotiflac_qobuz | spotiflac_tidal | spotiflac_amazon |
+          spotiflac_deezer | spotiflac_youtube |
+          ytdlp_ytm | spotdl | ytdlp_yt | ytdlp_soundcloud
+        """
+        if tier_name == "tier1_spotiflac":
+            # Service name encoded in filename: {hex}_{service}.ext
+            basename = os.path.basename(file_path)
+            name_no_ext = os.path.splitext(basename)[0]
+            # Split on last underscore to get service
+            parts = name_no_ext.rsplit("_", 1)
+            service = parts[1] if len(parts) == 2 else "unknown"
+            return f"spotiflac_{service}"
+        elif tier_name == "tier2_ytdlp_ytm":
+            return "ytdlp_ytm"
+        elif tier_name == "tier3_spotdl":
+            return "spotdl"
+        elif tier_name == "tier4_ytdlp_youtube":
+            return "ytdlp_yt"
+        elif tier_name == "tier5_ytdlp_soundcloud":
+            return "ytdlp_soundcloud"
+        else:
+            return tier_name
 
     # ── Tier 0: librespot (direct Spotify CDN) ───────────────────────────────
 

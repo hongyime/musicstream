@@ -68,6 +68,7 @@ class ServiceRateLimiter:
     CONFIGS: Dict[str, ServiceRateConfig] = {
         "spotify":      ServiceRateConfig(base=3.0,  max=3600, concurrent=10),
         "librespot":    ServiceRateConfig(base=5.0,  max=120,  concurrent=1),   # Tier 0: direct Spotify CDN, serialised
+        "spotiflac":    ServiceRateConfig(base=5.0,  max=300,  concurrent=2),   # Tier 1: lossless from other services
         "youtube":      ServiceRateConfig(base=4.0,  max=600,  concurrent=3),
         "ytmusicapi":   ServiceRateConfig(base=2.5,  max=300,  concurrent=5),
         "spotdl":       ServiceRateConfig(base=3.0,  max=180,  concurrent=3),
@@ -274,6 +275,7 @@ class ServiceThrottle:
         "youtube":    ThrottleConfig(floor=4.5, ceiling=60.0),   # random(4.5, 6.75)
         "soundcloud": ThrottleConfig(floor=1.5, ceiling=30.0),   # random(1.5, 2.25)
         "spotdl":     ThrottleConfig(floor=4.5, ceiling=60.0),   # random(4.5, 6.75)
+        "spotiflac":   ThrottleConfig(floor=5.0, ceiling=60.0),   # random(5.0, 7.5)
     }
 
     SKIP_THRESHOLD: float = 30.0  # seconds; skip tier rather than block longer

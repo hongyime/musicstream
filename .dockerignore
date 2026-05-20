@@ -1,0 +1,55 @@
+# Docker Build Ignore List
+
+# Dependencies
+**/node_modules/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Local data & media
+backups/
+logs/
+downloads/
+data/
+temp/
+plex/
+scrobbler/
+
+# Frontend build artifacts (we build these in the Dockerfile)
+frontend/dist/
+static/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+spotify_token.json
+librespot_credentials.json
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# IDEs and Tools
+.vscode/
+.idea/
+.claude/
+.codeflicker/
+.hypothesis/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.sourcery.yml
+.deepsource.toml
+
+# OS Files
+.DS_Store
+Thumbs.db
