@@ -289,6 +289,119 @@ class SpotifyScraper:
         logger.info("Incremental sync complete. Total new tracks: %d.", new_count)
         return new_count
 
+    # ── Targeted syncs (callable from scheduler / on-demand) ───────────────────
+
+    def saved_albums_sync(self, session: Session) -> int:
+        """Pull every Spotify Saved Album and upsert all its tracks. Returns new-track count.
+
+        Each album becomes a Source(source_type='album'); tracks are linked via
+        track_sources. Idempotent: re-running just adds whatever wasn't seen before.
+        """
+        new_count = 0
+        try:
+            saved_albums = self.get_saved_albums()
+        except Exception as exc:
+            logger.error("Saved-albums sync failed at fetch: %s", exc)
+            return 0
+
+        logger.info("saved_albums_sync: %d saved albums on Spotify", len(saved_albums))
+        for album in saved_albums:
+            album_obj = album.get("album", album)
+            album_id = album_obj.get("id")
+            if not album_id:
+                continue
+            album_name = album_obj.get("name", album_id)
+            album_source = self._get_or_create_source(
+                session,
+                spotify_id=f"album_{album_id}",
+                name=album_name,
+                source_type=SourceType.ALBUM.value,
+            )
+            try:
+                raw_tracks = self._album_to_track_items(album_obj)
+                added = self._upsert_tracks(session, raw_tracks, album_source)
+                new_count += added
+                self._update_source(session, album_source, snapshot_id=None, track_count=len(raw_tracks))
+                if added:
+                    logger.info("saved_albums_sync: '%s' +%d new tracks", album_name, added)
+            except Exception as exc:
+                logger.warning("saved_albums_sync: album '%s' failed: %s", album_name, exc)
+
+        logger.info("saved_albums_sync complete: %d new tracks", new_count)
+        return new_count
+
+    def followed_artists_sync(self, session: Session) -> int:
+        """Pull every followed artist's full discography and upsert all tracks.
+
+        Heaviest sync — one Spotify call per artist + one per album. Run weekly.
+        Each artist becomes a Source(source_type='artist'); de-duplication via
+        spotify_uri uniqueness on tracks.
+        """
+        new_count = 0
+        try:
+            artists = self.get_followed_artists()
+        except Exception as exc:
+            logger.error("Followed-artists sync failed at fetch: %s", exc)
+            return 0
+
+        logger.info("followed_artists_sync: %d followed artists", len(artists))
+        for artist in artists:
+            artist_id = artist.get("id")
+            if not artist_id:
+                continue
+            artist_name = artist.get("name", artist_id)
+            try:
+                added = self.expand_artist_discography(session, artist_id, artist_name)
+                new_count += added
+            except Exception as exc:
+                logger.warning("followed_artists_sync: artist '%s' failed: %s", artist_name, exc)
+
+        logger.info("followed_artists_sync complete: %d new tracks", new_count)
+        return new_count
+
+    def expand_artist_discography(
+        self,
+        session: Session,
+        artist_id: str,
+        artist_name: Optional[str] = None,
+    ) -> int:
+        """Pull every album for *artist_id* and upsert all tracks. Returns new-track count.
+
+        Used by both followed_artists_sync (every followed artist) and the
+        per-LB-track discography expansion (ad-hoc when LB recommends a new artist).
+        Idempotent: existing tracks via spotify_uri unique constraint.
+        """
+        artist_source = self._get_or_create_source(
+            session,
+            spotify_id=f"artist_{artist_id}",
+            name=artist_name or artist_id,
+            source_type=SourceType.ARTIST.value,
+        )
+        try:
+            albums = self.get_artist_albums(artist_id)
+        except Exception as exc:
+            logger.warning("expand_artist_discography: get_artist_albums(%s) failed: %s", artist_id, exc)
+            return 0
+
+        new_count = 0
+        artist_track_count = 0
+        for alb in albums:
+            try:
+                raw_tracks = self._album_to_track_items(alb)
+                added = self._upsert_tracks(session, raw_tracks, artist_source)
+                new_count += added
+                artist_track_count += len(raw_tracks)
+            except Exception as exc:
+                logger.debug("expand_artist_discography: album skipped: %s", exc)
+
+        self._update_source(session, artist_source, snapshot_id=None, track_count=artist_track_count)
+        if new_count:
+            logger.info(
+                "expand_artist_discography '%s': %d albums, %d tracks (%d new)",
+                artist_name or artist_id, len(albums), artist_track_count, new_count,
+            )
+        return new_count
+
     # ── Spotify API helpers ────────────────────────────────────────────────────
 
     def get_all_playlists(self) -> list[dict]:
