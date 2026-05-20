@@ -137,6 +137,14 @@ class FileOrganiser:
         # Persist to DB
         self._update_db(session, track, final_path, sha256, size, fmt)
 
+        # Sidecar artwork (cover.jpg in album dir, folder.jpg in artist dir).
+        # Plex/Jellyfin/most file browsers expect these as separate JPEGs even
+        # when the audio file already has embedded artwork. Non-fatal.
+        try:
+            self._write_sidecar_artwork(final_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Sidecar artwork write failed (non-fatal): %s", exc)
+
         # Trigger Plex refresh (non-fatal on failure)
         try:
             self._refresh_plex()
@@ -275,6 +283,47 @@ class FileOrganiser:
                 )
         except requests.RequestException as exc:
             logger.warning("Plex refresh request failed: %s", exc)
+
+    # ── Sidecar artwork ────────────────────────────────────────────────────────
+
+    def _write_sidecar_artwork(self, audio_path: str) -> None:
+        """Extract embedded artwork from *audio_path* and write Plex-style sidecar
+        files: ``cover.jpg`` in the album directory and ``folder.jpg`` in the
+        artist directory. Existing files are not overwritten so a higher-quality
+        replacement put there manually is preserved across re-runs.
+        """
+        from src.ingestion.artwork_checker import extract_first_artwork
+
+        try:
+            art_bytes = extract_first_artwork(audio_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("extract_first_artwork failed for %r: %s", audio_path, exc)
+            return
+
+        if not art_bytes:
+            logger.debug("No embedded artwork found in %r; skipping sidecars", audio_path)
+            return
+
+        album_dir = os.path.dirname(audio_path)
+        artist_dir = os.path.dirname(album_dir)
+
+        targets = [
+            (os.path.join(album_dir, "cover.jpg"), "album cover"),
+            (os.path.join(artist_dir, "folder.jpg"), "artist folder"),
+        ]
+
+        for target_path, label in targets:
+            if not target_path or os.path.dirname(target_path) in ("", os.sep, "/", "\\"):
+                continue
+            if os.path.exists(target_path):
+                logger.debug("Sidecar %s already exists at %r; preserving.", label, target_path)
+                continue
+            try:
+                with open(target_path, "wb") as fh:
+                    fh.write(art_bytes)
+                logger.info("Wrote %s sidecar: %s (%d bytes)", label, target_path, len(art_bytes))
+            except OSError as exc:
+                logger.warning("Could not write %s sidecar to %r: %s", label, target_path, exc)
 
     # ── DB update ──────────────────────────────────────────────────────────────
 

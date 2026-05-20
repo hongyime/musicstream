@@ -46,6 +46,7 @@ class TrackStatus(str, enum.Enum):
     DOWNLOADED        = "downloaded"
     FAILED            = "failed"
     FAILED_VALIDATION = "failed_validation"
+    TIMED_OUT         = "timed_out"
     MISSING           = "missing"
 
 

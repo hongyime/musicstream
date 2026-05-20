@@ -136,6 +136,125 @@ class MetadataTagger:
         self._rl = rate_limiter or ServiceRateLimiter()
         self._mb_session = requests.Session()
         self._mb_session.headers.update({"User-Agent": MB_USER_AGENT})
+        self._sp = None
+        self._sp_init_attempted = False
+
+    def _get_spotify_client(self):
+        """Lazy spotipy client for LB-track Spotify backfill. Returns None if
+        no Spotify credentials are configured or token cache is missing."""
+        if self._sp is not None or self._sp_init_attempted:
+            return self._sp
+        self._sp_init_attempted = True
+        try:
+            import spotipy  # type: ignore[import-untyped]
+            from spotipy.cache_handler import CacheFileHandler
+            from spotipy.oauth2 import SpotifyPKCE
+            client_id = os.environ.get("SPOTIFY_CLIENT_ID", "")
+            if not client_id:
+                logger.info("Spotify backfill disabled: SPOTIFY_CLIENT_ID unset")
+                return None
+            cache_path = os.environ.get("SPOTIFY_TOKEN_CACHE", "/app/spotify_token.json")
+            cache_handler = CacheFileHandler(cache_path=cache_path)
+            auth_manager = SpotifyPKCE(
+                client_id=client_id,
+                redirect_uri="http://127.0.0.1:8888/callback",
+                scope="user-library-read",
+                open_browser=False,
+                cache_handler=cache_handler,
+            )
+            if auth_manager.validate_token(auth_manager.get_cached_token()) is None:
+                logger.warning("Spotify backfill disabled: no valid token at %s", cache_path)
+                return None
+            self._sp = spotipy.Spotify(auth_manager=auth_manager)
+            logger.info("Spotify backfill client initialised for tagger")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not init Spotify backfill client: %s", exc)
+            self._sp = None
+        return self._sp
+
+    def _backfill_spotify_for_lb_track(self, track: Track, session: Session) -> None:
+        """For ListenBrainz-discovered tracks (spotify_uri starts with ``mb:``)
+        with no real Spotify metadata, search Spotify by title+artist and
+        populate cover_art_url, spotify_id, spotify_album_id, isrc, etc.
+
+        No-op for non-LB tracks or when no client is available.
+        """
+        if not track.spotify_uri or not track.spotify_uri.startswith("mb:"):
+            return
+        if track.cover_art_url and track.spotify_id:
+            return
+        if not (track.title and track.artist):
+            return
+
+        sp = self._get_spotify_client()
+        if sp is None:
+            return
+
+        query = f'track:"{track.title}" artist:"{track.artist}"'
+        try:
+            self._rl.wait("spotify", attempt=0)
+            resp = sp.search(q=query, type="track", limit=1, market="from_token")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Spotify backfill search failed for track %d: %s", track.id, exc)
+            return
+
+        items = ((resp or {}).get("tracks") or {}).get("items") or []
+        if not items:
+            logger.debug("Spotify backfill: no hit for %r — %r", track.title, track.artist)
+            return
+
+        item = items[0]
+        album = item.get("album") or {}
+        images = album.get("images") or []
+        cover_url = images[0].get("url") if images else None
+        spotify_id = item.get("id")
+        spotify_album_id = album.get("id")
+        external_ids = item.get("external_ids") or {}
+        isrc = external_ids.get("isrc")
+        track_number = item.get("track_number")
+        disc_number = item.get("disc_number")
+        duration_ms = item.get("duration_ms")
+        release_date = (album.get("release_date") or "")[:4] or None
+        album_name = album.get("name")
+
+        changed = False
+        if cover_url and not track.cover_art_url:
+            track.cover_art_url = cover_url
+            changed = True
+        if spotify_id and not track.spotify_id:
+            track.spotify_id = spotify_id
+            changed = True
+        if spotify_album_id and not track.spotify_album_id:
+            track.spotify_album_id = spotify_album_id
+            changed = True
+        if isrc and not track.isrc:
+            track.isrc = isrc
+            changed = True
+        if track_number and not track.track_number:
+            track.track_number = track_number
+            changed = True
+        if disc_number and not track.disc_number:
+            track.disc_number = disc_number
+            changed = True
+        if duration_ms and not track.duration_ms:
+            track.duration_ms = duration_ms
+            changed = True
+        if release_date and not track.year:
+            track.year = release_date
+            changed = True
+        if album_name and not track.album:
+            track.album = album_name
+            changed = True
+
+        if changed:
+            try:
+                session.flush()
+                logger.info(
+                    "Spotify backfill: track %d ('%s' — '%s') resolved to spotify_id=%s",
+                    track.id, track.title, track.artist, spotify_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("DB flush after Spotify backfill failed: %s", exc)
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -154,6 +273,14 @@ class MetadataTagger:
             raise TaggingError("mutagen is not installed; cannot write tags")
 
         result = TagResult()
+
+        # Step 0: backfill Spotify metadata for LB-discovered tracks (no-op for
+        # tracks already linked to a real Spotify ID). Populates cover_art_url
+        # so the cover-art fetch in Step 4 can succeed.
+        try:
+            self._backfill_spotify_for_lb_track(track, session)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Spotify backfill error for track %d: %s", track.id, exc)
 
         # ── Step 1: read yt-dlp embedded tags as fallback baseline ────────────
         ytdlp_tags = self._read_embedded_tags(file_path)
@@ -461,13 +588,26 @@ class MetadataTagger:
         best_recording_id: Optional[str] = None
         best_acoustid: Optional[str] = None
 
-        for result in results:
+        # acoustid.lookup() returns the raw API JSON: {"status": "ok", "results": [...]}.
+        # Iterating the dict directly yields its KEYS as strings (a footgun). Always
+        # drill into the "results" list, and accept either a list-of-results or that
+        # raw envelope so future pyacoustid behaviour shifts don't break us again.
+        if isinstance(results, dict):
+            results_list = results.get("results", []) or []
+        elif isinstance(results, list):
+            results_list = results
+        else:
+            results_list = []
+
+        for result in results_list:
+            if not isinstance(result, dict):
+                continue
             score = result.get("score", 0)
             if score < 0.5:
                 continue
             aid = result.get("id")
             recordings = result.get("recordings", [])
-            if recordings:
+            if recordings and isinstance(recordings[0], dict):
                 best_acoustid = aid
                 best_recording_id = recordings[0].get("id")
                 break
