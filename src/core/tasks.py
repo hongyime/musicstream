@@ -66,7 +66,7 @@ def integrity_check() -> None:
 
 def spotify_incremental_sync() -> None:
     """Run Spotify incremental sync and log new track count."""
-    logger.info("Running Spotify incremental sync…")
+    logger.info("Running Spotify incremental sync.")
     try:
         from src.db import get_session
         from src.ingestion.scraper import SpotifyScraper
@@ -76,6 +76,67 @@ def spotify_incremental_sync() -> None:
         logger.info("Spotify incremental sync complete: %d new tracks", new_tracks)
     except Exception as exc:
         logger.error("Spotify incremental sync failed: %s", exc, exc_info=True)
+
+
+def spotify_saved_albums_sync() -> None:
+    """Pull every Spotify Saved Album and upsert all its tracks."""
+    logger.info("Running Spotify saved-albums sync.")
+    try:
+        from src.db import get_session
+        from src.ingestion.scraper import SpotifyScraper
+        scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
+        with get_session() as session:
+            new_tracks = scraper.saved_albums_sync(session)
+        logger.info("Spotify saved-albums sync complete: %d new tracks", new_tracks)
+    except Exception as exc:
+        logger.error("Spotify saved-albums sync failed: %s", exc, exc_info=True)
+
+
+def spotify_followed_artists_sync() -> None:
+    """Pull every followed artist's full discography (heavy weekly sweep)."""
+    logger.info("Running Spotify followed-artists sync.")
+    try:
+        from src.db import get_session
+        from src.ingestion.scraper import SpotifyScraper
+        scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
+        with get_session() as session:
+            new_tracks = scraper.followed_artists_sync(session)
+        logger.info("Spotify followed-artists sync complete: %d new tracks", new_tracks)
+    except Exception as exc:
+        logger.error("Spotify followed-artists sync failed: %s", exc, exc_info=True)
+
+
+def maybe_run_full_backfill() -> int:
+    """One-time catch-up: if the DB has no album/artist sources yet, run a full
+    backfill so saved-albums and followed-artists data lands. Idempotent — once
+    the sources exist, this is a no-op on every subsequent boot.
+
+    Returns the number of new tracks ingested (0 if skipped).
+    """
+    try:
+        from src.db import get_session
+        from src.models import Source, SourceType
+        from src.ingestion.scraper import SpotifyScraper
+
+        with get_session() as session:
+            existing = (
+                session.query(Source)
+                .filter(Source.source_type.in_([SourceType.ALBUM.value, SourceType.ARTIST.value]))
+                .count()
+            )
+        if existing > 0:
+            logger.info("Full backfill skip: %d album/artist sources already exist", existing)
+            return 0
+
+        logger.info("Full backfill: no album/artist sources yet — running one-time catch-up")
+        scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
+        with get_session() as session:
+            new_tracks = scraper.full_backfill(session)
+        logger.info("Full backfill complete: %d new tracks", new_tracks)
+        return new_tracks
+    except Exception as exc:
+        logger.error("Full backfill failed (non-fatal): %s", exc, exc_info=True)
+        return 0
 
 def download_pipeline() -> tuple[int, int]:
     """Run the download pipeline for all pending tracks. Returns (downloaded, failed)."""
@@ -115,7 +176,7 @@ def download_pipeline() -> tuple[int, int]:
 
 def listenbrainz_discovery() -> None:
     """Run ListenBrainz discovery and Plex playlist sync."""
-    logger.info("Running ListenBrainz discovery…")
+    logger.info("Running ListenBrainz discovery.")
     try:
         from src.db import get_session
         from src.discovery.listenbrainz import ListenBrainzDiscovery
@@ -124,6 +185,12 @@ def listenbrainz_discovery() -> None:
         with get_session() as session:
             new_tracks = discovery.run(session)
         logger.info("ListenBrainz discovery complete: %d new tracks", new_tracks)
+
+        if new_tracks > 0 and os.environ.get("LB_ARTIST_EXPANSION", "true").lower() in ("1", "true", "yes", "on"):
+            try:
+                _expand_lb_track_artists()
+            except Exception as exc:
+                logger.warning("LB artist-discography expansion failed (non-fatal): %s", exc)
 
         # Sync Plex playlist for current month
         now = datetime.now(timezone.utc)
@@ -134,6 +201,80 @@ def listenbrainz_discovery() -> None:
             plex_sync.sync_discovery_playlist(session, month=month_name, year=year)
     except Exception as exc:
         logger.error("ListenBrainz discovery failed: %s", exc, exc_info=True)
+
+
+def _expand_lb_track_artists(lookback_hours: int = 24, max_artists: int = 50) -> None:
+    """For LB-discovered tracks (spotify_uri starts with 'mb:') ingested in the
+    last *lookback_hours*, search Spotify by artist name and pull that artist's
+    full discography. Skips artists who already have an ARTIST source.
+
+    Capped at *max_artists* unique artists per run to bound API usage.
+    """
+    from datetime import timedelta
+    from src.db import get_session
+    from src.models import Track, Source, SourceType
+    from src.ingestion.scraper import SpotifyScraper
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+    with get_session() as session:
+        recent_lb_artists = (
+            session.query(Track.artist)
+            .filter(Track.spotify_uri.like("mb:%"))
+            .filter(Track.created_at >= cutoff)
+            .distinct()
+            .limit(max_artists)
+            .all()
+        )
+        artist_names = [row[0] for row in recent_lb_artists if row[0]]
+
+        existing_artist_sources = {
+            s.name.strip().lower() if s.name else ""
+            for s in session.query(Source).filter(Source.source_type == SourceType.ARTIST.value).all()
+        }
+        new_artist_names = [n for n in artist_names if n.strip().lower() not in existing_artist_sources]
+
+    if not new_artist_names:
+        logger.info("LB artist expansion: nothing new to expand")
+        return
+
+    logger.info("LB artist expansion: resolving %d new artists via Spotify", len(new_artist_names))
+
+    try:
+        scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
+        sp = scraper.sp
+    except Exception as exc:
+        logger.warning("LB artist expansion: cannot init Spotify client: %s", exc)
+        return
+
+    total_new_tracks = 0
+    expanded = 0
+    for name in new_artist_names:
+        try:
+            search_resp = sp.search(q=f'artist:"{name}"', type="artist", limit=1)
+        except Exception as exc:
+            logger.debug("LB artist expansion: search failed for %r: %s", name, exc)
+            continue
+        items = ((search_resp or {}).get("artists") or {}).get("items") or []
+        if not items:
+            logger.debug("LB artist expansion: no Spotify match for %r", name)
+            continue
+        artist = items[0]
+        artist_id = artist.get("id")
+        artist_name = artist.get("name") or name
+        if not artist_id:
+            continue
+        try:
+            with get_session() as session:
+                added = scraper.expand_artist_discography(session, artist_id, artist_name)
+            total_new_tracks += added
+            expanded += 1
+        except Exception as exc:
+            logger.warning("LB artist expansion: expand_artist_discography(%r) failed: %s", artist_name, exc)
+
+    logger.info(
+        "LB artist expansion complete: expanded %d/%d artists, %d new tracks queued",
+        expanded, len(new_artist_names), total_new_tracks,
+    )
 
 def db_backup() -> Optional[str]:
     """Run pg_dump and prune old backups."""

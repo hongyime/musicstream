@@ -68,10 +68,13 @@ services:
       - ./logs:/app/logs
       - ./backups:/app/backups
       # data/ persists librespot credential blob across rebuilds.
-      # gitignored — never committed. Created by daemon on first librespot auth.
+      # gitignored - never committed. Created by daemon on first librespot auth.
       - ./data:/app/data
-    # cookies.txt and spotify_token.json are baked into the image via COPY . .
-    # File bind-mounts with spaces in the host path fail on Docker Desktop / WSL2.
+      # Bind-mount token files so OAuth refresh + browser-callback writes
+      # persist across image rebuilds. Earlier code baked these via COPY but
+      # .dockerignore now excludes them; mount is the durable path.
+      - ./spotify_token.json:/app/spotify_token.json
+      - ./cookies.txt:/app/cookies.txt
     ports:
       - "9079:9079"
     environment:

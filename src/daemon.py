@@ -96,6 +96,9 @@ async def _background_startup():
         logger.info("Step 5/9: Running Spotify incremental sync…")
         await asyncio.to_thread(tasks.spotify_incremental_sync)
 
+        logger.info("Step 5b/9: One-time full backfill (saved albums + followed artists) if needed…")
+        await asyncio.to_thread(tasks.maybe_run_full_backfill)
+
         logger.info("Step 6/9: Running download pipeline…")
         run_id = await asyncio.to_thread(tasks._record_run_start, "startup")
         dl, fail = await asyncio.to_thread(tasks.download_pipeline)
@@ -151,6 +154,8 @@ async def _broadcast_health():
 
 def _register_scheduler_jobs():
     scheduler.add_job(tasks.spotify_incremental_sync, "cron", minute="*/15", id="spotify_sync", replace_existing=True)
+    scheduler.add_job(tasks.spotify_saved_albums_sync, "cron", hour="*/6", id="saved_albums_sync", replace_existing=True)
+    scheduler.add_job(tasks.spotify_followed_artists_sync, "cron", day_of_week="sun", hour=6, id="followed_artists_sync", replace_existing=True)
     scheduler.add_job(tasks.full_download_pipeline, "cron", hour=3, id="download_pipeline", replace_existing=True)
     scheduler.add_job(tasks.listenbrainz_discovery, "cron", hour=4, id="lb_discovery", replace_existing=True)
     scheduler.add_job(tasks.full_integrity_check, "cron", day_of_week="wed,sun", hour=5, id="integrity_check", replace_existing=True)
