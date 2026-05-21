@@ -255,6 +255,29 @@ async def trigger_sync():
     await asyncio.to_thread(tasks.spotify_incremental_sync)
     return ApiResponse(data={"queued": True})
 
+@app.post("/api/musicstream/full-backfill")
+async def trigger_full_backfill():
+    """Run the one-time catch-up: saved albums + followed artists' discographies.
+    Heavy. Returns immediately; check /api/musicstream/stats for progress."""
+    _bg = asyncio.create_task(asyncio.to_thread(tasks.maybe_run_full_backfill))
+    _background_tasks.add(_bg)
+    _bg.add_done_callback(_background_tasks.discard)
+    return ApiResponse(data={"queued": True, "watch": "/api/musicstream/stats"})
+
+@app.post("/api/musicstream/saved-albums-sync")
+async def trigger_saved_albums():
+    _bg = asyncio.create_task(asyncio.to_thread(tasks.spotify_saved_albums_sync))
+    _background_tasks.add(_bg)
+    _bg.add_done_callback(_background_tasks.discard)
+    return ApiResponse(data={"queued": True})
+
+@app.post("/api/musicstream/followed-artists-sync")
+async def trigger_followed_artists():
+    _bg = asyncio.create_task(asyncio.to_thread(tasks.spotify_followed_artists_sync))
+    _background_tasks.add(_bg)
+    _bg.add_done_callback(_background_tasks.discard)
+    return ApiResponse(data={"queued": True})
+
 @app.post("/api/musicstream/integrity")
 async def trigger_integrity():
     await asyncio.to_thread(tasks.integrity_check)
@@ -307,30 +330,42 @@ async def spotify_login(request: Request):
     auth_manager = _get_auth_manager(fresh=True)
     auth_url = auth_manager.get_authorize_url()
     logger.info("Initiating Spotify OAuth: %s", auth_url)
-    return RedirectResponse(auth_url)
+    # 303 (See Other) forces GET on the redirect target. RedirectResponse's
+    # default 307 preserves method, so a POST from the dashboard form would
+    # POST to accounts.spotify.com/authorize and trigger Spotify's "Oops!"
+    # error page (it only serves GET there).
+    return RedirectResponse(auth_url, status_code=303)
 
 @app.get("/auth/spotify/callback")
 async def spotify_callback(code: str = None, error: str = None):
+    import urllib.parse as _up
     if error:
         logger.error("Spotify callback returned error: %s", error)
-        return RedirectResponse("/?error=" + error)
+        return RedirectResponse("/?error=" + _up.quote(error))
 
     if not code:
         logger.warning("Spotify callback hit without code or error")
         return RedirectResponse("/?error=no_code")
 
     auth_manager = _get_auth_manager()
+    print(f"[OAUTH] callback code received len={len(code)} verifier_present={hasattr(auth_manager, 'code_verifier') and bool(auth_manager.code_verifier)}", flush=True)
     try:
-        token = await asyncio.to_thread(auth_manager.get_access_token, code, False, False)
+        token = await asyncio.to_thread(auth_manager.get_access_token, code, False)
         if token:
-            scope = token.get("scope", "") if isinstance(token, dict) else ""
+            cached = auth_manager.get_cached_token() or {}
+            scope = cached.get("scope", "") if isinstance(cached, dict) else ""
+            print(f"[OAUTH] exchange OK; cached_scope={scope!r}", flush=True)
             logger.info("Spotify token successfully obtained via UI flow. scope=%r", scope)
             return RedirectResponse("/?auth=ok")
-        logger.error("Spotify token exchange returned None")
+        print("[OAUTH] exchange returned None", flush=True)
         return RedirectResponse("/?error=token_none")
     except Exception as exc:
+        import traceback as _tb
+        tb_text = _tb.format_exc()
+        print(f"[OAUTH] EXCHANGE FAILED: {type(exc).__name__}: {exc}\n{tb_text}", flush=True)
         logger.error("Failed to exchange Spotify code: %s", exc, exc_info=True)
-        return RedirectResponse("/?error=exchange_failed")
+        msg = f"{type(exc).__name__}: {exc}"[:200]
+        return RedirectResponse("/?error=" + _up.quote(msg))
 
 @app.get("/api/musicstream/auth/status")
 async def get_auth_status(request: Request):
