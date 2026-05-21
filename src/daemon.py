@@ -279,24 +279,32 @@ async def reset_failed():
 _SCOPES = "playlist-read-private playlist-read-collaborative user-library-read user-follow-read user-read-recently-played"
 _REDIRECT_URI = "http://127.0.0.1:9079/auth/spotify/callback"
 
-def _get_auth_manager():
-    """Create a fresh SpotifyPKCE manager for the OAuth flow."""
-    # Use PKCE (like scraper.py) for the browser flow
-    return SpotifyPKCE(
-        client_id=SPOTIFY_CLIENT_ID,
-        redirect_uri=_REDIRECT_URI,
-        scope=_SCOPES,
-        cache_handler=CacheFileHandler(cache_path=SPOTIFY_TOKEN_CACHE),
-        open_browser=False
-    )
+# Single in-flight auth_manager kept alive between /auth/spotify/login and
+# /auth/spotify/callback so the PKCE code_verifier generated at login time is
+# the same one used at exchange time. Without this, each request rebuilt the
+# manager and the exchange failed silently with code_verifier mismatch.
+_active_auth_manager: Optional[SpotifyPKCE] = None
+
+def _get_auth_manager(*, fresh: bool = False) -> SpotifyPKCE:
+    """Reuse the active SpotifyPKCE instance unless *fresh* is set (login start)."""
+    global _active_auth_manager
+    if _active_auth_manager is None or fresh:
+        _active_auth_manager = SpotifyPKCE(
+            client_id=SPOTIFY_CLIENT_ID,
+            redirect_uri=_REDIRECT_URI,
+            scope=_SCOPES,
+            cache_handler=CacheFileHandler(cache_path=SPOTIFY_TOKEN_CACHE),
+            open_browser=False,
+        )
+    return _active_auth_manager
 
 @app.api_route("/auth/spotify/login", methods=["GET", "POST"])
 async def spotify_login(request: Request):
     if not SPOTIFY_CLIENT_ID:
         logger.error("Spotify login failed: SPOTIFY_CLIENT_ID missing")
         raise HTTPException(status_code=500, detail="SPOTIFY_CLIENT_ID missing")
-    
-    auth_manager = _get_auth_manager()
+
+    auth_manager = _get_auth_manager(fresh=True)
     auth_url = auth_manager.get_authorize_url()
     logger.info("Initiating Spotify OAuth: %s", auth_url)
     return RedirectResponse(auth_url)
@@ -307,20 +315,22 @@ async def spotify_callback(code: str = None, error: str = None):
         logger.error("Spotify callback returned error: %s", error)
         return RedirectResponse("/?error=" + error)
 
-    if code:
-        try:
-            auth_manager = _get_auth_manager()
-            # This exchange requires the code_verifier stored in the auth_manager state
-            # but since we are stateless between requests, let's try to just exchange it.
-            token = await asyncio.to_thread(auth_manager.get_access_token, code)
-            if token:
-                logger.info("Spotify token successfully obtained via UI flow.")
-            else:
-                logger.error("Spotify token exchange returned None.")
-        except Exception as e:
-            logger.error("Failed to exchange Spotify code: %s", exc_info=True)
-    
-    return RedirectResponse("/")
+    if not code:
+        logger.warning("Spotify callback hit without code or error")
+        return RedirectResponse("/?error=no_code")
+
+    auth_manager = _get_auth_manager()
+    try:
+        token = await asyncio.to_thread(auth_manager.get_access_token, code, False, False)
+        if token:
+            scope = token.get("scope", "") if isinstance(token, dict) else ""
+            logger.info("Spotify token successfully obtained via UI flow. scope=%r", scope)
+            return RedirectResponse("/?auth=ok")
+        logger.error("Spotify token exchange returned None")
+        return RedirectResponse("/?error=token_none")
+    except Exception as exc:
+        logger.error("Failed to exchange Spotify code: %s", exc, exc_info=True)
+        return RedirectResponse("/?error=exchange_failed")
 
 @app.get("/api/musicstream/auth/status")
 async def get_auth_status(request: Request):
