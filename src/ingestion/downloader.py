@@ -70,6 +70,12 @@ if SPOTIFLAC_AVAILABLE:
 # SpotiFLAC serialisation — streaming services return 429 under concurrent load.
 _SPOTIFLAC_SEMAPHORE = threading.Semaphore(2)
 
+# Librespot serialisation — single Spotify streaming session per account, parallel
+# stream loads cause 90s timeouts and circuit-breaker trips. Force strictly serial
+# librespot use across all workers; other tiers (SpotiFLAC, yt-dlp, spotdl) stay
+# parallel so the worker pool isn't bottlenecked when librespot is skipped.
+_LIBRESPOT_SEMAPHORE = threading.Semaphore(1)
+
 
 def _get_librespot_session():
     """Return the shared librespot Session, creating it on first call."""
@@ -697,34 +703,38 @@ class DownloadOrchestrator:
 
         try:
             _librespot_auth_ok = False
-            session = _get_librespot_session()
-            _librespot_auth_ok = True
+            with _LIBRESPOT_SEMAPHORE:
+                session = _get_librespot_session()
+                _librespot_auth_ok = True
 
-            track_id = _TrackId.from_uri(track.spotify_uri)
-            stream = session.content_feeder().load(
-                track_id,
-                _VorbisQuality(_AudioQuality.VERY_HIGH),
-                False,
-                None,
-            )
+                track_id = _TrackId.from_uri(track.spotify_uri)
+                stream = session.content_feeder().load(
+                    track_id,
+                    _VorbisQuality(_AudioQuality.VERY_HIGH),
+                    False,
+                    None,
+                )
 
-            # Write OGG Vorbis to temp file
-            out_dir = os.path.join(TEMP_DIR, f"librespot_{track.id}_{uuid.uuid4().hex[:8]}")
-            os.makedirs(out_dir, exist_ok=True)
-            ogg_path = os.path.join(out_dir, f"{uuid.uuid4().hex}.ogg")
+                # Write OGG Vorbis to temp file
+                out_dir = os.path.join(TEMP_DIR, f"librespot_{track.id}_{uuid.uuid4().hex[:8]}")
+                os.makedirs(out_dir, exist_ok=True)
+                ogg_path = os.path.join(out_dir, f"{uuid.uuid4().hex}.ogg")
 
-            with open(ogg_path, "wb") as fh:
-                while True:
-                    chunk = stream.input_stream.stream().read(65536)
-                    if not chunk:
-                        break
-                    fh.write(chunk)
+                with open(ogg_path, "wb") as fh:
+                    while True:
+                        chunk = stream.input_stream.stream().read(65536)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
 
-            if not os.path.exists(ogg_path) or os.path.getsize(ogg_path) < 1024:
-                logger.warning("librespot: empty stream for track %d ('%s')", track.id, track.title)
-                self._rate_limiter.record_failure("librespot")
-                return None
+                if not os.path.exists(ogg_path) or os.path.getsize(ogg_path) < 1024:
+                    logger.warning("librespot: empty stream for track %d ('%s')", track.id, track.title)
+                    self._rate_limiter.record_failure("librespot")
+                    return None
 
+            # FFmpeg conversion is CPU-bound, not librespot-session-bound — release
+            # the semaphore here so the next worker can start streaming while this
+            # one transcodes.
             # Convert OGG → MP3 320k
             mp3_path = ogg_path.replace(".ogg", ".mp3")
             import subprocess as _sp
