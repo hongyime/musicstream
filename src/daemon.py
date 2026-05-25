@@ -489,9 +489,18 @@ def _get_auth_manager(*, fresh: bool = False) -> SpotifyPKCE:
 @app.api_route(
     "/auth/spotify/login",
     methods=["GET", "POST"],
-    dependencies=[Depends(require_auth)],
 )
 async def spotify_login(request: Request):
+    # NOTE: This route is intentionally NOT gated by `require_auth`.
+    # It's the OAuth bootstrap — the browser hits it as a top-level
+    # navigation (window.location = "/auth/spotify/login"), so there's
+    # no opportunity to attach an Authorization header.  The protection
+    # surface here is the Spotify OAuth flow itself: Spotify only
+    # redirects to our pre-registered callback URI, and the callback
+    # validates the code against a fresh PKCE code_verifier we hold
+    # in-process for the lifetime of this single login attempt.
+    # Anyone who hits /auth/spotify/login can ONLY trigger a redirect
+    # to accounts.spotify.com — not authenticate as someone else.
     if not SPOTIFY_CLIENT_ID:
         logger.error("Spotify login failed: SPOTIFY_CLIENT_ID missing")
         raise HTTPException(status_code=500, detail="SPOTIFY_CLIENT_ID missing")
