@@ -8,25 +8,24 @@ import json
 import logging
 import logging.handlers
 import os
+import secrets as _secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends, Header
 from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from apscheduler.schedulers.background import BackgroundScheduler
-import spotipy
 from spotipy.cache_handler import CacheFileHandler
-from spotipy.oauth2 import SpotifyOAuth, SpotifyPKCE
+from spotipy.oauth2 import SpotifyPKCE
 
-from src.schemas.responses import ApiResponse, TrackStats, HealthStatus
+from src.schemas.responses import ApiResponse, TrackStats
 from src.ws.manager import manager
 from src.core.config import (
-    LOG_DIR, TIMEZONE, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, 
-    SPOTIFY_TOKEN_CACHE, DISABLE_DOWNLOADS, MAX_CONCURRENT_WORKERS
+    LOG_DIR, TIMEZONE, SPOTIFY_CLIENT_ID, SPOTIFY_TOKEN_CACHE, DAEMON_API_TOKEN,
 )
 import src.core.tasks as tasks
 
@@ -34,19 +33,74 @@ import src.core.tasks as tasks
 
 def _configure_logging() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    fmt = logging.Formatter("%(asctime)s %(levelname)-8s %(name)s — %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    # Audit #33: custom formatter that defensively injects track_id when
+    # missing. The filter approach (TrackContextFilter) covers the loggers
+    # we own, but uvicorn replaces its own handlers AFTER our setup runs
+    # — those records reach us without the field set, blowing up the
+    # standard Formatter with KeyError. Subclassing format() is the only
+    # bulletproof way to guarantee the field exists at format time.
+    class _TrackIDSafeFormatter(logging.Formatter):
+        def format(self, record: logging.LogRecord) -> str:  # noqa: A003
+            if not hasattr(record, "track_id"):
+                from src.logging_context import current_track_id
+                tid = current_track_id()
+                record.track_id = tid if tid is not None else "-"
+            return super().format(record)
+
+    fmt = _TrackIDSafeFormatter(
+        "%(asctime)s %(levelname)-8s %(name)s [%(track_id)s] — %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     root = logging.getLogger()
     root.setLevel(logging.INFO)
+
+    # Filter at root for our own loggers — keeps the contextvar lookup
+    # cheap on the hot path.
+    from src.logging_context import TrackContextFilter
+    track_filter = TrackContextFilter()
+    root.addFilter(track_filter)
     
     # Console handler
     console = logging.StreamHandler()
     console.setFormatter(fmt)
+    console.addFilter(track_filter)
     root.addHandler(console)
     
-    # File handler
-    ms_handler = logging.handlers.RotatingFileHandler(LOG_DIR / "musicstream.log", maxBytes=5*1024*1024, backupCount=3)
+    # Main rotating file handler — INFO and above, 5 MB × 3 backups.
+    ms_handler = logging.handlers.RotatingFileHandler(
+        LOG_DIR / "musicstream.log", maxBytes=5*1024*1024, backupCount=3,
+        encoding="utf-8",
+    )
     ms_handler.setFormatter(fmt)
+    ms_handler.addFilter(track_filter)
     root.addHandler(ms_handler)
+
+    # Dedicated errors handler (audit #21). Without this an WARNING/ERROR
+    # spike from yt-dlp / spotdl blows past the 5 MB cap and overwrites
+    # earlier real errors that the operator needs for diagnosis. The
+    # errors-only file rotates independently at 2 MB × 5 backups so the
+    # post-mortem record is preserved across long noisy windows.
+    err_handler = logging.handlers.RotatingFileHandler(
+        LOG_DIR / "errors.log", maxBytes=2*1024*1024, backupCount=5,
+        encoding="utf-8",
+    )
+    err_handler.setFormatter(fmt)
+    err_handler.setLevel(logging.WARNING)
+    err_handler.addFilter(track_filter)
+    root.addHandler(err_handler)
+
+    # Uvicorn keeps its own loggers (`uvicorn`, `uvicorn.access`,
+    # `uvicorn.error`) which have propagate=True by default but ALSO
+    # carry their own StreamHandler that ships records to stderr.  Those
+    # records bypass the root's filter chain.  Attach the filter to
+    # uvicorn's loggers explicitly so even their own handlers see a
+    # populated `track_id` field.
+    for uvi_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        uvi_logger = logging.getLogger(uvi_name)
+        uvi_logger.addFilter(track_filter)
+        for handler in uvi_logger.handlers:
+            handler.addFilter(track_filter)
 
 _configure_logging()
 logger = logging.getLogger("musicstream.daemon")
@@ -56,6 +110,40 @@ logger = logging.getLogger("musicstream.daemon")
 scheduler = BackgroundScheduler(timezone=TIMEZONE)
 _start_time = time.time()
 _background_tasks: set = set()  # Strong refs to fire-and-forget tasks; asyncio only holds weakrefs and will GC unsupervised tasks mid-flight.
+
+# ── Credential permission audit ───────────────────────────────────────────────
+
+_CREDENTIAL_FILES_TO_AUDIT = [
+    SPOTIFY_TOKEN_CACHE,
+    "/app/data/librespot_credentials.json",
+    "/app/cookies.txt",
+]
+
+
+def _audit_credential_permissions() -> None:
+    """Warn (don't fail) when credential files are world- or group-readable.
+
+    Bind-mounts inherit host umask. A token file at 0644 is readable by
+    every user/process on the host with access to the directory — including
+    monitoring sidecars, log scrapers, and unprivileged users on shared
+    hosts. We log loudly so operators see it; we don't refuse to start
+    because tightening the mode often requires host-level work the user
+    can't do from inside the container.
+    """
+    for path in _CREDENTIAL_FILES_TO_AUDIT:
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except OSError as exc:
+            logger.debug("permission audit: cannot stat %r: %s", path, exc)
+            continue
+        if mode & 0o077:  # any group or world bit set
+            logger.warning(
+                "Credential file %r has permissive mode %#o — recommend `chmod 600 %s` "
+                "(group/world bits are set; secrets are exposed to other users on the host).",
+                path, mode, path,
+            )
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
@@ -85,6 +173,13 @@ async def lifespan(app: FastAPI):
 async def _background_startup():
     """Run the 9-step startup sequence in the background."""
     try:
+        # Permission audit on credential files. Bind-mounted secrets often
+        # come over from the host with permissive mode bits because Docker
+        # inherits the host's umask. We don't *enforce* a tight mode (many
+        # users mount these from non-root accounts where chmod is awkward),
+        # but we DO log a clear warning so the operator can fix it.
+        _audit_credential_permissions()
+
         logger.info("Step 3/9: Skipping legacy banner (UI-only now)")
 
         if os.environ.get("SKIP_STARTUP_INTEGRITY", "true").lower() in ("1", "true", "yes", "on"):
@@ -124,6 +219,47 @@ async def _background_startup():
 
 app = FastAPI(title="Musicstream API", lifespan=lifespan)
 
+# ── Auth (Bearer token) ───────────────────────────────────────────────────────
+#
+# DAEMON_API_TOKEN guards every mutating endpoint. SPEC §B13 required this and
+# audit finding #6 confirmed the token was defined but never enforced — every
+# POST was reachable by any tailnet host.
+#
+# Behaviour:
+#   - DAEMON_API_TOKEN unset      → fail closed: HTTP 503 on protected routes.
+#                                   Read-only GETs still serve so the dashboard
+#                                   keeps working when an operator is mid-setup.
+#   - Header missing              → HTTP 401
+#   - Header wrong                → HTTP 403
+#   - Header right                → request proceeds
+#
+# Comparison uses `secrets.compare_digest` to avoid leaking the token via
+# response timing on long mismatches. The `Authorization: Bearer <token>`
+# header is the single source of truth — there is no cookie fallback, no
+# query-string fallback (the latter would re-introduce the very leak we
+# fixed for Plex in #8).
+
+def require_auth(authorization: Optional[str] = Header(default=None)) -> None:
+    """FastAPI dependency: enforce DAEMON_API_TOKEN bearer auth."""
+    if not DAEMON_API_TOKEN:
+        # Fail closed — refuse to mutate state without an operator-set token.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "DAEMON_API_TOKEN is not configured on the server. "
+                "Set it in the daemon environment to enable mutating endpoints."
+            ),
+        )
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    # Accept "Bearer <token>" only (case-insensitive scheme).
+    parts = authorization.split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Authorization must be 'Bearer <token>'")
+    presented = parts[1].strip()
+    if not _secrets.compare_digest(presented, DAEMON_API_TOKEN):
+        raise HTTPException(status_code=403, detail="Invalid token")
+
 # ── Background Tasks ──────────────────────────────────────────────────────────
 
 async def _broadcast_health():
@@ -162,6 +298,35 @@ def _register_scheduler_jobs():
     scheduler.add_job(tasks.db_backup, "cron", day_of_week="sun", hour=5, id="db_backup", replace_existing=True)
 
 # ── API Routes ────────────────────────────────────────────────────────────────
+
+@app.get("/health", include_in_schema=False)
+async def health():
+    """Audit #32: liveness probe used by Docker healthcheck + uptime checks.
+
+    Intentionally unauthenticated — Docker's HEALTHCHECK and external
+    monitors must reach this without credentials. We deliberately do NOT
+    surface internal state (DB row counts, queue depth, scheduler job IDs)
+    here; that's reconnaissance. Just returns a structural OK plus a
+    DB-reachable boolean so an outage in postgres trips the probe.
+    """
+    from src.db import get_session
+    db_ok = False
+    try:
+        with get_session() as s:
+            # SELECT 1 is the lightest-weight liveness check that still
+            # round-trips through the connection pool.
+            s.execute(__import__("sqlalchemy").text("SELECT 1"))
+            db_ok = True
+    except Exception:
+        db_ok = False
+    payload = {"status": "ok" if db_ok else "degraded", "db": db_ok}
+    # Return 503 when degraded so HEALTHCHECK actually marks the container
+    # unhealthy instead of cheerfully reporting 200 + `db: false`.
+    if not db_ok:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=503, content=payload)
+    return payload
+
 
 @app.get("/api/musicstream/stats", response_model=ApiResponse[TrackStats])
 async def get_stats():
@@ -250,12 +415,12 @@ async def get_metrics():
     except Exception as e:
         return ApiResponse(error=str(e))
 
-@app.post("/api/musicstream/sync")
+@app.post("/api/musicstream/sync", dependencies=[Depends(require_auth)])
 async def trigger_sync():
     await asyncio.to_thread(tasks.spotify_incremental_sync)
     return ApiResponse(data={"queued": True})
 
-@app.post("/api/musicstream/full-backfill")
+@app.post("/api/musicstream/full-backfill", dependencies=[Depends(require_auth)])
 async def trigger_full_backfill():
     """Run the one-time catch-up: saved albums + followed artists' discographies.
     Heavy. Returns immediately; check /api/musicstream/stats for progress."""
@@ -264,26 +429,26 @@ async def trigger_full_backfill():
     _bg.add_done_callback(_background_tasks.discard)
     return ApiResponse(data={"queued": True, "watch": "/api/musicstream/stats"})
 
-@app.post("/api/musicstream/saved-albums-sync")
+@app.post("/api/musicstream/saved-albums-sync", dependencies=[Depends(require_auth)])
 async def trigger_saved_albums():
     _bg = asyncio.create_task(asyncio.to_thread(tasks.spotify_saved_albums_sync))
     _background_tasks.add(_bg)
     _bg.add_done_callback(_background_tasks.discard)
     return ApiResponse(data={"queued": True})
 
-@app.post("/api/musicstream/followed-artists-sync")
+@app.post("/api/musicstream/followed-artists-sync", dependencies=[Depends(require_auth)])
 async def trigger_followed_artists():
     _bg = asyncio.create_task(asyncio.to_thread(tasks.spotify_followed_artists_sync))
     _background_tasks.add(_bg)
     _bg.add_done_callback(_background_tasks.discard)
     return ApiResponse(data={"queued": True})
 
-@app.post("/api/musicstream/integrity")
+@app.post("/api/musicstream/integrity", dependencies=[Depends(require_auth)])
 async def trigger_integrity():
     await asyncio.to_thread(tasks.integrity_check)
     return ApiResponse(data={"queued": True})
 
-@app.post("/api/musicstream/tracks/reset-failed")
+@app.post("/api/musicstream/tracks/reset-failed", dependencies=[Depends(require_auth)])
 async def reset_failed():
     from src.db import get_session
     from src.models import Track, TrackStatus
@@ -321,7 +486,11 @@ def _get_auth_manager(*, fresh: bool = False) -> SpotifyPKCE:
         )
     return _active_auth_manager
 
-@app.api_route("/auth/spotify/login", methods=["GET", "POST"])
+@app.api_route(
+    "/auth/spotify/login",
+    methods=["GET", "POST"],
+    dependencies=[Depends(require_auth)],
+)
 async def spotify_login(request: Request):
     if not SPOTIFY_CLIENT_ID:
         logger.error("Spotify login failed: SPOTIFY_CLIENT_ID missing")
@@ -388,7 +557,7 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        await manager.disconnect(websocket)
 
 # ── Static Files ──────────────────────────────────────────────────────────────
 

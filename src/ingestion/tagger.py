@@ -17,11 +17,16 @@ Rate limiting:
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
+import shutil
+import socket
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 from sqlalchemy.orm import Session
@@ -113,6 +118,150 @@ class TagResult:
     mb_recording_id:     Optional[str] = None
     mb_release_id:       Optional[str] = None
     acoustid_id:         Optional[str] = None
+
+
+# ── SSRF guard ────────────────────────────────────────────────────────────────
+#
+# All outbound HTTP for cover art / external metadata routes through this
+# guard. We resolve the host to its IP via socket.getaddrinfo and refuse if
+# any resolved address is in a private/loopback/link-local/multicast/reserved
+# range. This blocks the standard SSRF attack surface:
+#   - 127.0.0.0/8 (loopback)
+#   - 10/172.16/192.168 (RFC1918)
+#   - 169.254.0.0/16 (link-local + cloud metadata 169.254.169.254)
+#   - ::1, fc00::/7, fe80::/10 (IPv6 equivalents)
+#
+# Only http/https are allowed as schemes. file://, gopher://, etc. are out.
+
+def _ip_is_safe(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _ssrf_safe(url: str) -> bool:
+    """Return True if *url* is http(s) and resolves only to public IPs."""
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:  # noqa: BLE001
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = parsed.hostname
+    if not host:
+        return False
+    # If the host is already an IP literal, validate directly — getaddrinfo
+    # would return it unchanged but being explicit avoids surprises.
+    try:
+        ipaddress.ip_address(host)
+        return _ip_is_safe(host)
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        ip = info[4][0]
+        if not _ip_is_safe(ip):
+            return False
+    return True
+
+
+def _ssrf_safe_get(url: str, *, timeout: int = 15, max_redirects: int = 5):
+    """GET a URL, validating every redirect hop with the SSRF guard."""
+    current = url
+    for _ in range(max_redirects + 1):
+        if not _ssrf_safe(current):
+            logger.warning("SSRF guard rejected %r; aborting fetch chain", current)
+            return None
+        resp = requests.get(current, timeout=timeout, allow_redirects=False)
+        if resp.is_redirect or resp.is_permanent_redirect:
+            loc = resp.headers.get("Location")
+            if not loc:
+                return resp
+            # Resolve relative redirects against the current URL.
+            from urllib.parse import urljoin
+            current = urljoin(current, loc)
+            continue
+        return resp
+    logger.warning("SSRF guard: too many redirects from %r", url)
+    return None
+
+
+# ── Atomic save helper ────────────────────────────────────────────────────────
+
+def _atomic_mutagen_save(audio, file_path: str) -> None:
+    """Write mutagen tags to *file_path* atomically.
+
+    mutagen's ``audio.save()`` rewrites the file in place. SIGKILL / power
+    loss / OOM during the rewrite truncates the file's header or leaves
+    the frame index pointing past EOF — corrupting an otherwise-good
+    audio file beyond recovery.
+
+    We protect against that by:
+      1. copying the original to a sibling temp file (preserves perms +
+         the audio data mutagen needs to read back),
+      2. invoking ``audio.save(tmp_path)`` — mutagen writes the new frames
+         to the COPY,
+      3. fsync'ing the temp file,
+      4. ``os.replace`` (atomic rename within the same dir) over the
+         original.
+
+    A SIGKILL at any point either leaves the original intact (steps 1–3)
+    or fully replaces it (step 4 is atomic on POSIX and on NTFS for
+    same-volume renames). The temp file is cleaned up on every error
+    path.
+    """
+    src = Path(file_path)
+    dir_ = src.parent
+
+    # tempfile.mkstemp gives us a unique filename in the SAME directory
+    # — required for os.replace to be atomic. We don't actually use the
+    # fd it returns (mutagen will reopen by path); close it immediately.
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{src.name}.tagging.",
+        dir=str(dir_),
+    )
+    os.close(fd)
+
+    try:
+        # Copy bytes + permissions. mutagen reads existing frames from
+        # the file before rewriting, so the temp must start as a faithful
+        # copy of the source.
+        shutil.copy2(file_path, tmp_path)
+
+        # Mutagen rewrites the temp in place — corruption here only ever
+        # touches the temp, never the original.
+        audio.save(tmp_path)
+
+        # fsync so the bytes are durable before we swap.
+        with open(tmp_path, "rb") as fh:
+            os.fsync(fh.fileno())
+
+        # Atomic swap. On POSIX os.replace is atomic; on Windows it is
+        # atomic for files on the same volume (which is always the case
+        # here since we created the temp in the same directory).
+        os.replace(tmp_path, file_path)
+    except Exception:
+        # Best-effort cleanup; never raise from cleanup.
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 # ── Main tagger class ─────────────────────────────────────────────────────────
@@ -637,13 +786,25 @@ class MetadataTagger:
         Priority:
           1. Spotify album image URL (track.cover_art_url)
           2. Cover Art Archive /release/{mb_release_id}/front-250
+
+        SSRF guard: any URL must use https and resolve to a public IP that
+        is NOT in any private/loopback/link-local range. Both Spotify and
+        Cover Art Archive serve from public CDNs so legitimate fetches are
+        unaffected; SSRF attempts pointed at 127.0.0.1, 169.254.169.254
+        (cloud metadata), or RFC1918 hosts are rejected before the GET.
         """
         # 1. Spotify URL
         if track.cover_art_url:
             try:
-                resp = requests.get(track.cover_art_url, timeout=15)
-                if resp.status_code == 200 and resp.content:
-                    return resp.content
+                if _ssrf_safe(track.cover_art_url):
+                    resp = requests.get(track.cover_art_url, timeout=15, allow_redirects=False)
+                    if resp.status_code == 200 and resp.content:
+                        return resp.content
+                else:
+                    logger.warning(
+                        "Refusing to fetch cover art from %r — SSRF guard rejected URL",
+                        track.cover_art_url,
+                    )
             except requests.RequestException as exc:
                 logger.debug("Spotify cover art fetch failed: %s", exc)
 
@@ -653,8 +814,11 @@ class MetadataTagger:
             self._rl.wait("coverart", attempt=0)
             url = f"{CAA_BASE}/release/{release_id}/front-250"
             try:
-                resp = requests.get(url, timeout=15, allow_redirects=True)
-                if resp.status_code == 200 and resp.content:
+                # CAA-internal redirects to archive.org are expected and
+                # safe; we still validate that each redirect target survives
+                # the SSRF guard.
+                resp = _ssrf_safe_get(url, timeout=15, max_redirects=5)
+                if resp is not None and resp.status_code == 200 and resp.content:
                     return resp.content
             except requests.RequestException as exc:
                 logger.debug("Cover Art Archive fetch failed: %s", exc)
@@ -718,7 +882,7 @@ class MetadataTagger:
                 data=tags.cover_art,
             )
 
-        audio.save(file_path)
+        _atomic_mutagen_save(audio, file_path)
 
     def _tag_flac(self, file_path: str, tags: TagData) -> None:
         """Write Vorbis comment tags to a FLAC file using mutagen."""
@@ -755,7 +919,7 @@ class MetadataTagger:
             audio.clear_pictures()
             audio.add_picture(pic)
 
-        audio.save()
+        _atomic_mutagen_save(audio, file_path)
 
     def _tag_m4a(self, file_path: str, tags: TagData) -> None:
         """Write MP4 atom tags to an M4A/MP4 file using mutagen."""
@@ -786,7 +950,7 @@ class MetadataTagger:
         if tags.cover_art:
             audio["covr"] = [MP4Cover(tags.cover_art, imageformat=MP4Cover.FORMAT_JPEG)]
 
-        audio.save()
+        _atomic_mutagen_save(audio, file_path)
 
     def _tag_ogg(self, file_path: str, tags: TagData) -> None:
         """Write Vorbis comment tags to an OGG Vorbis file using mutagen."""
@@ -807,7 +971,7 @@ class MetadataTagger:
         if tags.track_number is not None:
             audio["tracknumber"] = [str(tags.track_number)]
 
-        audio.save()
+        _atomic_mutagen_save(audio, file_path)
 
     def _tag_opus(self, file_path: str, tags: TagData) -> None:
         """Write Vorbis comment tags to an Opus file using mutagen."""
@@ -828,7 +992,7 @@ class MetadataTagger:
         if tags.track_number is not None:
             audio["tracknumber"] = [str(tags.track_number)]
 
-        audio.save()
+        _atomic_mutagen_save(audio, file_path)
 
     # ── Album artist rule (§7.3.1) ─────────────────────────────────────────────
 

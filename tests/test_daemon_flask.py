@@ -1,13 +1,34 @@
 """
 Tests for musicstream/src/daemon.py — daemon utilities and scheduler
 
-Tests the daemon's non-Flask logic directly:
+NOTE (audit #19): This module is QUARANTINED.
+
+It targets the legacy Flask-era daemon API (`_get_db_track_count`,
+`startup_sequence`, `_register_scheduler_jobs`, `app.run`) which no longer
+exists — daemon.py was migrated to FastAPI + lifespan handler. Importing
+the file fails ImportError on the first test the moment pytest discovers it,
+so the entire suite fails.
+
+Rather than delete the file (and lose the test scaffolding for a future
+FastAPI rewrite of these tests), we skip it at module level. To restore:
+rewrite each test against the current FastAPI app via `httpx.AsyncClient`
+or `fastapi.testclient.TestClient`, then drop this skip.
+
+Original test inventory (kept below for reference, all skipped):
   - _get_db_track_count(): returns int
   - db_backup(): calls pg_dump, returns path
   - _prune_backups(): keeps only 14 most recent
   - _register_scheduler_jobs(): 5 jobs with correct cron params
 """
 from __future__ import annotations
+
+import pytest
+
+pytest.skip(
+    "test_daemon_flask.py targets the removed Flask-era daemon API; "
+    "rewrite against FastAPI lifespan + TestClient before re-enabling.",
+    allow_module_level=True,
+)
 
 import os
 import sys

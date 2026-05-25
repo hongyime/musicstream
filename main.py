@@ -300,8 +300,19 @@ def cmd_integrity(_args: argparse.Namespace) -> None:
 # ── Daemon command ─────────────────────────────────────────────────────────────
 
 def cmd_daemon(_args: argparse.Namespace) -> None:
-    """Start the musicstream daemon (APScheduler + Flask control plane)."""
-    import threading
+    """Start the musicstream daemon (APScheduler + FastAPI control plane).
+
+    Audit #16: previous implementation called ``daemon_module.app.run(...)``
+    which assumes Flask. The daemon was migrated to FastAPI but main.py was
+    never updated — running ``musicstream daemon`` raised AttributeError on
+    ``app.run`` and the daemon never came up via this entrypoint. Production
+    used ``docker-compose`` → ``uvicorn src.daemon:app`` directly, masking
+    the bug from the deployed system but breaking every local-dev workflow.
+    Also: the second startup_sequence thread was redundant — FastAPI's
+    lifespan handler runs the same sequence under the proper event loop.
+
+    Fix: launch uvicorn programmatically pointing at ``src.daemon:app``.
+    """
     print_header("Daemon")
     try:
         from src.db import init_db, run_migrations, wait_for_db
@@ -313,10 +324,16 @@ def cmd_daemon(_args: argparse.Namespace) -> None:
         print_error("Database unavailable. Check DATABASE_URL.")
         sys.exit(1)
     try:
-        from src import daemon as daemon_module
-        t = threading.Thread(target=daemon_module.startup_sequence, daemon=True)
-        t.start()
-        daemon_module.app.run(host="0.0.0.0", port=9079, threaded=True)
+        import uvicorn
+        # Lifespan handler in src.daemon will run the startup_sequence on
+        # the event loop — no extra thread needed.
+        uvicorn.run(
+            "src.daemon:app",
+            host="0.0.0.0",
+            port=int(os.environ.get("DAEMON_PORT", "9079")),
+            log_level="info",
+            access_log=True,
+        )
     except Exception:
         logger.exception("Daemon failed to start")
         print_error("Daemon failed. See logs/daemon.log for details.")

@@ -50,8 +50,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Iterable, Optional
 
-from sqlalchemy import select, update
-from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 # Path bootstrapping when run as a stand-alone script
 _HERE = Path(__file__).resolve()

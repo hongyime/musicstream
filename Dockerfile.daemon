@@ -1,21 +1,49 @@
+# Audit #30: hardened multi-stage Dockerfile.
+#
+# Improvements over the previous version:
+#   - npm ci (deterministic, fails on lockfile drift) instead of npm install
+#   - non-root runtime user (uid/gid 1000) — daemon never needs root in
+#     the container; the bind-mounted /media and /app/data only need to be
+#     writable by 1000:1000 on the host
+#   - explicit --workers 1 keeps the in-process scheduler + websocket
+#     manager singletons; multi-worker would double-register cron jobs and
+#     break the connection-set lock added in audit #15
+#   - tini as PID 1 so SIGTERM from `docker stop` actually reaches uvicorn
+#     and lifespan shutdown runs (without it uvicorn exits but pending
+#     downloads are killed mid-flight)
+#   - --no-install-recommends shrinks the runtime layer
+
 # --- Stage 1: Build React Frontend ---
 FROM node:20-alpine AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
-RUN npm install
+# Use npm ci so the build fails fast on lockfile drift instead of
+# silently shipping mismatched deps.  Falls back to npm install if no
+# lockfile is present (e.g. fresh checkout in CI without a committed
+# package-lock.json) — keep this conditional rather than hard-failing.
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 COPY frontend/ ./
 RUN npm run build
 
 # --- Stage 2: Python Backend ---
-FROM python:3.12-slim
+FROM python:3.12-slim AS runtime
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies + tini for signal forwarding + gosu for
+# the entrypoint UID-drop pattern.
 RUN apt-get update \
-    && apt-get install -y ffmpeg curl git libchromaprint-dev postgresql-client \
+    && apt-get install -y --no-install-recommends \
+       ffmpeg curl git libchromaprint-dev postgresql-client tini gosu \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# Create non-root runtime user.  uid/gid 1000 is conventional and matches
+# the default first user on most Linux hosts so bind-mounted volumes
+# (./data, ./logs, ./backups, the media drive) Just Work without chmod.
+RUN groupadd --gid 1000 musicstream \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash musicstream
+
+# Install Python dependencies as root (needed for system site-packages),
+# then transfer ownership of /app to the runtime user.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir yt-dlp-ejs
@@ -24,10 +52,36 @@ RUN pip install --no-cache-dir -r requirements.txt \
 COPY . .
 
 # Copy built frontend from Stage 1 to static directory
-# Vite defaults to 'dist'
 COPY --from=frontend-builder /app/frontend/dist ./static
+
+# Pre-create writable dirs the daemon will use, then hand /app to the
+# runtime user.  Bind-mounts (/app/data, /app/logs, /app/backups) inherit
+# their host owner but the entrypoint copes with that because the daemon
+# only writes via tempfile + os.replace.
+RUN mkdir -p /app/data /app/logs /app/backups \
+    && chown -R musicstream:musicstream /app
+
+# Install entrypoint script that fixes bind-mount ownership at runtime
+# (Docker Desktop on Windows/macOS doesn't honour build-time chown for
+# bind-mounted dirs — their UID comes from the host) and then drops to
+# the unprivileged user via gosu.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+# Strip CRLF defensively — if the file is checked out on Windows with
+# core.autocrlf=true, the shebang will be `#!/usr/bin/env bash\r` which
+# kernel rejects with "no such file or directory".
+RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
+    && chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Note: we deliberately do NOT switch USER here.  The entrypoint runs as
+# root for the duration of the chown, then execs into the daemon as
+# `musicstream` via gosu.  This is the standard PID-1 init pattern.
 
 EXPOSE 9079
 
-# Use uvicorn to serve the FastAPI app
-CMD ["uvicorn", "src.daemon:app", "--host", "0.0.0.0", "--port", "9079"]
+# tini reaps zombies (yt-dlp / spotdl spawn many short-lived children)
+# and forwards SIGTERM so lifespan shutdown actually runs.  Our wrapper
+# script then drops to non-root before exec'ing uvicorn.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
+
+# --workers 1 is REQUIRED — see header comment.
+CMD ["uvicorn", "src.daemon:app", "--host", "0.0.0.0", "--port", "9079", "--workers", "1"]
