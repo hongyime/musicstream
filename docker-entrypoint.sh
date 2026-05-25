@@ -32,6 +32,24 @@ for d in /app/logs /app/backups /app/data; do
     fi
 done
 
+# OAuth token cache files are bind-mounted as individual files, NOT
+# directories — the loop above misses them.  Spotipy/spotdl rewrite
+# these in place after every refresh, so they MUST be writable by the
+# runtime user.  Without this fix, a fresh OAuth flow logs
+# "[OAUTH] exchange OK" but Spotipy silently fails the cache write
+# (PermissionError, eaten by its CacheFileHandler) and the next request
+# loads the stale on-disk token — manifesting as "needs_auth" forever.
+for f in /app/spotify_token.json /app/cookies.txt; do
+    if [ -e "$f" ]; then
+        chown "$RUNTIME_UID:$RUNTIME_GID" "$f" 2>/dev/null || true
+        # Also relax mode to 0644 for files that came in as 0600 owned by
+        # someone else.  Cookies/tokens are secrets but they're already
+        # bind-mounted into a single-tenant container — host-side perms
+        # are what matter.
+        chmod u+rw "$f" 2>/dev/null || true
+    fi
+done
+
 # Drop to non-root via gosu and exec — exec keeps us as PID 1 child of
 # tini (which is the real PID 1 from the Dockerfile ENTRYPOINT).
 exec gosu "$RUNTIME_USER" "$@"
