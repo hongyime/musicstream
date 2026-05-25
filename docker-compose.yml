@@ -1,6 +1,8 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    # Audit #31: pin minor version explicitly.  `postgres:16-alpine` floats —
+    # a silent base-image bump can break extensions or change locale behaviour.
+    image: postgres:16.4-alpine
     container_name: musicstream-postgres
     environment:
       POSTGRES_DB: musicstream
@@ -9,8 +11,13 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     restart: unless-stopped
+    # Audit #31: drop ambient capabilities + lock down the security profile.
+    # Postgres runs as its own UID inside the image so it doesn't need any
+    # of the SUID dance in the default seccomp profile.
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U musicstream"]
       interval: 10s
@@ -102,6 +109,16 @@ services:
       # Worker concurrency for parallel downloads (default: 12 - MAXIMUM SPEED 🚀)
       # 12 workers = 3x faster than original 4 workers. Monitor for rate limits!
       - MAX_CONCURRENT_WORKERS=${MAX_CONCURRENT_WORKERS:-12}
+      # Audit #6/#28: Bearer token enforced on all mutating endpoints.
+      # Daemon refuses to start (503 on every protected route) unless this
+      # is set, so it MUST be present in your .env.  See .env.example for
+      # how to generate a strong value.  DAEMON_DEV_NOAUTH=*** opt-in
+      # bypass for local dev only — never set in production.
+      - DAEMON_API_TOKEN=${DAEMON_API_TOKEN}
+      - DAEMON_DEV_NOAUTH=***
+      # Audit #13: persisted throttle state (rate-limiter backoff history)
+      # so a daemon restart doesn't reset cooldowns and re-trigger 429s.
+      - THROTTLE_STATE_PATH=/app/data/throttle_state.json
       # Container-internal mount point for the media drive — always /media
       # regardless of the host path in EXTERNAL_MEDIA_DRIVE.
       - MEDIA_DIR=/media
@@ -111,6 +128,18 @@ services:
       - 1.1.1.1
       - 8.8.8.8
     restart: unless-stopped
+    # Audit #31: prevent runtime privilege escalation; the daemon is now
+    # non-root via Dockerfile USER directive and never legitimately
+    # needs setuid binaries.
+    security_opt:
+      - no-new-privileges:true
+    # Audit #31: cap memory so a runaway tagger / ffmpeg loop OOMs the
+    # daemon container without taking the whole host with it.  Tune to
+    # taste — 2G is generous given typical ingestion working sets.
+    deploy:
+      resources:
+        limits:
+          memory: 2G
     depends_on:
       postgres:
         condition: service_healthy

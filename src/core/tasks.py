@@ -1,9 +1,7 @@
 import logging
 import os
 import subprocess
-import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 from src.core.config import LOG_DIR, BACKUP_DIR, MAX_BACKUPS, DISABLE_DOWNLOADS, SPOTIFY_CLIENT_ID
@@ -301,7 +299,8 @@ def db_backup() -> Optional[str]:
         result = subprocess.run(_pg_cmd, env=_pg_env, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
             logger.error("pg_dump failed (exit %d): %s", result.returncode, result.stderr[:500])
-            if backup_path.exists(): backup_path.unlink()
+            if backup_path.exists():
+                backup_path.unlink()
             return None
     except Exception as exc:
         logger.error("pg_dump error: %s", exc, exc_info=True)
@@ -399,7 +398,8 @@ def _record_run_complete(run_id: Optional[int] = None, downloaded: int = 0, fail
                 run.tracks_failed = failed
                 run.tracks_scraped = scraped
                 run.tracks_requeued = requeued
-                if notes: run.notes = notes
+                if notes:
+                    run.notes = notes
                 session.commit()
     except Exception as exc:
         logger.warning("Could not record run completion: %s", exc)

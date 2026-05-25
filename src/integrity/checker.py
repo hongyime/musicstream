@@ -159,30 +159,45 @@ class IntegrityChecker:
                     result.ok += 1
                     continue
 
-                # Hash mismatch: update stored hash and log — do NOT reset to pending.
-                # Legitimate operations (retag, format conversion) change the hash.
-                # Resetting to pending would cause unnecessary re-downloads.
-                errors_logger.warning(
-                    "[HASH_CHANGED]  %s | %s | %s | was=%s | now=%s",
+                # Hash mismatch: TREAT AS CORRUPTION.
+                #
+                # Previously this branch silently overwrote the stored hash and
+                # counted the file as OK, on the theory that legitimate retags
+                # change the hash. That theory is wrong here: the tagger writes
+                # the hash AFTER tagging finishes (organiser/tagger handshake),
+                # so the integrity checker should never see a legitimate-retag
+                # mismatch. Anything that hits this branch is bit-rot, partial
+                # write from a SIGKILL'd tagger, or tampering — none of which
+                # we want to silently accept.
+                #
+                # We do NOT overwrite track.file_sha256: the original hash is
+                # forensic evidence. We mark the track failed so it re-enters
+                # the download queue on the next pass. Operators who know a
+                # legitimate retag happened can manually clear file_sha256 to
+                # force a re-record on the next integrity run (the
+                # "no stored hash yet" branch above handles that case).
+                errors_logger.error(
+                    "[FILE_CORRUPT]  %s | %s | %s | expected=%s | got=%s",
                     track.title,
                     track.artist,
                     file_path,
                     expected_hash,
                     actual_hash,
                 )
-                logger.warning(
-                    "Hash changed for track %d (%r by %r): updating stored hash "
-                    "(was=%s… now=%s…) — file likely re-tagged",
+                logger.error(
+                    "Hash mismatch on track %d (%r by %r): expected=%s… got=%s… "
+                    "— marking corrupt, will re-download",
                     track.id,
                     track.title,
                     track.artist,
                     expected_hash[:12],
                     actual_hash[:12],
                 )
-                track.file_sha256 = actual_hash
+                # Do NOT mutate file_sha256 — keep original for forensics.
+                track.status = "pending"
                 track.last_checked_at = now
                 session.add(track)
-                result.ok += 1
+                result.corrupt += 1
                 continue
 
             # ── 3. All good ────────────────────────────────────────────────────

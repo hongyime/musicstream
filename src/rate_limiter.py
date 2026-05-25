@@ -9,7 +9,9 @@ Services covered (PRD §11):
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import random
 import threading
 import time
@@ -280,12 +282,65 @@ class ServiceThrottle:
 
     SKIP_THRESHOLD: float = 30.0  # seconds; skip tier rather than block longer
 
+    # Persistence: where to snapshot the current min_gap per service so an
+    # AIMD backoff state survives daemon restarts. Without this, every
+    # restart drops back to the floor, hammering remote services straight
+    # into rate-limit responses again. (audit #13)
+    _PERSIST_PATH: str = os.environ.get(
+        "THROTTLE_STATE_PATH", "/app/data/throttle_state.json"
+    )
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._state: Dict[str, _ThrottleState] = {
             svc: _ThrottleState(min_gap=cfg.floor)
             for svc, cfg in self.CONFIGS.items()
         }
+        self._restore()
+
+    def _restore(self) -> None:
+        """Best-effort load of last-known min_gap values from disk."""
+        try:
+            if not os.path.exists(self._PERSIST_PATH):
+                return
+            with open(self._PERSIST_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            for svc, payload in data.items():
+                if svc not in self._state:
+                    continue
+                gap = float(payload.get("min_gap", self.CONFIGS[svc].floor))
+                # Clamp to configured floor/ceiling in case the persisted file
+                # was written under a different config.
+                gap = max(self.CONFIGS[svc].floor, min(self.CONFIGS[svc].ceiling, gap))
+                self._state[svc].min_gap = gap
+            logger.info(
+                "Throttle: restored min_gap state from %s (%d services)",
+                self._PERSIST_PATH, len(data),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Throttle: failed to restore state from %s: %s",
+                           self._PERSIST_PATH, exc)
+
+    def _persist(self) -> None:
+        """Best-effort write of current min_gap values to disk.
+
+        Uses atomic-rename so a SIGKILL mid-write can't corrupt the file.
+        Caller MUST hold self._lock.
+        """
+        try:
+            os.makedirs(os.path.dirname(self._PERSIST_PATH) or ".", exist_ok=True)
+            payload = {
+                svc: {"min_gap": state.min_gap}
+                for svc, state in self._state.items()
+            }
+            tmp = f"{self._PERSIST_PATH}.tmp.{os.getpid()}"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self._PERSIST_PATH)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Throttle: persist failed (non-fatal): %s", exc)
 
     def wait(self, service: str) -> bool:
         """
@@ -341,6 +396,9 @@ class ServiceThrottle:
                 "Throttle backoff: service=%s %.1fs → %.1fs",
                 service, old, state.min_gap,
             )
+            # Persist on backoff only — successes are common (would be a hot
+            # path), backoffs are rare and important to survive restarts.
+            self._persist()
 
     def status(self) -> Dict[str, Dict[str, float]]:
         """Current throttle gaps for all services (monitoring/debug)."""

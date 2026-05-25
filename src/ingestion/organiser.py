@@ -81,6 +81,15 @@ class FileOrganiser:
         self._plex_token = plex_token
         self._plex_section_id = plex_section_id
 
+        # Build a requests.Session that puts the Plex token in the
+        # X-Plex-Token HEADER instead of the URL query string. SPEC §B15:
+        # tokens in URLs leak into proxy/access logs, container stdout when
+        # curl -v is wired up, and into Plex server access logs.
+        self._http = requests.Session()
+        if plex_token:
+            self._http.headers.update({"X-Plex-Token": plex_token})
+        self._http.headers.update({"Accept": "application/json"})
+
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def organise(self, temp_path: str, track: Track, session: Session) -> str:
@@ -121,21 +130,87 @@ class FileOrganiser:
                 f"Cannot create directory for {final_path!r}: {exc}"
             ) from exc
 
-        # Move file
+        # ── Filesystem orphan check ───────────────────────────────────────────
+        # _resolve_collision only checks the DB. A file may already exist at
+        # final_path with no DB row pointing at it (a previous crashed run, a
+        # manual `mv`, etc.). On the same filesystem shutil.move becomes
+        # os.rename which silently overwrites — destroying the user's file.
+        # Quarantine any orphan to <name>.orphan-<unix_ts> instead.
+        if os.path.exists(final_path):
+            import time
+            quarantine_path = f"{final_path}.orphan-{int(time.time())}"
+            logger.warning(
+                "Orphan file at destination %r (no DB row owns it); "
+                "quarantining to %r before move",
+                final_path, quarantine_path,
+            )
+            try:
+                os.rename(final_path, quarantine_path)
+            except OSError as exc:
+                raise OrganiserError(
+                    f"Refusing to overwrite orphan at {final_path!r}; "
+                    f"could not quarantine: {exc}"
+                ) from exc
+
+        # ── Atomic move + DB commit ────────────────────────────────────────────
+        # Original code: shutil.move(); compute sha256; _update_db(); commit
+        # implicitly by caller. A SIGKILL between move and commit leaves the
+        # file at final_path with the DB row still pointing at the temp path
+        # (or with stale state) — orphan + duplicate-download on retry.
+        #
+        # New ordering: move → compute sha → update_db → flush → commit. If
+        # ANY step before flush raises, we move the file BACK to temp_path
+        # so the next run sees a clean retry. If flush+commit fails, we ALSO
+        # move it back. Only after a successful commit is the move "real".
+        #
+        # Cross-filesystem move pitfall: `shutil.move()` falls back to
+        # copy2() + unlink() when src/dst are on different mounts.  Both
+        # copy2 (timestamps + mode + xattrs) AND copy (mode only) call
+        # os.chmod, which raises EPERM on bind-mounted exFAT/SMB volumes
+        # even when the data write succeeds.  Verified at runtime:
+        # only shutil.copyfile (data-only, no metadata) survives.  We
+        # don't need mtime/mode preservation for media files anyway —
+        # tagger sets them as part of metadata write.
         try:
-            shutil.move(temp_path, final_path)
+            shutil.move(temp_path, final_path, copy_function=shutil.copyfile)
             logger.info("Moved %r → %r", temp_path, final_path)
         except (OSError, shutil.Error) as exc:
             raise OrganiserError(
                 f"Failed to move {temp_path!r} to {final_path!r}: {exc}"
             ) from exc
 
-        # Compute SHA-256 from the FINAL file at its FINAL path
-        sha256 = self._compute_sha256(final_path)
-        size = os.path.getsize(final_path)
-
-        # Persist to DB
-        self._update_db(session, track, final_path, sha256, size, fmt)
+        try:
+            sha256 = self._compute_sha256(final_path)
+            size = os.path.getsize(final_path)
+            self._update_db(session, track, final_path, sha256, size, fmt)
+            # Force the SQL UPDATE to flush so we know the DB will accept it
+            # while the file is still recoverable.
+            session.flush()
+            session.commit()
+        except Exception:
+            # Roll the file back to temp so the caller's retry path can pick
+            # up where it left off. Best-effort — if even the rollback fails,
+            # log loudly and re-raise; the file is now "stuck" but at least
+            # the operator gets a clear signal.
+            logger.error(
+                "Post-move step failed for track %d; rolling file back from "
+                "%r to %r so next run can retry cleanly",
+                track.id, final_path, temp_path,
+            )
+            try:
+                if os.path.exists(final_path):
+                    os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+                    # Same EPERM-on-metadata defence as the forward move:
+                    # copy_function=shutil.copyfile (data-only).
+                    shutil.move(final_path, temp_path, copy_function=shutil.copyfile)
+                session.rollback()
+            except Exception as rollback_exc:  # noqa: BLE001
+                logger.critical(
+                    "Rollback move failed for track %d: file at %r, "
+                    "temp %r, rollback err=%s — manual intervention required",
+                    track.id, final_path, temp_path, rollback_exc,
+                )
+            raise
 
         # Sidecar artwork (cover.jpg in album dir, folder.jpg in artist dir).
         # Plex/Jellyfin/most file browsers expect these as separate JPEGs even
@@ -258,7 +333,7 @@ class FileOrganiser:
         Sends::
 
             GET http://{plex_url}/library/sections/{section_id}/refresh
-                ?X-Plex-Token={token}
+              with X-Plex-Token in the request HEADER (NOT the URL).
 
         A non-2xx response is logged as a warning but does NOT raise an
         exception — a Plex refresh failure must never abort the pipeline.
@@ -266,9 +341,9 @@ class FileOrganiser:
         url = (
             f"{self._plex_url}/library/sections/{self._plex_section_id}/refresh"
         )
-        params = {"X-Plex-Token": self._plex_token}
         try:
-            resp = requests.get(url, params=params, timeout=10)
+            # Token comes from self._http session headers, not URL params.
+            resp = self._http.get(url, timeout=10)
             if resp.ok:
                 logger.info(
                     "Plex library section %s refresh triggered (HTTP %s).",

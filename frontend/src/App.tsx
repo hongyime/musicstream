@@ -19,6 +19,7 @@ import { MetricCard } from './components/MetricCard';
 import { DataTable } from './components/DataTable';
 import { StatusBadge } from './components/StatusBadge';
 import { Button } from './components/Button';
+import { TokenPrompt } from './components/TokenPrompt';
 import { musicstreamService } from './services/api';
 import { useHealthWS, type ServiceHealth } from './hooks/useHealthWS';
 
@@ -87,10 +88,16 @@ function App() {
     },
   });
 
+  // Audit #26: keep stale data on transient errors so the banner does
+  // not flicker every refetch.  The banner is binary (authenticated or
+  // not) — flashing it draws the operator's eye to a non-event.
   const { data: authStatus } = useQuery({
     queryKey: ['auth-status'],
     queryFn: musicstreamService.getAuthStatus,
     refetchInterval: 10000,
+    retry: 1,
+    placeholderData: (prev) => prev,
+    staleTime: 8000,
   });
 
   const sidebarItems = [
@@ -108,6 +115,16 @@ function App() {
       case 'dashboard':
         return (
           <>
+            {/* Audit #25: token entry sits at the top so a fresh tab can
+                authenticate before any other query has a chance to fail. */}
+            <div className="col-span-12 mb-4">
+              <TokenPrompt
+                onTokenChange={() => {
+                  // Re-validate everything when the token changes.
+                  queryClient.invalidateQueries();
+                }}
+              />
+            </div>
             {authStatus?.status !== 'authenticated' && (
               <div className="col-span-12 mb-6">
                 <div className="bg-error/10 border border-error/20 rounded-lg p-6">

@@ -75,41 +75,41 @@ def main():
             print(f"  Album: '{track.album}'")
             
             # Check if track exists on Spotify
-            print(f"  Checking Spotify...")
+            print("  Checking Spotify...")
             exists = check_spotify_exists(track.spotify_id)
             
             if exists:
-                print(f"  ✅ EXISTS on Spotify - keep track (metadata was empty but track is valid)")
+                print("  ✅ EXISTS on Spotify - keep track (metadata was empty but track is valid)")
                 # Note: We could update metadata here, but since they have no artist/album,
                 # better to leave them and let re-scraping fix them
                 # Or delete and re-scrape
             else:
-                print(f"  ❌ NOT FOUND on Spotify - will DELETE")
+                print("  ❌ NOT FOUND on Spotify - will DELETE")
                 to_delete.append(track.spotify_id)
         
         print("\n" + "=" * 80)
-        print(f"SUMMARY")
+        print("SUMMARY")
         print("=" * 80)
         print(f"Total invalid tracks: {len(invalid_tracks)}")
         print(f"Tracks to DELETE (not on Spotify): {len(to_delete)}")
         print(f"Tracks to UPDATE (exist on Spotify): {len(to_update)}")
         
         if to_delete:
-            print(f"\nTracks to be deleted:")
+            print("\nTracks to be deleted:")
             for spotify_id in to_delete:
                 tracks = [t for t in invalid_tracks if t.spotify_id == spotify_id]
                 for t in tracks:
                     print(f"  - [{t.id}] {t.title} (ID: {t.spotify_id})")
             
             print(f"\n⚠️  Would you like to DELETE {len(to_delete)} tracks?")
-            print(f"   (This is IRREVERSIBLE!)")
+            print("   (This is IRREVERSIBLE!)")
             print(f"   Run: session.query(Track).filter(Track.spotify_id.in_({to_delete})).delete()")
         
         if to_update:
-            print(f"\nTracks that exist but have empty metadata:")
+            print("\nTracks that exist but have empty metadata:")
             for track in to_update:
                 print(f"  - [{track.id}] {track.title} (ID: {track.spotify_id})")
-            print(f"   Consider re-scraping these with: python main.py scrape")
+            print("   Consider re-scraping these with: python main.py scrape")
 
 
 if __name__ == "__main__":

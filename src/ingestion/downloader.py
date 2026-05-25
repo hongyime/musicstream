@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -183,6 +185,12 @@ class DownloadOrchestrator:
         self._throttle = ServiceThrottle()
         os.makedirs(TEMP_DIR, exist_ok=True)
 
+        # Track ephemeral cookies copies so they can be cleaned at exit.
+        # Each yt-dlp call creates one if cookies.txt is read-only (Docker
+        # bind-mount); without explicit tracking they accumulate forever.
+        # (audit #20)
+        self._tmp_cookie_files: set[str] = set()
+
         # Lazy-init tagger and organiser from env vars.
         # Imported here to avoid circular imports at module level.
         from src.ingestion.tagger import MetadataTagger
@@ -216,9 +224,25 @@ class DownloadOrchestrator:
         # Tracks left in DOWNLOADING from a previous crashed/restarted run are
         # permanently stuck — no worker will pick them up again.  Reset them here
         # before querying PENDING so they re-enter the queue this run.
+        #
+        # CRITICAL race fix (audit #11): the previous version reset EVERY row
+        # in DOWNLOADING state. If two scheduler runs (or a manual /sync
+        # trigger landing on top of a cron-run) overlapped, the second run
+        # would yank tracks out from under workers in the FIRST run, causing
+        # double downloads, orphaned temp files, and DB UPDATE conflicts.
+        #
+        # Fix: only reset rows whose updated_at is older than the worker
+        # heartbeat window (default 30 min). A live worker bumps updated_at
+        # on each tier transition + on success/failure — anything older than
+        # 30 min is provably crashed.
+        from datetime import datetime, timedelta, timezone
+        stuck_cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
         stuck = (
             session.execute(
-                select(Track).where(Track.status == TrackStatus.DOWNLOADING.value)
+                select(Track).where(
+                    Track.status == TrackStatus.DOWNLOADING.value,
+                    Track.updated_at < stuck_cutoff,
+                )
             )
             .scalars()
             .all()
@@ -227,7 +251,10 @@ class DownloadOrchestrator:
             for t in stuck:
                 t.status = TrackStatus.PENDING.value
             session.flush()
-            logger.info("Reset %d stuck DOWNLOADING tracks to PENDING", len(stuck))
+            logger.info(
+                "Reset %d stuck DOWNLOADING tracks (updated_at < %s) to PENDING",
+                len(stuck), stuck_cutoff.isoformat(),
+            )
 
         pending_tracks = (
             session.execute(
@@ -474,9 +501,39 @@ class DownloadOrchestrator:
         Returns:
             True if the track was successfully downloaded, False otherwise.
         """
-        # Mark as downloading
-        track.status = TrackStatus.DOWNLOADING.value
-        session.flush()
+        # Audit #33: bind track_id to the logging context for the entire
+        # tier chain. Every log line emitted by tagger / organiser / rate
+        # limiter / ffmpeg subprocess wrapper inherits the contextvar so
+        # `grep "\[42\]" logs/musicstream.log` returns this track's full
+        # ingestion timeline.
+        from src.logging_context import track_context
+        with track_context(track.id):
+            return self._download_track_inner(track, session, tiers_override)
+
+    def _download_track_inner(self, track: Track, session: Session, tiers_override=None) -> bool:
+        # Atomic claim (audit #12): convert from "set status; flush" (which
+        # any two workers could both win) to a conditional UPDATE that only
+        # succeeds if the row is STILL pending. If rowcount==0 another
+        # worker beat us — return False so the caller skips it.
+        from sqlalchemy import update
+        result = session.execute(
+            update(Track)
+            .where(
+                Track.id == track.id,
+                Track.status == TrackStatus.PENDING.value,
+            )
+            .values(status=TrackStatus.DOWNLOADING.value)
+        )
+        if result.rowcount == 0:
+            logger.debug(
+                "Track %d already claimed by another worker (status changed) — skipping",
+                track.id,
+            )
+            session.rollback()
+            return False
+        session.commit()
+        # Refresh the in-memory ORM object so subsequent reads see DOWNLOADING.
+        session.refresh(track)
 
         # Tier 0 (librespot) and tier 3 (spotdl) are single-worker sweeps that
         # run before/after this batch — not in the 12-worker pool.  Both require
@@ -650,6 +707,11 @@ class DownloadOrchestrator:
             self._rate_limiter.record_failure("spotiflac")
             logger.debug("SpotiFLAC failed for track %d: %s", track.id, exc)
             return None
+        finally:
+            # Always remove the per-call temp dir; success path already moved
+            # the labeled file out to TEMP_DIR root, so this only cleans the
+            # working directory and any leftover partials.
+            shutil.rmtree(out_dir, ignore_errors=True)
 
     @staticmethod
     def _resolve_method_label(tier_name: str, file_path: str) -> str:
@@ -701,6 +763,7 @@ class DownloadOrchestrator:
             logger.debug("Tier 0 skipped for track %d: no spotify_id", track.id)
             return None
 
+        out_dir: Optional[str] = None
         try:
             _librespot_auth_ok = False
             with _LIBRESPOT_SEMAPHORE:
@@ -736,14 +799,14 @@ class DownloadOrchestrator:
             # the semaphore here so the next worker can start streaming while this
             # one transcodes.
             # Convert OGG → MP3 320k
-            mp3_path = ogg_path.replace(".ogg", ".mp3")
+            mp3_in_workdir = ogg_path.replace(".ogg", ".mp3")
             import subprocess as _sp
             ffmpeg_result = _sp.run(
                 [
                     "ffmpeg", "-i", ogg_path,
                     "-codec:a", "libmp3lame", "-b:a", "320k",
                     "-y", "-loglevel", "error",
-                    mp3_path,
+                    mp3_in_workdir,
                 ],
                 capture_output=True,
                 timeout=120,
@@ -753,7 +816,7 @@ class DownloadOrchestrator:
             except OSError:
                 pass
 
-            mp3_size = os.path.getsize(mp3_path) if os.path.exists(mp3_path) else 0
+            mp3_size = os.path.getsize(mp3_in_workdir) if os.path.exists(mp3_in_workdir) else 0
             if ffmpeg_result.returncode != 0 or mp3_size < 10_240:
                 logger.warning(
                     "librespot: ffmpeg conversion failed for track %d (size=%d): %s",
@@ -761,6 +824,12 @@ class DownloadOrchestrator:
                 )
                 self._rate_limiter.record_failure("librespot")
                 return None
+
+            # Promote MP3 OUT of the per-call workdir so the workdir can be
+            # cleaned in the finally block. Caller will move/rename this path
+            # again in the organiser stage.
+            mp3_path = os.path.join(TEMP_DIR, f"librespot_{uuid.uuid4().hex}.mp3")
+            shutil.move(mp3_in_workdir, mp3_path)
 
             self._rate_limiter.record_success("librespot")
             logger.info("librespot: track %d ('%s') downloaded OK", track.id, track.title)
@@ -781,6 +850,11 @@ class DownloadOrchestrator:
                 global _librespot_session
                 _librespot_session = None
             return None
+        finally:
+            # Always remove the per-call workdir. Success path already moved
+            # the MP3 out of it; failure path leaves nothing worth keeping.
+            if out_dir is not None:
+                shutil.rmtree(out_dir, ignore_errors=True)
 
     # ── Tier 2: yt-dlp + ytmusicapi ───────────────────────────────────────────
 
@@ -919,6 +993,7 @@ class DownloadOrchestrator:
             logger.info("Throttle skip: spotdl track %d — will retry next run", track.id)
             return None
 
+        out_dir: Optional[str] = None
         try:
             import subprocess
             import shutil
@@ -939,6 +1014,18 @@ class DownloadOrchestrator:
             out_dir = os.path.join(TEMP_DIR, f"spotdl_{track.id}_{uuid.uuid4().hex[:8]}")
             os.makedirs(out_dir, exist_ok=True)
 
+            # ── Secret hygiene ────────────────────────────────────────────────
+            # SPEC §B / audit #7: passing --client-id / --client-secret on argv
+            # means the credentials are visible to any local user via `ps aux`
+            # / `/proc/<pid>/cmdline` / Docker monitoring sidecars. spotdl
+            # honours the SPOTIPY_CLIENT_ID / SPOTIPY_CLIENT_SECRET env vars
+            # (pinned to the underlying spotipy library). We pass via the
+            # subprocess `env=` arg so the secrets cross only the parent →
+            # child process boundary as kernel-private memory, never argv.
+            spotdl_env = {**os.environ,
+                          "SPOTIPY_CLIENT_ID": client_id,
+                          "SPOTIPY_CLIENT_SECRET": client_secret}
+
             # URI must come BEFORE --audio: spotdl's --audio uses nargs=* and will
             # greedily consume the URI as an audio-source value, failing argparse validation.
             base_cmd = [
@@ -948,8 +1035,6 @@ class DownloadOrchestrator:
                 "--format", "mp3",
                 "--bitrate", "320k",
                 "--log-level", "ERROR",
-                "--client-id", client_id,
-                "--client-secret", client_secret,
             ]
 
             # Attempt 1: youtube-music (Spotify-matched, most accurate)
@@ -960,6 +1045,7 @@ class DownloadOrchestrator:
                 capture_output=True,
                 text=True,
                 timeout=120,
+                env=spotdl_env,
             )
 
             # Attempt 2: fallback to plain youtube search
@@ -974,6 +1060,7 @@ class DownloadOrchestrator:
                     capture_output=True,
                     text=True,
                     timeout=120,
+                    env=spotdl_env,
                 )
 
             if result.returncode != 0:
@@ -1001,10 +1088,17 @@ class DownloadOrchestrator:
                 self._rate_limiter.record_failure("spotdl")
                 return None
 
+            # Promote the downloaded file OUT of out_dir so we can clean
+            # the workdir without losing the result.
+            ext = os.path.splitext(downloaded_file)[1]
+            promoted = os.path.join(TEMP_DIR, f"spotdl_{uuid.uuid4().hex}{ext}")
+            shutil.move(downloaded_file, promoted)
+            shutil.rmtree(out_dir, ignore_errors=True)
+
             self._rate_limiter.record_success("spotdl")
             self._throttle.on_success("spotdl")
-            logger.info("spotdl CLI successfully downloaded track %d via %s", track.id, os.path.basename(downloaded_file))
-            return downloaded_file
+            logger.info("spotdl CLI successfully downloaded track %d via %s", track.id, os.path.basename(promoted))
+            return promoted
 
         except subprocess.TimeoutExpired:
             logger.warning("spotdl CLI timeout for track %d", track.id)
@@ -1021,6 +1115,17 @@ class DownloadOrchestrator:
                 return None
             self._rate_limiter.record_failure("spotdl")
             raise DownloadError(f"Tier 3 spotdl failed: {exc}") from exc
+        finally:
+            # Always remove the per-call workdir. Success path moved the
+            # promoted file out and already removed out_dir; failure paths
+            # (timeout, exception, early return) reach here with out_dir
+            # still on disk.
+            if out_dir is not None:
+                try:
+                    import shutil as _shutil
+                    _shutil.rmtree(out_dir, ignore_errors=True)
+                except Exception:  # noqa: BLE001
+                    pass
 
     # ── Tier 4: yt-dlp YouTube direct search ─────────────────────────────────
 
@@ -1200,18 +1305,12 @@ class DownloadOrchestrator:
                 opts["cookiefile"] = cookies_src
             else:
                 # Docker mounts cookies.txt :ro — yt-dlp tries to write-lock it
-                # on open, causing EROFS. Copy to a writable temp file instead.
-                import shutil
-                import tempfile
-                try:
-                    tmp = tempfile.NamedTemporaryFile(
-                        suffix=".txt", delete=False, dir=TEMP_DIR
-                    )
-                    shutil.copy2(cookies_src, tmp.name)
-                    tmp.close()
-                    opts["cookiefile"] = tmp.name
-                except Exception as exc:
-                    logger.debug("Could not copy cookies.txt to temp: %s", exc)
+                # on open, causing EROFS. Reuse a single per-instance temp
+                # copy instead of leaking a fresh tempfile per call.
+                # (audit #20)
+                tmp_path = self._get_or_refresh_cookie_copy(cookies_src)
+                if tmp_path:
+                    opts["cookiefile"] = tmp_path
 
         return opts
 
@@ -1222,6 +1321,67 @@ class DownloadOrchestrator:
             if os.path.exists(candidate):
                 return candidate
         return None
+
+    def _get_or_refresh_cookie_copy(self, cookies_src: str) -> Optional[str]:
+        """Return a writable copy of cookies.txt, refreshed when source mtime moves.
+
+        We keep one copy per Downloader instance and refresh only when the
+        underlying file changes — Docker bind-mount cookies are typically
+        rotated on a daily basis, much rarer than the per-call frequency
+        the previous implementation triggered.
+
+        Old copies (with stale mtime) get unlinked. Any errors degrade
+        gracefully to "no cookies" instead of breaking the tier.
+        """
+        try:
+            src_mtime = os.path.getmtime(cookies_src)
+        except OSError:
+            return None
+
+        cached = getattr(self, "_active_cookie_copy", None)
+        if cached and cached.get("src_mtime") == src_mtime and os.path.exists(cached["path"]):
+            return cached["path"]
+
+        # Refresh: unlink old copy, create new one.
+        if cached and os.path.exists(cached.get("path", "")):
+            try:
+                os.unlink(cached["path"])
+                self._tmp_cookie_files.discard(cached["path"])
+            except OSError:
+                pass
+
+        try:
+            tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False, dir=TEMP_DIR)
+            shutil.copy2(cookies_src, tmp.name)
+            tmp.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not copy cookies.txt to temp: %s", exc)
+            return None
+
+        self._tmp_cookie_files.add(tmp.name)
+        self._active_cookie_copy = {"path": tmp.name, "src_mtime": src_mtime}
+        return tmp.name
+
+    def cleanup_temp_cookies(self) -> None:
+        """Remove any tracked temp cookie copies. Safe to call repeatedly."""
+        for path in list(self._tmp_cookie_files):
+            try:
+                if os.path.exists(path):
+                    os.unlink(path)
+            except OSError as exc:
+                logger.debug("Could not remove temp cookies %r: %s", path, exc)
+            finally:
+                self._tmp_cookie_files.discard(path)
+        self._active_cookie_copy = None
+
+    def __del__(self) -> None:
+        # Best-effort cleanup at GC time. __del__ is unreliable so we don't
+        # depend on it for correctness — the daemon shutdown hook should
+        # call cleanup_temp_cookies() explicitly.
+        try:
+            self.cleanup_temp_cookies()
+        except Exception:  # noqa: BLE001
+            pass
 
     @staticmethod
     def _exc_contains_rate_limit(exc: BaseException) -> bool:
@@ -1270,24 +1430,3 @@ class DownloadOrchestrator:
             "geographic restriction",
             "not available in your country",
         ))
-
-    @staticmethod
-    def _resolve_method_label(tier_name: str, file_path: str) -> str:
-        """
-        Map internal tier name + file path to the canonical download_method label.
-
-        Labels per spec:
-          librespot | ytdlp_ytm | spotdl | ytdlp_yt | ytdlp_soundcloud
-        """
-        if tier_name == "tier0_librespot":
-            return "librespot"
-        elif tier_name == "tier2_ytdlp_ytm":
-            return "ytdlp_ytm"
-        elif tier_name == "tier3_spotdl":
-            return "spotdl"
-        elif tier_name == "tier4_ytdlp_youtube":
-            return "ytdlp_yt"
-        elif tier_name == "tier5_ytdlp_soundcloud":
-            return "ytdlp_soundcloud"
-        else:
-            return tier_name
