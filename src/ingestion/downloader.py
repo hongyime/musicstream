@@ -419,6 +419,26 @@ class DownloadOrchestrator:
                                 "librespot per-track timeout (%.0fs) for track %d ('%s')",
                                 per_track_timeout, track.id, track.title,
                             )
+                            # F1: timeouts are ALSO failures. Without this, the
+                            # rate-limiter never trips and we hammer a Spotify
+                            # account that's already rate-limited (upstream
+                            # librespot-python #325): hung packet reads silently
+                            # block until our 90s watchdog, library never raises.
+                            self._rate_limiter.record_failure("librespot")
+                            # F3: future.cancel() is a no-op on a worker blocked
+                            # in a C-level socket read. The only way to unblock
+                            # the worker is to kill the underlying connection.
+                            # Invalidating the singleton makes the next read
+                            # raise (closed socket) and the hung worker exits;
+                            # _get_librespot_session() rebuilds on next call.
+                            global _librespot_session
+                            try:
+                                old = _librespot_session
+                                _librespot_session = None
+                                if old is not None and hasattr(old, "close"):
+                                    old.close()
+                            except Exception as _close_exc:  # noqa: BLE001
+                                logger.debug("librespot session close on timeout: %s", _close_exc)
                             success = False
                         if success:
                             downloaded += 1
@@ -427,6 +447,14 @@ class DownloadOrchestrator:
                 except Exception as exc:
                     logger.error("librespot sweep error for track %d: %s", track.id, exc, exc_info=True)
                     failed += 1
+                # F2: pace inter-track attempts. Upstream contributor (cvdub)
+                # confirms <5s between streams reliably triggers Spotify's
+                # per-account rate limit, after which the account is dead for
+                # 1-2 hours.  Override with LIBRESPOT_INTER_TRACK_SLEEP=0 for
+                # tests; default 5s in production.
+                _inter_sleep = float(os.environ.get("LIBRESPOT_INTER_TRACK_SLEEP", "5"))
+                if _inter_sleep > 0:
+                    time.sleep(_inter_sleep)
 
         elapsed = time.monotonic() - sweep_start
         logger.info(
@@ -762,6 +790,28 @@ class DownloadOrchestrator:
         if not track.spotify_id:
             logger.debug("Tier 0 skipped for track %d: no spotify_id", track.id)
             return None
+
+        # F4: pre-filter tracks that librespot consistently can't fetch.
+        # Upstream issue #318 (RuntimeError: Cannot get alternative track) fires
+        # 100% of the time on tracks that Spotify has no playable variant for in
+        # the account's region/format — most commonly album skits, podcast
+        # interludes, and similar non-music content.  Empirically (musicstream
+        # log 2026-05-26): every "Skit"-titled track failed this way.  Skip them
+        # at the top so they don't burn a librespot attempt + 30-min cooldown
+        # quota.  Tier 2/4 (yt-dlp) can still find them on YouTube.
+        # Override with LIBRESPOT_FILTER_UNPLAYABLE=false for tests.
+        _filter_unplayable = os.environ.get("LIBRESPOT_FILTER_UNPLAYABLE", "true").lower() == "true"
+        if _filter_unplayable and track.title:
+            _title_lower = track.title.lower()
+            # Only trigger on whole-word matches — "intronaut" should NOT match "intro".
+            import re as _re
+            _unplayable_patterns = (r"\bskit\b", r"\binterlude\b")
+            if any(_re.search(p, _title_lower) for p in _unplayable_patterns):
+                logger.info(
+                    "Tier 0 pre-skip for track %d ('%s'): title matches non-music heuristic",
+                    track.id, track.title,
+                )
+                return None
 
         out_dir: Optional[str] = None
         try:
