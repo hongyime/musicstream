@@ -5,9 +5,9 @@ import { getDaemonToken, setDaemonToken } from '../services/api';
 /**
  * Audit #25: Token entry UI for the daemon's Bearer-auth gate.
  *
- * Stored in sessionStorage (cleared on tab close) — see api.ts header for
- * why we don't bake it into the bundle.  Exposes a small bar at the top of
- * the dashboard that:
+ * Stored in localStorage (durable across tab close + browser restart) — see
+ * api.ts header for the security trade-off rationale and why we don't bake
+ * it into the bundle.  Exposes a small bar at the top of the dashboard that:
  *   - shows whether a token is currently set
  *   - lets the operator paste/replace it
  *   - lets them clear it
@@ -49,7 +49,7 @@ export function TokenPrompt({ onTokenChange }: TokenPromptProps) {
       <div className="flex items-center justify-between bg-success/10 border border-success/20 rounded-lg p-3 text-sm">
         <div className="flex items-center space-x-2">
           <Check size={16} className="text-success" />
-          <span className="text-secondary">Daemon token configured (this tab)</span>
+          <span className="text-secondary">Daemon token configured (this browser)</span>
         </div>
         <div className="flex items-center space-x-2">
           <button
@@ -81,9 +81,10 @@ export function TokenPrompt({ onTokenChange }: TokenPromptProps) {
       </div>
       <p className="text-xs text-secondary">
         The daemon protects mutating endpoints with <code>DAEMON_API_TOKEN</code>.
-        Paste it here — it is stored in <code>sessionStorage</code> and cleared
-        when this tab closes.  It is never written to <code>localStorage</code>
-        or sent anywhere except this daemon.
+        Paste it here — it is stored in <code>localStorage</code> so it persists
+        across tab close and browser restart.  Click <strong>Clear</strong> below
+        to remove it from this browser.  It is never sent anywhere except this
+        daemon.
       </p>
       <div className="flex items-center space-x-2">
         <input

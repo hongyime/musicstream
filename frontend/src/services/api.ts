@@ -1,18 +1,30 @@
 // musicstream/frontend/src/services/api.ts
 //
-// API client. Audit #22: mutating endpoints now require Bearer auth on the
-// daemon (DAEMON_API_TOKEN). The token is read from sessionStorage so it
-// survives within a tab but isn't persisted to disk like localStorage —
-// closing the tab clears it. The user pastes the token into the dashboard
-// once per session via a small prompt UI.
+// API client. Audit #22: mutating endpoints require Bearer auth on the
+// daemon (DAEMON_API_TOKEN).  The token is stored in localStorage so it
+// survives tab close / browser restart for operator convenience — paste
+// once, use forever (until the operator hits Clear or rotates the token
+// server-side).
+//
+// Trade-off accepted: localStorage IS readable by any XSS payload that
+// runs in this origin.  Mitigations:
+//  - This dashboard ships zero user-generated content (no comments,
+//    no playlists from third parties, no rich text).  XSS surface is
+//    effectively the operator's own browser extensions.
+//  - The token only authorises the SAME operator's daemon, accessible
+//    only over loopback / Tailscale.  Even a leaked token from this
+//    origin can't be used from the public internet.
+//  - The token rotates the moment the operator regenerates DAEMON_API_TOKEN
+//    in .env and recreates the daemon container; the stale localStorage
+//    value silently 401s and the TokenPrompt re-appears.
+// Earlier audit hardening used sessionStorage — switched to localStorage
+// at user request to avoid re-pasting after every OAuth redirect chain.
 //
 // We deliberately do NOT bake the token into env at build time:
 //  - Vite-style import.meta.env values get inlined into the bundle and
 //    served as plain text from /static/assets — anyone who can hit the
 //    dashboard can read the token.
 //  - Per-deploy rotation of the build artefact is heavyweight.
-// Storing the token in sessionStorage means an operator with the token
-// can use the dashboard, but the bundle itself contains no secret.
 
 export interface ApiResponse<T> {
   data: T;
@@ -25,6 +37,11 @@ const TOKEN_STORAGE_KEY = 'musicstream.daemonToken';
 
 export function getDaemonToken(): string | null {
   try {
+    // Read from localStorage first (durable), then fall back to
+    // sessionStorage so any token saved under the previous policy keeps
+    // working until the user explicitly clears+re-enters it.
+    const stored = localStorage.getItem(TOKEN_STORAGE_KEY);
+    if (stored) return stored;
     return sessionStorage.getItem(TOKEN_STORAGE_KEY);
   } catch {
     return null;
@@ -33,10 +50,18 @@ export function getDaemonToken(): string | null {
 
 export function setDaemonToken(token: string | null): void {
   try {
-    if (token) sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
-    else sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+    if (token) {
+      localStorage.setItem(TOKEN_STORAGE_KEY, token);
+      // Drop any sessionStorage copy left over from older builds so
+      // there's only one source of truth.
+      sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+    } else {
+      localStorage.removeItem(TOKEN_STORAGE_KEY);
+      sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+    }
   } catch {
-    // sessionStorage can throw in private browsing modes; degrade gracefully.
+    // localStorage can throw in private-browsing modes or when the
+    // origin's storage quota is exhausted; degrade gracefully.
   }
 }
 
