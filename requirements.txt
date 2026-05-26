@@ -11,6 +11,11 @@ python-dotenv==1.2.2
 yt-dlp[default]
 ytmusicapi==1.12.0
 spotdl
+# spotdl 3.9.6 imports pkg_resources (legacy setuptools API).
+# setuptools >= 81 (Aug 2025) removed pkg_resources, breaking `import spotdl`
+# and the CLI. Pin <81 until spotdl upstream migrates to importlib.metadata.
+# Verified: setuptools 80.10.2 still ships pkg_resources.
+setuptools<81
 
 # Tier 0: direct Spotify CDN streaming (requires Spotify Premium account)
 # PyPI package: https://pypi.org/project/librespot/ (versions 0.0.x)
