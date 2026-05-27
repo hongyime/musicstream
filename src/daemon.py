@@ -396,6 +396,7 @@ def _register_scheduler_jobs():
     scheduler.add_job(tasks.spotify_incremental_sync, "cron", minute="*/15", id="spotify_sync", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.spotify_saved_albums_sync, "cron", hour="*/6", id="saved_albums_sync", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.spotify_followed_artists_sync, "cron", day_of_week="sun", hour=6, id="followed_artists_sync", replace_existing=True, misfire_grace_time=GRACE)
+    scheduler.add_job(tasks.spotify_liked_artists_expand, "cron", hour=2, id="liked_artists_expand", replace_existing=True, misfire_grace_time=GRACE)  # LIKED_ARTISTS_EXPAND_V1
     scheduler.add_job(tasks.full_download_pipeline, "cron", hour=3, id="download_pipeline", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.listenbrainz_discovery, "cron", hour=4, id="lb_discovery", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.full_integrity_check, "cron", day_of_week="wed,sun", hour=5, id="integrity_check", replace_existing=True, misfire_grace_time=GRACE)
@@ -582,6 +583,14 @@ async def trigger_followed_artists():
     _background_tasks.add(_bg)
     _bg.add_done_callback(_background_tasks.discard)
     return ApiResponse(data={"queued": True})
+
+@app.post("/api/musicstream/liked-artists-expand", dependencies=[Depends(require_auth)])
+async def trigger_liked_artists_expand(batch: int = 50):
+    """LIKED_ARTISTS_EXPAND_V1: manual trigger. ?batch=N to override default 50."""
+    _bg = asyncio.create_task(asyncio.to_thread(tasks.spotify_liked_artists_expand, batch))
+    _background_tasks.add(_bg)
+    _bg.add_done_callback(_background_tasks.discard)
+    return ApiResponse(data={"queued": True, "batch": batch})
 
 @app.post("/api/musicstream/integrity", dependencies=[Depends(require_auth)])
 async def trigger_integrity():

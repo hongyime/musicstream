@@ -364,12 +364,18 @@ class SpotifyScraper:
         session: Session,
         artist_id: str,
         artist_name: Optional[str] = None,
+        album_type: str = "album,single",
     ) -> int:
         """Pull every album for *artist_id* and upsert all tracks. Returns new-track count.
 
         Used by both followed_artists_sync (every followed artist) and the
         per-LB-track discography expansion (ad-hoc when LB recommends a new artist).
         Idempotent: existing tracks via spotify_uri unique constraint.
+
+        Args:
+            album_type: Default "album,single" preserves prior behaviour.
+                        Pass "album,single,appears_on" for full firehose
+                        (used by liked_artists_expand to also pull guest features).
         """
         artist_source = self._get_or_create_source(
             session,
@@ -378,7 +384,7 @@ class SpotifyScraper:
             source_type=SourceType.ARTIST.value,
         )
         try:
-            albums = self.get_artist_albums(artist_id)
+            albums = self.get_artist_albums(artist_id, album_type=album_type)
         except Exception as exc:
             logger.warning("expand_artist_discography: get_artist_albums(%s) failed: %s", artist_id, exc)
             return 0
@@ -401,6 +407,127 @@ class SpotifyScraper:
                 artist_name or artist_id, len(albums), artist_track_count, new_count,
             )
         return new_count
+
+    def liked_artists_expand(
+        self,
+        session: Session,
+        batch_size: int = 50,
+        album_type: str = "album,single,appears_on",
+    ) -> dict:
+        """LIKED_ARTISTS_EXPAND_V1: discography-expand artists from Liked Songs + Saved Albums.
+
+        Picks up to *batch_size* distinct artist Spotify IDs that appear on tracks
+        linked to a 'liked' or 'album' source, but DON'T already have an artist
+        source row. For each, calls expand_artist_discography with appears_on
+        included so guest features land too. Idempotent and bounded — designed
+        to run daily and chip away at the long tail.
+
+        Args:
+            batch_size: How many artists to expand per call. ~50/day @ 5min/artist
+                        ≈ 4-5h wall time, leaves API headroom for everything else.
+            album_type: "album,single,appears_on" (default firehose) or override.
+
+        Returns:
+            {"artists_expanded": N, "new_tracks": M, "remaining": K}
+        """
+        from sqlalchemy import text  # local import: avoid top-level dep churn
+
+        # Find candidate artist IDs: appear on liked/album tracks, no artist source yet.
+        # Strategy: read tracks.spotify_id for everything in liked/album sources,
+        # batch-fetch via /tracks endpoint, extract artists[].id, dedupe, filter
+        # against existing artist sources.
+        sql = text("""
+            SELECT DISTINCT t.spotify_id
+            FROM tracks t
+            JOIN track_sources ts ON ts.track_id = t.id
+            JOIN sources s ON s.id = ts.source_id
+            WHERE s.source_type IN ('liked', 'album')
+              AND t.spotify_id IS NOT NULL
+        """)
+        track_spotify_ids = [row[0] for row in session.execute(sql).fetchall()]
+
+        if not track_spotify_ids:
+            logger.info("liked_artists_expand: no liked/album tracks found")
+            return {"artists_expanded": 0, "new_tracks": 0, "remaining": 0}
+
+        # Existing artist source IDs (so we can skip already-expanded)
+        existing_sql = text("""
+            SELECT spotify_id FROM sources WHERE source_type='artist'
+        """)
+        existing_artist_sources = {row[0] for row in session.execute(existing_sql).fetchall()}
+
+        # Pull artist IDs from track metadata via /tracks (50 per call)
+        candidate_artists: dict[str, str] = {}  # id -> name
+        attempt = 0
+        for i in range(0, len(track_spotify_ids), 50):
+            chunk = track_spotify_ids[i:i+50]
+            try:
+                tracks_resp = self.sp.tracks(chunk)
+                self._rate_limiter.record_success("spotify")
+            except spotipy.SpotifyException as exc:
+                if exc.http_status == 429:
+                    retry_after = float(exc.headers.get("Retry-After", 0)) if exc.headers else 0
+                    self._rate_limiter.record_failure("spotify")
+                    self._rate_limiter.wait("spotify", attempt, retry_after=retry_after)
+                    attempt += 1
+                    if attempt >= 5:
+                        raise SpotifyRateLimitError() from exc
+                    continue
+                logger.warning("liked_artists_expand: /tracks chunk %d failed: %s", i // 50, exc)
+                continue
+            for tr in tracks_resp.get("tracks") or []:
+                if not tr:
+                    continue
+                for art in tr.get("artists") or []:
+                    aid = art.get("id")
+                    aname = art.get("name") or aid
+                    if aid and f"artist_{aid}" not in existing_artist_sources:
+                        candidate_artists.setdefault(aid, aname)
+
+        total_candidates = len(candidate_artists)
+        logger.info(
+            "liked_artists_expand: %d distinct unexpanded artists found (album_type=%s, batch=%d)",
+            total_candidates, album_type, batch_size,
+        )
+        if not candidate_artists:
+            return {"artists_expanded": 0, "new_tracks": 0, "remaining": 0}
+
+        # Take batch_size artists, sorted alphabetically by name for determinism
+        # (so retries / restarts hit the same ones)
+        sorted_artists = sorted(candidate_artists.items(), key=lambda kv: (kv[1] or "").lower())
+        batch = sorted_artists[:batch_size]
+
+        new_total = 0
+        for aid, aname in batch:
+            try:
+                added = self.expand_artist_discography(
+                    session, aid, artist_name=aname, album_type=album_type,
+                )
+                new_total += added
+                if added:
+                    logger.info(
+                        "liked_artists_expand: '%s' (%s) +%d new tracks",
+                        aname, aid, added,
+                    )
+                # Commit per-artist so a mid-batch failure doesn't lose progress
+                session.commit()
+            except Exception as exc:
+                logger.warning(
+                    "liked_artists_expand: artist '%s' (%s) failed: %s",
+                    aname, aid, exc,
+                )
+                session.rollback()
+
+        remaining = total_candidates - len(batch)
+        logger.info(
+            "liked_artists_expand complete: %d artists processed, %d new tracks, %d remaining",
+            len(batch), new_total, remaining,
+        )
+        return {
+            "artists_expanded": len(batch),
+            "new_tracks": new_total,
+            "remaining": remaining,
+        }
 
     # ── Spotify API helpers ────────────────────────────────────────────────────
 
@@ -586,8 +713,16 @@ class SpotifyScraper:
                 break
         return artists
 
-    def get_artist_albums(self, artist_id: str) -> list[dict]:
-        """Fetch all albums for an artist via /artists/{id}/albums."""
+    def get_artist_albums(self, artist_id: str, album_type: str = "album,single") -> list[dict]:
+        """Fetch all albums for an artist via /artists/{id}/albums.
+
+        Args:
+            artist_id:  Spotify artist ID.
+            album_type: Comma-separated subset of {album,single,appears_on,compilation}.
+                        Default "album,single" — own-discography only.
+                        Pass "album,single,appears_on" for full firehose
+                        (used by liked_artists_expand).
+        """
         albums: list[dict] = []
         limit = 50
         offset = 0
@@ -597,7 +732,7 @@ class SpotifyScraper:
                 try:
                     result = self.sp.artist_albums(
                         artist_id,
-                        album_type="album,single",
+                        album_type=album_type,
                         limit=limit,
                         offset=offset,
                     )

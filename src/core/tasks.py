@@ -104,6 +104,27 @@ def spotify_followed_artists_sync() -> None:
         logger.error("Spotify followed-artists sync failed: %s", exc, exc_info=True)
 
 
+def spotify_liked_artists_expand(batch_size: int = 50) -> None:
+    """LIKED_ARTISTS_EXPAND_V1: discography-expand artists from Liked Songs +
+    Saved Albums, including appears_on (guest features). Bounded daily job —
+    chips away at the long tail without bursting the Spotify rate limiter."""
+    logger.info("Running Spotify liked-artists expand (batch=%d).", batch_size)
+    try:
+        from src.db import get_session
+        from src.ingestion.scraper import SpotifyScraper
+        scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
+        with get_session() as session:
+            result = scraper.liked_artists_expand(session, batch_size=batch_size)
+        logger.info(
+            "Spotify liked-artists expand complete: %d artists, %d new tracks, %d remaining",
+            result.get("artists_expanded", 0),
+            result.get("new_tracks", 0),
+            result.get("remaining", 0),
+        )
+    except Exception as exc:
+        logger.error("Spotify liked-artists expand failed: %s", exc, exc_info=True)
+
+
 def maybe_run_full_backfill() -> int:
     """One-time catch-up: if the DB has no album/artist sources yet, run a full
     backfill so saved-albums and followed-artists data lands. Idempotent — once
