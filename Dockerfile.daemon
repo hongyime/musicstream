@@ -34,7 +34,28 @@ WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        ffmpeg curl git libchromaprint-dev postgresql-client tini gosu \
+       unzip ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Deno (≥2.3.0) so yt-dlp-ejs can solve YouTube's signature /
+# n-challenge JavaScript.  Without a JS runtime, yt-dlp falls back to
+# image-only formats and tier 4 dies with "Only images are available
+# for download".  Deno is the default runtime expected by yt-dlp-ejs
+# (auto-detected from PATH, no --js-runtimes flag needed) and ships as
+# a single static binary, so it's lighter than Debian's nodejs (which
+# is too old at v20 — yt-dlp-ejs needs Node ≥22).
+RUN ARCH="$(uname -m)" \
+    && case "$ARCH" in \
+         x86_64)  DENO_TARGET=x86_64-unknown-linux-gnu ;; \
+         aarch64) DENO_TARGET=aarch64-unknown-linux-gnu ;; \
+         *) echo "unsupported arch for Deno: $ARCH"; exit 1 ;; \
+       esac \
+    && curl -fsSL -o /tmp/deno.zip \
+       "https://github.com/denoland/deno/releases/latest/download/deno-${DENO_TARGET}.zip" \
+    && unzip -q /tmp/deno.zip -d /usr/local/bin \
+    && chmod +x /usr/local/bin/deno \
+    && rm /tmp/deno.zip \
+    && /usr/local/bin/deno --version
 
 # Create non-root runtime user.  uid/gid 1000 is conventional and matches
 # the default first user on most Linux hosts so bind-mounted volumes
