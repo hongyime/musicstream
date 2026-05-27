@@ -886,16 +886,37 @@ class DownloadOrchestrator:
             return mp3_path
 
         except Exception as exc:
+            # Distinguish between (a) genuine librespot/auth failures and (b)
+            # "Cannot get alternative track" — a benign upstream-issue-#318
+            # signal that THIS specific track has no playable variant for our
+            # account/region. Treating (b) as a regular failure poisons the
+            # circuit breaker (5 in a row → 30 min cooldown that locks tier 0
+            # for unrelated tracks) and floods the log with WARNINGs that
+            # aren't actually actionable. The track will cascade to tiers 1-5
+            # cleanly the same way our F4 pre-skip path handles it.
+            exc_str = str(exc).lower()
+            is_alt_track_signal = "cannot get alternative track" in exc_str
+            is_auth_failure = not _librespot_auth_ok or any(
+                kw in exc_str for kw in ("auth", "credential", "login", "token", "unauthorized", "403", "invalid")
+            )
+
+            if is_alt_track_signal:
+                # Log at INFO and DO NOT count against the circuit breaker.
+                # We DO still log it — operators want visibility into how many
+                # tracks are hitting this so they can correlate with Spotify
+                # catalogue changes — just not at WARN/ERROR severity.
+                logger.info(
+                    "librespot: no playable variant for track %d ('%s') — cascading to next tier",
+                    track.id, track.title,
+                )
+                return None
+
             self._rate_limiter.record_failure("librespot")
             logger.warning("librespot failed for track %d ('%s'): %s", track.id, track.title, exc)
             # Only invalidate the session on auth failures or explicit auth signals.
             # Transient stream errors (IOError, empty chunk, decode error) don't
             # mean the session is dead — nuking it on every blip forces expensive
             # full re-auth on the next call.
-            exc_str = str(exc).lower()
-            is_auth_failure = not _librespot_auth_ok or any(
-                kw in exc_str for kw in ("auth", "credential", "login", "token", "unauthorized", "403", "invalid")
-            )
             if is_auth_failure:
                 global _librespot_session
                 _librespot_session = None
