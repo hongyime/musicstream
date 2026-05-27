@@ -31,7 +31,27 @@ import src.core.tasks as tasks
 
 # ── Logging Setup ─────────────────────────────────────────────────────────────
 
+_LOG_HANDLER_TAGS = ("musicstream_main_file", "musicstream_errors_file", "musicstream_console")
+
+
 def _configure_logging() -> None:
+    """Wire console + rotating file handlers onto the root logger.
+
+    IDEMPOTENT and SELF-HEALING. We tag our handlers with a custom `_ms_tag`
+    attribute so we can detect whether they're still attached after a foreign
+    `dictConfig`/`basicConfig` call wipes the root handlers list. Uvicorn does
+    exactly that: it imports `src.daemon:app` (running this module's import-
+    time `_configure_logging()` call), then runs its OWN
+    `logging.config.dictConfig(LOGGING_CONFIG)` AFTER ours, which replaces
+    `root.handlers` with just uvicorn's stream handler. Result: our file
+    handlers silently disappear and `/app/logs/musicstream.log` stops growing
+    even though `docker logs` keeps streaming via uvicorn's handler.
+
+    Calling `_configure_logging()` again from the FastAPI lifespan (which runs
+    AFTER uvicorn's logging setup) re-attaches our handlers without
+    duplicating them. The tag check is the only reliable way to distinguish
+    our handlers from foreign ones across the dictConfig boundary.
+    """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     # Audit #33: custom formatter that defensively injects track_id when
@@ -55,18 +75,40 @@ def _configure_logging() -> None:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
 
+    # Idempotency: if all our tagged handlers are already on the root we have
+    # nothing to do. This makes calling _configure_logging() multiple times
+    # safe (no duplicate handlers, no duplicated log lines).
+    existing_tags = {getattr(h, "_ms_tag", None) for h in root.handlers}
+    if all(tag in existing_tags for tag in _LOG_HANDLER_TAGS):
+        return
+
+    # Some of our handlers might be attached, others wiped by a foreign
+    # dictConfig. Drop ALL our previously-tagged handlers so we can re-add a
+    # clean set; leave foreign handlers (uvicorn's StreamHandler etc.) alone
+    # so console output keeps flowing.
+    for h in list(root.handlers):
+        if getattr(h, "_ms_tag", None) in _LOG_HANDLER_TAGS:
+            try:
+                h.close()
+            except Exception:  # noqa: BLE001 — handler close failures are non-fatal
+                pass
+            root.removeHandler(h)
+
     # Filter at root for our own loggers — keeps the contextvar lookup
     # cheap on the hot path.
     from src.logging_context import TrackContextFilter
     track_filter = TrackContextFilter()
-    root.addFilter(track_filter)
-    
+    # Don't double-add the filter on re-runs.
+    if not any(isinstance(f, TrackContextFilter) for f in root.filters):
+        root.addFilter(track_filter)
+
     # Console handler
     console = logging.StreamHandler()
     console.setFormatter(fmt)
     console.addFilter(track_filter)
+    console._ms_tag = "musicstream_console"  # type: ignore[attr-defined]
     root.addHandler(console)
-    
+
     # Main rotating file handler — INFO and above, 5 MB × 3 backups.
     ms_handler = logging.handlers.RotatingFileHandler(
         LOG_DIR / "musicstream.log", maxBytes=5*1024*1024, backupCount=3,
@@ -74,6 +116,7 @@ def _configure_logging() -> None:
     )
     ms_handler.setFormatter(fmt)
     ms_handler.addFilter(track_filter)
+    ms_handler._ms_tag = "musicstream_main_file"  # type: ignore[attr-defined]
     root.addHandler(ms_handler)
 
     # Dedicated errors handler (audit #21). Without this an WARNING/ERROR
@@ -88,6 +131,7 @@ def _configure_logging() -> None:
     err_handler.setFormatter(fmt)
     err_handler.setLevel(logging.WARNING)
     err_handler.addFilter(track_filter)
+    err_handler._ms_tag = "musicstream_errors_file"  # type: ignore[attr-defined]
     root.addHandler(err_handler)
 
     # Uvicorn keeps its own loggers (`uvicorn`, `uvicorn.access`,
@@ -104,6 +148,35 @@ def _configure_logging() -> None:
 
 _configure_logging()
 logger = logging.getLogger("musicstream.daemon")
+
+
+async def _log_handler_watchdog() -> None:
+    """Periodically verify our file handlers are still on root and re-attach if not.
+
+    We've observed file handlers being silently detached after FastAPI's
+    lifespan completes — even though the in-process `_configure_logging()`
+    calls succeed at module-import and lifespan-start. The exact culprit is
+    upstream (likely uvicorn's logging.config.dictConfig running on a worker
+    boundary or starlette's lifespan teardown semantics; the production
+    behaviour is consistent: console keeps working, file handlers go silent
+    within a minute of startup). Rather than chase the upstream cause, we
+    treat the problem operationally: every 60 seconds, call the same
+    idempotent `_configure_logging()` setup. If handlers are missing,
+    they're re-attached; if all three are present (`musicstream_main_file`,
+    `musicstream_errors_file`, `musicstream_console`), the call returns
+    immediately. Worst case: 60s of file-log gap after a wipe, no duplicate
+    log lines, no observable performance impact (one set check per minute).
+    """
+    interval = 60
+    while True:
+        try:
+            _configure_logging()
+        except Exception:  # noqa: BLE001 — watchdog must never crash
+            # Last-ditch: log via print since our handlers may be the thing broken.
+            import sys
+            import traceback as _tb
+            print("[log-watchdog] re-attach failed:", _tb.format_exc(), file=sys.stderr, flush=True)
+        await asyncio.sleep(interval)
 
 # ── Globals ───────────────────────────────────────────────────────────────────
 
@@ -149,6 +222,16 @@ def _audit_credential_permissions() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Audit (this session): re-run _configure_logging AFTER uvicorn has
+    # finished its own setup. Uvicorn's startup runs
+    # `logging.config.dictConfig(LOGGING_CONFIG)` which wipes any handlers
+    # we added at module-import time, including the rotating file handlers
+    # for /app/logs/musicstream.log and /app/logs/errors.log. Re-running
+    # here is idempotent (handlers carry an _ms_tag and we skip if already
+    # attached) so the file handlers stay live for the entire process
+    # lifetime, not just the brief window between import and uvicorn boot.
+    _configure_logging()
+
     # Step 1 & 2: DB + migrations
     logger.info("Initializing DB and running migrations...")
     try:
@@ -179,6 +262,13 @@ async def _background_startup():
         # users mount these from non-root accounts where chmod is awkward),
         # but we DO log a clear warning so the operator can fix it.
         _audit_credential_permissions()
+
+        # Spawn the file-logger watchdog FIRST so any subsequent log line
+        # has a fighting chance of landing on disk. See the docstring on
+        # _configure_logging for why a one-shot re-run isn't enough.
+        _wd_task = asyncio.create_task(_log_handler_watchdog())
+        _background_tasks.add(_wd_task)
+        _wd_task.add_done_callback(_background_tasks.discard)
 
         logger.info("Step 3/9: Skipping legacy banner (UI-only now)")
 
