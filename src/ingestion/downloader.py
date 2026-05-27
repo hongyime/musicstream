@@ -957,24 +957,65 @@ class DownloadOrchestrator:
 
         query = f"{track.title} {track.artist}"
 
-        # Collect up to 4 candidates per filtered search (songs → videos only).
-        # Skipping the no-filter pass avoids hundreds of album/artist results
-        # that have no videoId and would still be YouTube Music Premium content.
-        candidates: list[str] = []
+        # OFFICIAL_SOURCE_FILTER_V1: collect candidates with metadata across
+        # filters, score via _score_youtube_candidate, sort by score desc.
+        scored_candidates: list[tuple[int, str]] = []
+        seen_vids: set[str] = set()
         for search_filter in ("songs", "videos"):
             try:
                 ytm = YTMusic()
                 results = ytm.search(query=query, filter=search_filter, limit=4)
                 for result in results:
                     vid = result.get("videoId")
-                    if vid and vid not in candidates:
-                        candidates.append(vid)
+                    if not vid or vid in seen_vids:
+                        continue
+                    seen_vids.add(vid)
+                    # Build an info-shaped dict for the scorer
+                    artists_field = result.get("artists") or []
+                    primary_channel = artists_field[0].get("name") if artists_field else ""
+                    duration_seconds = None
+                    dur = result.get("duration_seconds") or result.get("duration")
+                    if isinstance(dur, int):
+                        duration_seconds = dur
+                    elif isinstance(dur, str) and ":" in dur:
+                        # mm:ss or h:mm:ss
+                        parts = [int(p) for p in dur.split(":") if p.isdigit()]
+                        if len(parts) == 2:
+                            duration_seconds = parts[0] * 60 + parts[1]
+                        elif len(parts) == 3:
+                            duration_seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
+                    info_shape = {
+                        "title": result.get("title") or "",
+                        "channel": primary_channel,
+                        "uploader": primary_channel,
+                        "duration": duration_seconds,
+                    }
+                    score = self._score_youtube_candidate(info_shape, track)
+                    # Songs filter implicitly ARE official audio on YT Music;
+                    # bonus +50 to prefer them over the videos filter
+                    if search_filter == "songs":
+                        score += 50
+                    scored_candidates.append((score, vid))
             except Exception as exc:
                 self._rate_limiter.record_failure("ytmusicapi")
                 logger.warning("ytmusicapi search (filter=%s) failed: %s", search_filter, exc)
 
-        if not candidates:
+        if not scored_candidates:
             return None
+
+        # Sort by score desc, drop negatives
+        scored_candidates.sort(key=lambda kv: kv[0], reverse=True)
+        if scored_candidates and scored_candidates[0][0] < 0:
+            logger.info(
+                "Tier 2: no official-grade candidate for track %d (best score=%d) — skipping tier",
+                track.id, scored_candidates[0][0],
+            )
+            return None
+        candidates = [vid for score, vid in scored_candidates if score >= 0]
+        logger.info(
+            "Tier 2 [official-filter] track %d: %d candidates, top score=%d",
+            track.id, len(candidates), scored_candidates[0][0],
+        )
 
         self._rate_limiter.record_success("ytmusicapi")
 
@@ -1119,19 +1160,14 @@ class DownloadOrchestrator:
                 env=spotdl_env,
             )
 
-            # Attempt 2: fallback to plain youtube search
+            # OFFICIAL_SOURCE_FILTER_V1: previously fell back to --audio youtube
+            # which often picks lyric videos / fan uploads. Drop that fallback
+            # entirely — let the track cascade to Tier 4 yt-dlp YouTube which
+            # now scores candidates and rejects unofficial sources.
             if result.returncode != 0:
                 logger.info(
-                    "spotdl --audio youtube-music failed for track %d ('%s'); falling back to youtube: %s",
-                    track.id, track.title, result.stderr[:120],
-                )
-                cmd_yt = base_cmd + ["--audio", "youtube"]
-                result = subprocess.run(
-                    cmd_yt,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                    env=spotdl_env,
+                    "spotdl --audio youtube-music failed for track %d ('%s'); cascading to Tier 4 (no plain youtube fallback): %s",
+                    track.id, track.title, (result.stderr or "")[:120],
                 )
 
             if result.returncode != 0:
@@ -1200,12 +1236,90 @@ class DownloadOrchestrator:
 
     # ── Tier 4: yt-dlp YouTube direct search ─────────────────────────────────
 
+    # OFFICIAL_SOURCE_FILTER_V1: scoring rules to prefer official audio over
+    # lyric videos / fan uploads / 8D / sped-up / reaction content.
+    _BAD_TITLE_TOKENS = (
+        "lyric", "lyrics", "(audio)", "cover", "remix", "live ", "reaction",
+        "review", "tribute", "8d audio", "slowed", "sped up", "nightcore",
+        "reverb", "remastered fan", "fan made", "fan-made", "guitar tutorial",
+        "piano tutorial", "instrumental", "karaoke", "loop", "1 hour", "10 hours",
+        "extended", "ai cover", "type beat",
+    )
+    _OFFICIAL_TITLE_TOKENS = (
+        "official audio", "official video", "official music video", "official",
+    )
+
+    def _score_youtube_candidate(self, info: dict, track: Track) -> int:
+        """OFFICIAL_SOURCE_FILTER_V1: score a yt-dlp/ytmusic candidate.
+
+        Higher = more likely to be the official master recording. Returns a
+        signed int. Caller picks the highest-scoring candidate that passes
+        duration check.
+
+        Inputs (info):
+            channel / uploader / channel_url — channel identity
+            title — video title
+            duration — seconds
+            view_count — popularity tiebreaker
+
+        Heuristics:
+            +200 channel ends in ' - Topic' (auto-gen master-recording channel)
+            +150 channel contains 'VEVO' or exact artist name
+            +60  title contains 'official audio' or 'official music video'
+            -150 title token in _BAD_TITLE_TOKENS
+                  (unless that token also appears in track.title — e.g.
+                   a song literally called 'Live')
+            duration delta penalty: -2 per second of |actual - expected|
+        """
+        score = 0
+
+        title = (info.get("title") or "").lower()
+        channel = (info.get("channel") or info.get("uploader") or "").lower()
+        track_title_l = (track.title or "").lower()
+        track_artist_l = (track.artist or "").lower()
+
+        # Channel: Topic and VEVO are the gold standard
+        if channel.endswith(" - topic"):
+            score += 200
+        if "vevo" in channel:
+            score += 150
+        # Exact artist channel name match (cleaned)
+        if track_artist_l and track_artist_l in channel:
+            score += 80
+
+        # Title: official markers
+        for tok in self._OFFICIAL_TITLE_TOKENS:
+            if tok in title:
+                score += 60
+                break
+
+        # Title: bad tokens — only penalise if NOT in original track title
+        for bad in self._BAD_TITLE_TOKENS:
+            if bad in title and bad not in track_title_l:
+                score -= 150
+
+        # Duration penalty
+        if track.duration_ms is not None:
+            expected_s = track.duration_ms / 1000.0
+            got_s = info.get("duration") or 0
+            if got_s:
+                delta = abs(got_s - expected_s)
+                score -= int(delta * 2)
+                if delta > _DURATION_TOLERANCE_S:
+                    score -= 200  # hard penalty over tolerance
+
+        return score
+
     def _tier4_ytdlp_youtube(self, track: Track) -> Optional[str]:
         """
         Search YouTube with ytsearch12 using two query variants:
           - "{title} {artist} audio"
           - "{title} {artist} official audio"
         Returns temp file path (MP3 320kbps) or None.
+
+        OFFICIAL_SOURCE_FILTER_V1: instead of downloading the first hit,
+        flat-extract all results, score each via _score_youtube_candidate,
+        download the highest-scoring candidate (must score >= 0).
         """
         if not self._rate_limiter.is_healthy("youtube"):
             logger.warning("YouTube circuit breaker open; skipping Tier 4.")
@@ -1216,40 +1330,101 @@ class DownloadOrchestrator:
             f"ytsearch12:{track.title} {track.artist} official audio",
         ]
 
+        # OFFICIAL_SOURCE_FILTER_V1: collect candidates across queries, score, sort.
+        candidates: list[dict] = []
+        seen_ids: set[str] = set()
         for query in queries:
             if not self._throttle.wait("youtube"):
                 logger.info("Throttle skip: youtube tier 4 track %d — will retry next run", track.id)
                 return None
-
-            out_stem = os.path.join(TEMP_DIR, str(uuid.uuid4()))
-            ydl_opts = self._build_mp3_opts(out_stem)
-            # For search queries, disable noplaylist so yt-dlp walks the result
-            # list.  ignoreerrors skips restricted videos silently; max_downloads
-            # stops after the first successful download.
-            ydl_opts["noplaylist"] = False
-            ydl_opts["ignoreerrors"] = True
-            ydl_opts["max_downloads"] = 1
-
+            flat_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "skip_download": True,
+                "extract_flat": "in_playlist",
+                "noplaylist": False,
+                "ignoreerrors": True,
+            }
+            if os.path.exists("cookies.txt") and os.path.getsize("cookies.txt") > 0:
+                flat_opts["cookiefile"] = "cookies.txt"
             try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([query])
-            except yt_dlp.utils.MaxDownloadsReached:
-                pass  # expected: yt-dlp raises this after max_downloads=1 succeeds
+                with yt_dlp.YoutubeDL(flat_opts) as ydl:
+                    flat = ydl.extract_info(query, download=False)
             except Exception as exc:
                 if self._is_youtube_session_rate_limited(exc):
                     self._rate_limiter.force_open("youtube", "session rate-limited")
                     self._throttle.on_rate_limit("youtube")
-                    logger.warning("YouTube session rate-limited; circuit breaker opened, stopping Tier 4")
+                    logger.warning("YouTube session rate-limited (flat); CB opened")
+                    return None
+                logger.warning("Tier 4 flat-extract '%s' failed: %s", query, exc)
+                continue
+            for entry in (flat or {}).get("entries") or []:
+                if not entry:
+                    continue
+                vid = entry.get("id") or entry.get("url")
+                if not vid or vid in seen_ids:
+                    continue
+                seen_ids.add(vid)
+                candidates.append(entry)
+
+        if not candidates:
+            logger.info("Tier 4: no candidates from flat-extract for track %d", track.id)
+            return None
+
+        # Score and sort
+        scored = [(self._score_youtube_candidate(c, track), c) for c in candidates]
+        scored.sort(key=lambda kv: kv[0], reverse=True)
+        # Log top-3 for debug visibility
+        if scored:
+            top3 = scored[:3]
+            logger.info(
+                "Tier 4 [official-filter] track %d ('%s' / '%s'): top candidates = %s",
+                track.id, track.title, track.artist,
+                [(s, (c.get("title") or "")[:50], (c.get("channel") or c.get("uploader") or "")[:30]) for s, c in top3],
+            )
+
+        # Try in score order; reject anything with score < 0 (hard fail)
+        for score, cand in scored:
+            if score < 0:
+                logger.info(
+                    "Tier 4: no official-grade candidate for track %d (best score=%d) — giving up tier",
+                    track.id, scored[0][0] if scored else -999,
+                )
+                return None
+
+            video_id = cand.get("id") or cand.get("url")
+            if not video_id:
+                continue
+            url = f"https://www.youtube.com/watch?v={video_id}"
+
+            if not self._throttle.wait("youtube"):
+                logger.info("Throttle skip: youtube tier 4 track %d (score-loop) — will retry next run", track.id)
+                return None
+
+            out_stem = os.path.join(TEMP_DIR, str(uuid.uuid4()))
+            ydl_opts = self._build_mp3_opts(out_stem)
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+            except Exception as exc:
+                if self._is_youtube_session_rate_limited(exc):
+                    self._rate_limiter.force_open("youtube", "session rate-limited")
+                    self._throttle.on_rate_limit("youtube")
+                    logger.warning("YouTube session rate-limited; CB opened, stopping Tier 4")
                     return None
                 if not self._is_content_error(exc):
                     self._rate_limiter.record_failure("youtube")
-                logger.warning("Tier 4 query '%s' failed: %s", query, exc)
+                logger.warning("Tier 4 download '%s' failed: %s", url, exc)
                 continue
 
             downloaded = self._find_output_file(out_stem)
             if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 0:
                 self._rate_limiter.record_success("youtube")
                 self._throttle.on_success("youtube")
+                logger.info(
+                    "Tier 4: track %d delivered via official-filtered candidate (score=%d, vid=%s)",
+                    track.id, score, video_id,
+                )
                 return downloaded
 
         return None

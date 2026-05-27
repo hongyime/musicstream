@@ -87,3 +87,9 @@ skills/
 skills-lock.json
 docs/
 templates/
+
+# Dev-mode compose override (per-machine). Bind-mounts src/ for instant
+# code reload. See LIKED_ARTISTS_EXPAND_V1 / OFFICIAL_SOURCE_FILTER_V1 era.
+docker-compose.override.yml
+docker-compose.override.yaml
+
