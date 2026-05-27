@@ -13,6 +13,13 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     restart: unless-stopped
+    # Cap docker json-file logs — without this, /var/lib/docker/containers/<id>-json.log
+    # grows without bound (saw 44 MB on neighbour projects). 10m × 3 = 30 MB max per service.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # Audit #31: drop ambient capabilities + lock down the security profile.
     # Postgres runs as its own UID inside the image so it doesn't need any
     # of the SUID dance in the default seccomp profile.
@@ -38,6 +45,11 @@ services:
     ports:
       - "0.0.0.0:32400:32400"
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:32400/identity"]
       interval: 30s
@@ -55,6 +67,11 @@ services:
     environment:
       - TZ=Asia/Singapore
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       - plex
     healthcheck:
@@ -128,6 +145,11 @@ services:
       - 1.1.1.1
       - 8.8.8.8
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # Audit #31: prevent runtime privilege escalation; the daemon is now
     # non-root via Dockerfile USER directive and never legitimately
     # needs setuid binaries.
