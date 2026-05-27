@@ -11,7 +11,7 @@ import os
 import secrets as _secrets
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -196,11 +196,19 @@ async def _background_startup():
 
         logger.info("Step 6/9: Running download pipeline…")
         run_id = await asyncio.to_thread(tasks._record_run_start, "startup")
+
+        # Step 7 fires-and-forgets in parallel so a long download_pipeline()
+        # (can be hours when there's a backlog) doesn't starve discovery.
+        # Previously step 7 awaited step 6 in series; a single multi-hour
+        # download backlog would skip discovery for that whole boot, which
+        # is how lb_discovery silently fell 7 days behind.
+        logger.info("Step 7/9: Scheduling ListenBrainz discovery (parallel, fires immediately)…")
+        _lb_task = asyncio.create_task(asyncio.to_thread(tasks.listenbrainz_discovery))
+        _background_tasks.add(_lb_task)
+        _lb_task.add_done_callback(_background_tasks.discard)
+
         dl, fail = await asyncio.to_thread(tasks.download_pipeline)
         await asyncio.to_thread(tasks._record_run_complete, run_id=run_id, downloaded=dl, failed=fail)
-
-        logger.info("Step 7/9: Running ListenBrainz discovery…")
-        await asyncio.to_thread(tasks.listenbrainz_discovery)
 
         logger.info("Step 8/9: Running DB backup…")
         await asyncio.to_thread(tasks.db_backup)
@@ -289,13 +297,55 @@ async def _broadcast_health():
         await asyncio.sleep(5)
 
 def _register_scheduler_jobs():
-    scheduler.add_job(tasks.spotify_incremental_sync, "cron", minute="*/15", id="spotify_sync", replace_existing=True)
-    scheduler.add_job(tasks.spotify_saved_albums_sync, "cron", hour="*/6", id="saved_albums_sync", replace_existing=True)
-    scheduler.add_job(tasks.spotify_followed_artists_sync, "cron", day_of_week="sun", hour=6, id="followed_artists_sync", replace_existing=True)
-    scheduler.add_job(tasks.full_download_pipeline, "cron", hour=3, id="download_pipeline", replace_existing=True)
-    scheduler.add_job(tasks.listenbrainz_discovery, "cron", hour=4, id="lb_discovery", replace_existing=True)
-    scheduler.add_job(tasks.full_integrity_check, "cron", day_of_week="wed,sun", hour=5, id="integrity_check", replace_existing=True)
-    scheduler.add_job(tasks.db_backup, "cron", day_of_week="sun", hour=5, id="db_backup", replace_existing=True)
+    # misfire_grace_time=3600 — if the daemon was down at the scheduled
+    # tick (e.g. we recreated the container past 04:00 SGT), APScheduler
+    # will still fire the job on next startup as long as we're within an
+    # hour of the scheduled time.  Without this, missed ticks are silently
+    # dropped — that's why lb_discovery hadn't run for 7 days.
+    GRACE = 3600
+    scheduler.add_job(tasks.spotify_incremental_sync, "cron", minute="*/15", id="spotify_sync", replace_existing=True, misfire_grace_time=GRACE)
+    scheduler.add_job(tasks.spotify_saved_albums_sync, "cron", hour="*/6", id="saved_albums_sync", replace_existing=True, misfire_grace_time=GRACE)
+    scheduler.add_job(tasks.spotify_followed_artists_sync, "cron", day_of_week="sun", hour=6, id="followed_artists_sync", replace_existing=True, misfire_grace_time=GRACE)
+    scheduler.add_job(tasks.full_download_pipeline, "cron", hour=3, id="download_pipeline", replace_existing=True, misfire_grace_time=GRACE)
+    scheduler.add_job(tasks.listenbrainz_discovery, "cron", hour=4, id="lb_discovery", replace_existing=True, misfire_grace_time=GRACE)
+    scheduler.add_job(tasks.full_integrity_check, "cron", day_of_week="wed,sun", hour=5, id="integrity_check", replace_existing=True, misfire_grace_time=GRACE)
+    scheduler.add_job(tasks.db_backup, "cron", day_of_week="sun", hour=5, id="db_backup", replace_existing=True, misfire_grace_time=GRACE)
+
+
+def _lb_discovery_overdue() -> bool:
+    """
+    Return True if the last successful ListenBrainz discovery run is older
+    than 24 hours (or if there has never been one).  Uses lb_recommendations
+    .fetched_at as the source of truth — that's the timestamp written for
+    every row inserted by ListenBrainzDiscovery.run().
+    """
+    try:
+        from src.db import get_session
+        from src.models import LbRecommendation
+        from sqlalchemy import func
+        with get_session() as session:
+            last = session.query(func.max(LbRecommendation.fetched_at)).scalar()
+        if last is None:
+            return True
+        return (datetime.now(timezone.utc) - last) > timedelta(hours=24)
+    except Exception as exc:
+        logger.warning("Could not determine LB discovery overdue state: %s", exc)
+        return False
+
+
+def _self_heal_lb_discovery_if_overdue():
+    """
+    Defensive backfill: if the daemon has been restarted enough times that
+    APScheduler missed the daily 04:00 lb_discovery tick AND misfire_grace_time
+    didn't catch it (e.g. the daemon was down for >1h past the scheduled tick),
+    fire the discovery job once on startup so we don't silently fall behind.
+    Runs on a thread so daemon startup isn't blocked by MusicBrainz's 1 req/s.
+    """
+    if not _lb_discovery_overdue():
+        logger.info("LB discovery up-to-date; no self-heal needed.")
+        return
+    logger.warning("LB discovery overdue (>24h since last fetched_at); self-healing in background.")
+    asyncio.get_event_loop().run_in_executor(None, tasks.listenbrainz_discovery)
 
 # ── API Routes ────────────────────────────────────────────────────────────────
 
