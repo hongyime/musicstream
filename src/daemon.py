@@ -494,6 +494,60 @@ async def health():
     return payload
 
 
+@app.get("/health/deep", include_in_schema=False)
+async def health_deep():
+    """P1-6: deep liveness probe for external monitoring (NOT Docker's healthcheck).
+
+    Extends /health with scheduler liveness and the age of the most recent daemon
+    run. Returns 503 'degraded' if the DB is unreachable, the scheduler is not
+    running, or no daemon run has started within DEEP_HEALTH_MAX_RUN_AGE_S (default
+    26h — the download pipeline runs daily plus a boot run). Kept separate from the
+    shallow /health so a wedged scheduler surfaces to monitors without making
+    Docker restart the container on a transient hiccup.
+    """
+    import sqlalchemy as _sa
+    from src.db import get_session
+    from src.models import DaemonRun
+
+    db_ok = False
+    try:
+        with get_session() as s:
+            s.execute(_sa.text("SELECT 1"))
+            db_ok = True
+    except Exception:
+        db_ok = False
+
+    sched_ok = bool(scheduler.running)
+
+    last_started = None
+    try:
+        with get_session() as s:
+            last_started = s.query(_sa.func.max(DaemonRun.started_at)).scalar()
+    except Exception:
+        last_started = None
+
+    max_age = int(os.environ.get("DEEP_HEALTH_MAX_RUN_AGE_S", str(26 * 3600)))
+    run_age_s = None
+    run_fresh = False
+    if last_started is not None:
+        run_age_s = (datetime.now(timezone.utc) - last_started).total_seconds()
+        run_fresh = run_age_s <= max_age
+
+    degraded = (not db_ok) or (not sched_ok) or (not run_fresh)
+    payload = {
+        "status": "degraded" if degraded else "ok",
+        "db": db_ok,
+        "scheduler_running": sched_ok,
+        "last_run_started_at": last_started.isoformat() if last_started else None,
+        "last_run_age_seconds": int(run_age_s) if run_age_s is not None else None,
+        "last_run_fresh": run_fresh,
+    }
+    if degraded:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=503, content=payload)
+    return payload
+
+
 @app.get("/api/musicstream/stats", response_model=ApiResponse[TrackStats])
 async def get_stats():
     from src.db import get_session
