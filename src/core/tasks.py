@@ -238,19 +238,40 @@ def download_pipeline() -> tuple[int, int]:
         from src.ingestion.downloader import DownloadOrchestrator
         orchestrator = DownloadOrchestrator()
 
-        # Phase 1: librespot
-        try:
-            with get_session() as session:
-                lib_dl, lib_fail = orchestrator.download_pending_librespot(session)
-            logger.info("librespot sweep: downloaded=%d failed=%d", lib_dl, lib_fail)
-        except Exception as exc:
-            logger.error("librespot sweep failed (non-fatal): %s", exc, exc_info=True)
-            lib_dl = 0
+        # T0 tier-ordering (pre-P2-3 throughput fix): run the Tier-0 librespot
+        # pre-sweep CONCURRENTLY with the 12-worker batch instead of blocking the
+        # batch behind librespot's up-to-2h serial budget — the measured
+        # bottleneck (see SCOPING_P2-9_P2-3.md / burn-rate). Safety (Oracle-
+        # reviewed): download_track's atomic UPDATE...WHERE status=PENDING claim
+        # makes double-downloads impossible (the loser sees status!=PENDING and
+        # skips); _LIBRESPOT_SEMAPHORE(1) still serialises librespot WITHIN this
+        # process so single-flight holds and the Spotify account is not locked
+        # (a worker thread is not a second process); batch tiers 1/2/4/5 never
+        # touch that semaphore. Net: batch + librespot overlap instead of serial.
+        import concurrent.futures as _cf
 
-        # Phase 2: Parallel batch
-        with get_session() as session:
-            downloaded, failed = orchestrator.download_pending(session)
-        logger.info("Download pipeline complete: downloaded=%d failed=%d", downloaded, failed)
+        def _librespot_phase() -> tuple[int, int]:
+            try:
+                with get_session() as session:
+                    return orchestrator.download_pending_librespot(session)
+            except Exception as exc:  # noqa: BLE001 — non-fatal; batch continues
+                logger.error("librespot sweep failed (non-fatal): %s", exc, exc_info=True)
+                return 0, 0
+
+        lib_dl = 0
+        with _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="librespot-sweep") as _lib_ex:
+            _lib_future = _lib_ex.submit(_librespot_phase)
+            try:
+                with get_session() as session:
+                    downloaded, failed = orchestrator.download_pending(session)
+            except Exception as exc:  # noqa: BLE001 — non-fatal; one bad batch != dead cycle
+                logger.error("batch sweep failed (non-fatal): %s", exc, exc_info=True)
+                downloaded, failed = 0, 0
+            lib_dl, _lib_fail = _lib_future.result()
+        logger.info(
+            "Download pipeline complete (concurrent T0): batch=%d librespot=%d failed=%d",
+            downloaded, lib_dl, failed,
+        )
         downloaded += lib_dl
 
         # Phase 3: spotdl sweep
