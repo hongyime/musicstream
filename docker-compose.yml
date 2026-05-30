@@ -2,7 +2,10 @@ services:
   postgres:
     # Audit #31: pin minor version explicitly.  `postgres:16-alpine` floats —
     # a silent base-image bump can break extensions or change locale behaviour.
-    image: postgres:16.4-alpine
+    # Bumped 16.4 -> 16.13 so the server's bundled psql understands the `\restrict`
+    # directive emitted by pg_dump 16.13+, so backups restore byte-clean with the
+    # server's own client (16.4 psql errored: "invalid command \restrict").
+    image: postgres:16.13-alpine
     container_name: musicstream-postgres
     environment:
       POSTGRES_DB: musicstream
