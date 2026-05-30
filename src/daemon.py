@@ -270,6 +270,15 @@ async def _background_startup():
         _background_tasks.add(_wd_task)
         _wd_task.add_done_callback(_background_tasks.discard)
 
+        # P0-1: authoritative orphaned-download reset. Phases 1 (librespot) and
+        # 3 (spotdl) of download_pipeline() claim rows into DOWNLOADING outside
+        # the Phase-2 reset, so a hard restart mid-sweep strands queue slots
+        # forever. --workers 1 guarantees no download worker survives a process
+        # restart, so at boot we safely reset ALL 'downloading' rows to 'pending'
+        # (no leaky 30-min heuristic). Must run before any sweep this boot.
+        reset_n = await asyncio.to_thread(tasks.reset_orphaned_downloads, True)
+        logger.info("Boot orphan-reset: %d stranded DOWNLOADING row(s) -> PENDING", reset_n)
+
         logger.info("Step 3/9: Skipping legacy banner (UI-only now)")
 
         if os.environ.get("SKIP_STARTUP_INTEGRITY", "true").lower() in ("1", "true", "yes", "on"):
