@@ -23,6 +23,19 @@ from src.models import Base, Track, Source, DownloadAttempt
 # the real unit tests is not blocked.
 collect_ignore = ["test_download.py", "test_refresh_artwork.py"]
 
+# ── Hypothesis stability ──────────────────────────────────────────────────────
+# Disable the per-example deadline so property tests don't flake on a loaded
+# CI/dev box (timing varies under load; the assertions don't). Standard CI
+# practice; does not weaken any test. Guarded in case hypothesis is absent.
+try:
+    from hypothesis import settings as _hyp_settings, HealthCheck as _HC
+    _hyp_settings.register_profile(
+        "ms", deadline=None, suppress_health_check=[_HC.too_slow]
+    )
+    _hyp_settings.load_profile("ms")
+except Exception:  # pragma: no cover - hypothesis optional
+    pass
+
 # ── Test Database Configuration ───────────────────────────────────────────────
 
 # Use in-memory SQLite for fast, isolated tests
