@@ -36,6 +36,7 @@ class IntegrityResult:
     corrupt: int = 0
     ok: int = 0
     total_checked: int = 0
+    no_method: int = 0
 
 
 class IntegrityChecker:
@@ -205,11 +206,33 @@ class IntegrityChecker:
             session.add(track)
             result.ok += 1
 
+        # P1-2: downloaded-without-method invariant. download_method records
+        # which tier delivered the file; a downloaded row missing it means
+        # unauditable provenance (cannot re-fetch by source if a tier ships
+        # bad files). Observability only — we do NOT reset these rows (the
+        # file is present and valid); we surface the count loudly.
+        from sqlalchemy import or_
+        result.no_method = (
+            session.query(Track)
+            .filter(
+                Track.status == TrackStatus.DOWNLOADED.value,
+                or_(Track.download_method.is_(None), Track.download_method == ""),
+            )
+            .count()
+        )
+        if result.no_method:
+            errors_logger.error(
+                "[NO_METHOD] %d downloaded track(s) have NULL/empty download_method "
+                "(unauditable provenance — run the download_method backfill)",
+                result.no_method,
+            )
+
         logger.info(
-            "Integrity check complete: total=%d ok=%d missing=%d corrupt=%d",
+            "Integrity check complete: total=%d ok=%d missing=%d corrupt=%d no_method=%d",
             result.total_checked,
             result.ok,
             result.missing,
             result.corrupt,
+            result.no_method,
         )
         return result
