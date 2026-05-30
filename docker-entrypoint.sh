@@ -22,8 +22,13 @@ RUNTIME_USER="${RUNTIME_USER:-musicstream}"
 RUNTIME_UID="${RUNTIME_UID:-1000}"
 RUNTIME_GID="${RUNTIME_GID:-1000}"
 
-# Best-effort fix on writable mount targets.
-for d in /app/logs /app/backups /app/data; do
+# Best-effort fix on writable mount targets + the in-container temp/ workdir.
+# /app/temp is NOT a bind mount; it must be writable by the runtime user or the
+# download tiers (spotiflac/yt-dlp/librespot/spotdl) fail with EACCES. The image
+# ships it musicstream-owned; re-assert here in case a stray root-owned temp/
+# was created (e.g. by a root `docker exec ... python` that imported the
+# orchestrator, whose __init__ does os.makedirs(TEMP_DIR)).
+for d in /app/logs /app/backups /app/data /app/temp; do
     if [ -d "$d" ]; then
         # Don't fail if chown returns non-zero — read-only filesystems
         # legitimately reject the call. The daemon's first write will

@@ -79,7 +79,7 @@ COPY --from=frontend-builder /app/frontend/dist ./static
 # runtime user.  Bind-mounts (/app/data, /app/logs, /app/backups) inherit
 # their host owner but the entrypoint copes with that because the daemon
 # only writes via tempfile + os.replace.
-RUN mkdir -p /app/data /app/logs /app/backups \
+RUN mkdir -p /app/data /app/logs /app/backups /app/temp \
     && chown -R musicstream:musicstream /app
 
 # Install entrypoint script that fixes bind-mount ownership at runtime
