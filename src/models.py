@@ -118,6 +118,12 @@ class Track(Base):
     status:          Mapped[str]           = mapped_column(String, nullable=False, default=TrackStatus.PENDING.value)
     download_method: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
+    # Download attempt accounting (migration 0003) — explicit requeue/give-up
+    # policy instead of COUNT(download_attempts) on every check. attempt_count
+    # tracks FAILED tier attempts; backfilled from download_attempts.
+    attempt_count:   Mapped[int]                = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # File info
     format:          Mapped[Optional[str]] = mapped_column(String, nullable=True)   # 'flac' | 'mp3'
     file_path:       Mapped[Optional[str]] = mapped_column(String, nullable=True)
