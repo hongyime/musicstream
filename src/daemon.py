@@ -251,6 +251,22 @@ async def lifespan(app: FastAPI):
     yield
     
     # Shutdown logic
+    # P0-2: drain-on-shutdown. Signal the download sweeps to stop claiming new
+    # work, then best-effort reset any rows still DOWNLOADING back to PENDING.
+    # With P0-1's boot reset this closes the orphaned-row leak from both ends:
+    # --workers 1 means no worker survives this process, so in-flight rows are
+    # genuinely abandoned and must return to the queue.
+    try:
+        from src.ingestion.downloader import request_shutdown
+        request_shutdown()
+    except Exception as exc:  # noqa: BLE001 — shutdown must not raise
+        logger.warning("Could not signal downloader shutdown: %s", exc)
+    try:
+        drained = tasks.reset_orphaned_downloads(all_rows=True)
+        if drained:
+            logger.info("Shutdown drain: reset %d in-flight DOWNLOADING row(s) -> PENDING", drained)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Shutdown drain reset failed: %s", exc)
     scheduler.shutdown()
 
 async def _background_startup():
