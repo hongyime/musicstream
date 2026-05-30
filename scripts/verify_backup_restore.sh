@@ -45,12 +45,12 @@ trap cleanup EXIT
 psql_main -c "DROP DATABASE IF EXISTS ${SCRATCH_DB};" >/dev/null 2>&1 || true
 psql_main -c "CREATE DATABASE ${SCRATCH_DB};" >/dev/null 2>&1 || fail "could not create scratch DB ${SCRATCH_DB}" 2
 
-# Restore (plain-SQL dump streamed via stdin; the dump lives on the daemon mount,
-# not this container, so stdin is the path). Deliberately NO ON_ERROR_STOP: the
-# daemon's pg_dump (v17) is newer than the server (v16), so dumps carry cosmetic
-# v17 directives (\restrict, SET transaction_timeout) that psql v16 warns about
-# but skips harmlessly. The authoritative success check is whether the data
-# landed (the tracks-count assertion below), not psql's handling of cosmetics.
+# Restore via stdin (the dump lives on the daemon mount, not this container).
+# Deliberately NO ON_ERROR_STOP: pg_dump is pinned to the server's MAJOR (16), so
+# dumps are native v16 (no v17 SET transaction_timeout), but they still carry the
+# \restrict security directive which the server's older-minor psql warns about and
+# skips harmlessly. The authoritative success check is whether the data landed
+# (the tracks-count assertion below), not psql's handling of that cosmetic.
 docker exec -i "$PG_CONTAINER" psql -U "$PG_USER" -d "$SCRATCH_DB" < "${latest}" >/dev/null 2>&1 || true
 
 # Assert the core table restored and is populated.
