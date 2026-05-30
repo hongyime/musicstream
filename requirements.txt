@@ -6,11 +6,13 @@ psycopg2-binary==2.9.12
 python-dotenv==1.2.2
 
 # Download pipeline
-# yt-dlp + spotdl unpinned — spotdl constrains yt-dlp internally;
-# pinning both causes unsolvable conflicts. Let pip resolve.
-yt-dlp[default]
+# yt-dlp + spotdl pinned to the live-resolved versions (P1-3). They coexist at
+# these exact versions in the running image, so pinning both IS resolvable (the
+# earlier 'unsolvable conflict' note was about pinning to arbitrary versions).
+# yt-dlp ships breaking changes often — bump deliberately via Dependabot PRs.
+yt-dlp[default]==2026.3.17
 ytmusicapi==1.12.0
-spotdl
+spotdl==3.9.6
 # spotdl 3.9.6 imports pkg_resources (legacy setuptools API).
 # setuptools >= 81 (Aug 2025) removed pkg_resources, breaking `import spotdl`
 # and the CLI. Pin <81 until spotdl upstream migrates to importlib.metadata.
@@ -19,7 +21,7 @@ setuptools<81
 
 # Tier 0: direct Spotify CDN streaming (requires Spotify Premium account)
 # PyPI package: https://pypi.org/project/librespot/ (versions 0.0.x)
-librespot
+librespot==0.0.10
 
 # Metadata & tagging
 mutagen==1.47.0
@@ -37,7 +39,7 @@ pydantic==2.10.6
 APScheduler==3.11.0
 
 # UI — version constrained by spotdl
-rich
+rich==15.0.0
 
 # Dev tools
 ruff==0.15.12
