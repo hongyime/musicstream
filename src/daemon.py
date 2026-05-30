@@ -572,6 +572,47 @@ async def get_stats():
     except Exception as e:
         return ApiResponse(error=str(e))
 
+@app.get("/api/musicstream/burn-rate")
+async def get_burn_rate():
+    """P2-7: download throughput + ETA. Surfaces downloads/hr (from successful
+    attempts) and projected completion for the pending backlog so the operator
+    can see whether the queue is converging and judge whether throughput is the
+    binding constraint (informs the deferred multi-worker question)."""
+    from datetime import timedelta
+    from src.db import get_session
+    from src.models import Track, DownloadAttempt
+    from sqlalchemy import func
+    try:
+        with get_session() as session:
+            now = datetime.now(timezone.utc)
+            pending = session.query(Track).filter(Track.status == "pending").count()
+            downloaded = session.query(Track).filter(Track.status == "downloaded").count()
+
+            def _succ_since(hours: int) -> int:
+                return session.query(func.count(DownloadAttempt.id)).filter(
+                    DownloadAttempt.success.is_(True),
+                    DownloadAttempt.attempted_at > now - timedelta(hours=hours),
+                ).scalar() or 0
+
+            dl_1h = _succ_since(1)
+            dl_24h = _succ_since(24)
+            rate_1h = float(dl_1h)
+            rate_24h = dl_24h / 24.0
+            eta_days_1h = (pending / rate_1h / 24.0) if rate_1h > 0 else None
+            eta_days_24h = (pending / rate_24h / 24.0) if rate_24h > 0 else None
+            return ApiResponse(data={
+                "pending": pending,
+                "downloaded": downloaded,
+                "downloads_last_1h": dl_1h,
+                "downloads_last_24h": dl_24h,
+                "rate_per_hour_recent": round(rate_1h, 1),
+                "rate_per_hour_24h_avg": round(rate_24h, 1),
+                "eta_days_at_recent_rate": round(eta_days_1h, 1) if eta_days_1h is not None else None,
+                "eta_days_at_24h_rate": round(eta_days_24h, 1) if eta_days_24h is not None else None,
+            })
+    except Exception as e:
+        return ApiResponse(error=str(e))
+
 @app.get("/api/musicstream/tracks")
 async def get_tracks(status: str = "pending", limit: int = 100):
     from src.db import get_session

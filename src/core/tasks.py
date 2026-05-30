@@ -198,6 +198,32 @@ def reset_orphaned_downloads(all_rows: bool = False, stale_after_minutes: int = 
         return 0
 
 
+def _log_burn_rate() -> None:
+    """P2-7: log throughput + ETA once per pipeline cycle. downloads/hr from
+    successful attempts in the trailing hour, pending backlog, projected days.
+    Surfaces whether the queue is converging (also exposed at /api/musicstream/burn-rate)."""
+    try:
+        from datetime import timedelta
+        from src.db import get_session
+        from src.models import Track, DownloadAttempt
+        from sqlalchemy import func
+        with get_session() as session:
+            pending = session.query(Track).filter(Track.status == "pending").count()
+            dl_1h = session.query(func.count(DownloadAttempt.id)).filter(
+                DownloadAttempt.success.is_(True),
+                DownloadAttempt.attempted_at > datetime.now(timezone.utc) - timedelta(hours=1),
+            ).scalar() or 0
+        if dl_1h > 0:
+            logger.info(
+                "Burn-rate: %d downloads/hr | %d pending | ETA ~%.1f days at current rate",
+                dl_1h, pending, pending / dl_1h / 24.0,
+            )
+        else:
+            logger.info("Burn-rate: 0 downloads in last hour | %d pending | ETA n/a", pending)
+    except Exception as exc:
+        logger.warning("Burn-rate logging failed: %s", exc)
+
+
 def download_pipeline() -> tuple[int, int]:
     """Run the download pipeline for all pending tracks. Returns (downloaded, failed)."""
     logger.info("Running download pipeline…")
@@ -235,6 +261,7 @@ def download_pipeline() -> tuple[int, int]:
             downloaded += sdl_dl
         except Exception as exc:
             logger.error("spotdl sweep failed (non-fatal): %s", exc, exc_info=True)
+        _log_burn_rate()
         return downloaded, failed
     except Exception as exc:
         logger.error("Download pipeline failed: %s", exc, exc_info=True)
