@@ -191,7 +191,7 @@ def main():
     # Test 4: Parameter validation
     results.append(("Parameter Validation", test_invalid_params()))
     
-    Test 5: Actual missing refresh (optional - only if daemon is running)
+    # Test 5: Actual missing refresh (optional - only if daemon is running)
     # results.append(("Actual Refresh Missing", test_refresh_artwork_missing_mode()))
     # Test 6: Actual all refresh (optional)
     # results.append(("Actual Refresh All", test_refresh_artwork_all_mode()))

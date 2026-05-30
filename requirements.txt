@@ -46,3 +46,4 @@ ruff==0.15.12
 mypy==1.20.2
 pytest==9.0.3
 hypothesis==6.152.4
+pytest-cov==7.1.0

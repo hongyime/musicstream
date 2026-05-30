@@ -1,0 +1,59 @@
+name: Python Tests
+
+# P2-10: pytest + coverage gate for the daemon.
+#
+# Implemented as a dedicated workflow rather than folded into ci.yml because
+# ci.yml is a synced, frontend-only "Build Check" (its path filter and Node
+# build logic come from sourcerepo); adding Python logic there would change the
+# frontend trigger semantics and be clobbered by the next settings sync.
+#
+# NOTE: the suite currently has pre-existing unit-test failures unrelated to the
+# P0/P1 remediation (stale mocks / a removed-symbol orchestrator test / a stale
+# REQUIRED_SERVICES set / a missing pytest-asyncio dep). This gate surfaces that
+# debt; it will be RED until those are fixed. The two manual smoke scripts in
+# tests/ are excluded via tests/conftest.py collect_ignore. Coverage floor is set
+# below the current ~30% baseline to block regressions; raise it as coverage
+# improves (this gate is the prerequisite for the P2-9 decomposition).
+
+on:
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "**.py"
+      - "requirements.txt"
+      - "pytest.ini"
+      - "tests/**"
+  push:
+    branches: [main, master]
+    paths:
+      - "**.py"
+      - "requirements.txt"
+      - "tests/**"
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest + coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libchromaprint-dev ffmpeg
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests with coverage (floor 25%)
+        run: pytest tests/ --cov=src --cov-report=term-missing --cov-fail-under=25
