@@ -39,14 +39,15 @@ done
 # "[OAUTH] exchange OK" but Spotipy silently fails the cache write
 # (PermissionError, eaten by its CacheFileHandler) and the next request
 # loads the stale on-disk token — manifesting as "needs_auth" forever.
-for f in /app/spotify_token.json /app/cookies.txt; do
+# P2-1: tighten credential files to 0600 (owner rw only) on every start.
+# They are secrets in a single-tenant container; 0600 clears the daemon's own
+# permissive-mode warning and re-applies after bind-mount remounts that reset
+# host-derived perms to 0777. Still owner-writable so OAuth/credential refresh
+# (Spotipy/spotdl/librespot rewrite these in place) keeps working.
+for f in /app/spotify_token.json /app/cookies.txt /app/data/librespot_credentials.json; do
     if [ -e "$f" ]; then
         chown "$RUNTIME_UID:$RUNTIME_GID" "$f" 2>/dev/null || true
-        # Also relax mode to 0644 for files that came in as 0600 owned by
-        # someone else.  Cookies/tokens are secrets but they're already
-        # bind-mounted into a single-tenant container — host-side perms
-        # are what matter.
-        chmod u+rw "$f" 2>/dev/null || true
+        chmod 600 "$f" 2>/dev/null || true
     fi
 done
 
