@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import yt_dlp  # type: ignore[import-untyped]
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.exceptions import DownloadError, OrganiserError, TaggingError
@@ -612,6 +612,7 @@ class DownloadOrchestrator:
                     )
                     download_method = self._resolve_method_label(method_name, path)
                     track.download_method = download_method
+                    track.last_attempt_at = _utcnow()
                     session.flush()
 
                     # ── Tag the file (non-fatal: bad tags ≠ bad download) ──────
@@ -659,10 +660,14 @@ class DownloadOrchestrator:
                         error="tier returned None",
                         success=False,
                     )
+                    track.attempt_count = (track.attempt_count or 0) + 1
+                    track.last_attempt_at = _utcnow()
             except Exception as exc:
                 self._record_attempt(
                     session, track.id, method_name, error=str(exc), success=False
                 )
+                track.attempt_count = (track.attempt_count or 0) + 1
+                track.last_attempt_at = _utcnow()
                 logger.warning(
                     "Tier %s failed for track id=%d: %s",
                     method_name,
@@ -1521,17 +1526,16 @@ class DownloadOrchestrator:
     # ── Give-up logic ──────────────────────────────────────────────────────────
 
     def _should_give_up(self, session: Session, track_id: int) -> bool:
-        """
-        Returns True if the track has ≥25 failed attempts recorded.
-        """
-        failed_count = session.execute(
-            select(func.count(DownloadAttempt.id)).where(
-                DownloadAttempt.track_id == track_id,
-                DownloadAttempt.success == False,  # noqa: E712
-            )
-        ).scalar_one()
+        """Return True once the track has >= _GIVE_UP_THRESHOLD failed attempts (P2-6).
 
-        return failed_count >= _GIVE_UP_THRESHOLD
+        Reads the maintained tracks.attempt_count column (migration 0003,
+        incremented on every failed tier attempt and backfilled from
+        download_attempts) instead of COUNT(download_attempts) on every check —
+        equivalent semantics, cheaper. The track is in this session's identity
+        map, so .get() returns the in-memory object with this run's increments.
+        """
+        track = session.get(Track, track_id)
+        return bool(track) and (track.attempt_count or 0) >= _GIVE_UP_THRESHOLD
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
