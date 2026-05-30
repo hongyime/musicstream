@@ -29,12 +29,22 @@ RUN npm run build
 FROM python:3.12-slim AS runtime
 WORKDIR /app
 
-# Install system dependencies + tini for signal forwarding + gosu for
-# the entrypoint UID-drop pattern.
+# Install system dependencies + tini (signal forwarding) + gosu (entrypoint
+# UID-drop). postgresql-client is pinned to MAJOR 16 to MATCH the Postgres 16
+# server: a v17 client's pg_dump emits \restrict / SET transaction_timeout that
+# a v16 server cannot cleanly restore. Installed from the PGDG apt repo, which
+# carries major-version-specific client packages (Debian trixie ships only v17).
 RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+         -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    && . /etc/os-release \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+         > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
-       ffmpeg curl git libchromaprint-dev postgresql-client tini gosu \
-       unzip ca-certificates \
+       ffmpeg git libchromaprint-dev postgresql-client-16 tini gosu unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Deno (≥2.3.0) so yt-dlp-ejs can solve YouTube's signature /
