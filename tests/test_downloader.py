@@ -77,6 +77,12 @@ def _add_failed_attempts(session, track_id, count):
             success=False,
         )
         session.add(a)
+    track = session.get(Track, track_id)
+    if track is not None:
+        # P2-6: give-up now reads tracks.attempt_count (incremented per failed
+        # tier attempt in production + backfilled). Keep this helper consistent
+        # so the _should_give_up tests exercise the real column-based logic.
+        track.attempt_count = (track.attempt_count or 0) + count
     session.flush()
 
 
@@ -212,6 +218,7 @@ class TestDownloadTrackIsolation:
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         orch._rate_limiter = MagicMock()
         orch._rate_limiter.is_healthy.return_value = True
+        orch._tier1_enabled = False
 
         # Patch all tiers to raise exceptions
         with patch.object(orch, "_tier2_ytdlp_ytm", side_effect=Exception("tier2 boom")), \
@@ -227,6 +234,7 @@ class TestDownloadTrackIsolation:
         track = _make_track(session, "spotify:track:tier1_success")
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         orch._rate_limiter = MagicMock()
+        orch._tier1_enabled = False
         orch._tagger = MagicMock()
 
         # organise() must set track.status itself (FileOrganiser does this)
@@ -238,7 +246,8 @@ class TestDownloadTrackIsolation:
         orch._organiser.organise.side_effect = _fake_organise
 
         fake_path = "/tmp/abc123_ytm.mp3"
-        with patch.object(orch, "_tier2_ytdlp_ytm", return_value=fake_path), \
+        with patch.object(orch, "_tier5_ytdlp_soundcloud", return_value=None), \
+             patch.object(orch, "_tier2_ytdlp_ytm", return_value=fake_path), \
              patch.object(orch, "_record_attempt"):
             result = orch.download_track(track, session)
 
@@ -253,6 +262,7 @@ class TestDownloadTrackIsolation:
 
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         orch._rate_limiter = MagicMock()
+        orch._tier1_enabled = False
 
         with patch.object(orch, "_tier2_ytdlp_ytm", return_value=None), \
              patch.object(orch, "_tier3_spotdl",    return_value=None), \

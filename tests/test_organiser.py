@@ -317,23 +317,21 @@ class TestOrganise:
 class TestRefreshPlex:
     def test_gets_correct_url(self):
         org = _make_organiser()
-        with patch("requests.get") as mock_get:
+        with patch.object(org._http, "get") as mock_get:
             mock_get.return_value = MagicMock(ok=True, status_code=200)
             org._refresh_plex()
         call_url = mock_get.call_args[0][0]
         assert "library/sections/1/refresh" in call_url
         assert "localhost:32400" in call_url
 
-    def test_includes_plex_token_as_query_param(self):
+    def test_includes_plex_token_in_session_headers(self):
+        # SPEC §B15: X-Plex-Token is sent as a request HEADER on the session,
+        # NOT a URL query param (avoids leaking the token in logs/proxies).
         org = _make_organiser()
-        with patch("requests.get") as mock_get:
-            mock_get.return_value = MagicMock(ok=True, status_code=200)
-            org._refresh_plex()
-        params = mock_get.call_args.kwargs["params"]
-        assert params.get("X-Plex-Token") == "fake-token"
+        assert org._http.headers.get("X-Plex-Token") == "fake-token"
 
     def test_non_ok_response_does_not_raise(self):
         org = _make_organiser()
-        with patch("requests.get") as mock_get:
+        with patch.object(org._http, "get") as mock_get:
             mock_get.return_value = MagicMock(ok=False, status_code=500, text="error")
             org._refresh_plex()  # must not raise

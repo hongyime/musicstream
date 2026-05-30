@@ -2,7 +2,7 @@
 Tests for musicstream/rate_limiter.py
 
 Covers:
-  - ServiceRateLimiter: all 9 service configs present, jitter range,
+  - ServiceRateLimiter: all 11 service configs present, jitter range,
     circuit breaker open/close, backoff capping, unknown service error
   - ExpiringResolutionCache: set/get, TTL expiry, len, invalidate, purge
   - MusicDownloadChaosMonkey: disabled by default, failure rate, stats
@@ -28,7 +28,7 @@ from src.rate_limiter import (
 
 class TestServiceRateLimiterConfigs:
     REQUIRED_SERVICES = {
-        "spotify", "librespot", "youtube", "ytmusicapi", "spotdl",
+        "spotify", "librespot", "spotiflac", "youtube", "ytmusicapi", "spotdl",
         "soundcloud", "musicbrainz", "acoustid", "listenbrainz", "coverart",
     }
 
