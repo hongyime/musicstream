@@ -16,6 +16,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.models import Base, Track, Source, DownloadAttempt
 
+# ── Collection exclusions (P2-10) ──────────────────────────────────────
+# These are MANUAL integration scripts (run via `python tests/<name>.py`
+# against a live daemon), not pytest unit tests — one imports a removed symbol,
+# one is a print-based smoke script. Exclude them so automated collection of
+# the real unit tests is not blocked.
+collect_ignore = ["test_download.py", "test_refresh_artwork.py"]
+
 # ── Test Database Configuration ───────────────────────────────────────────────
 
 # Use in-memory SQLite for fast, isolated tests
