@@ -271,6 +271,10 @@ def reconcile(media_root: str, apply_changes: bool, limit: Optional[int],
                 track.file_size_bytes = size
                 track.format = hit_fmt
                 track.status = "downloaded"
+                # P1-2: record provenance so the downloaded-without-method
+                # integrity invariant does not trip on disk-reconciled rows.
+                if not track.download_method:
+                    track.download_method = "disk_reconcile"
                 # plex_verified left False so a future verify pass picks it up
 
         if apply_changes:
