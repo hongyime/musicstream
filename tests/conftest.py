@@ -183,6 +183,8 @@ def reset_environment_variables():
         "DAEMON_API_TOKEN",
         "SPOTIFY_CLIENT_ID",
         "SPOTIFY_TOKEN_CACHE",
+        "LISTENBRAINZ_USERNAME",
+        "LISTENBRAINZ_TOKEN",
     ]
     
     for var in variables_to_reset:
