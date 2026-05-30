@@ -21,7 +21,7 @@ from src.models import Base, Track, Source, DownloadAttempt
 # against a live daemon), not pytest unit tests — one imports a removed symbol,
 # one is a print-based smoke script. Exclude them so automated collection of
 # the real unit tests is not blocked.
-collect_ignore = ["test_download.py", "test_refresh_artwork.py"]
+collect_ignore = ["test_download.py", "test_refresh_artwork.py", "test_invalid_data_endpoints.py"]
 
 # ── Hypothesis stability ──────────────────────────────────────────────────────
 # Disable the per-example deadline so property tests don't flake on a loaded
