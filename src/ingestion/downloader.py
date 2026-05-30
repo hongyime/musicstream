@@ -142,6 +142,19 @@ _GIVE_UP_THRESHOLD = 25    # ~5 complete tier-chain runs before giving up
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_WORKERS", "4"))
 logger.info("Worker concurrency set to: MAX_CONCURRENT=%d", MAX_CONCURRENT)
 
+# ── P0-2: cooperative drain-on-shutdown ──────────────────────────────────────
+# Lifespan shutdown (daemon.py) calls request_shutdown() on SIGTERM. The three
+# sweep loops below (download_pending batches, librespot pre-sweep, spotdl sweep)
+# check _shutting_down between tracks and stop claiming new work, so an in-flight
+# row is the only one that can be left DOWNLOADING — and lifespan resets that.
+# threading.Event is used because the sweeps run in worker threads.
+_shutting_down = threading.Event()
+
+
+def request_shutdown() -> None:
+    """Signal all download sweeps to stop picking up new tracks (P0-2)."""
+    _shutting_down.set()
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -301,6 +314,12 @@ class DownloadOrchestrator:
         total_batches = (len(track_ids) + batch_size - 1) // batch_size
 
         for batch_num in range(total_batches):
+            if _shutting_down.is_set():
+                logger.warning(
+                    "Shutdown requested; stopping download_pending after %d/%d batches.",
+                    batch_num, total_batches,
+                )
+                break
             start_idx = batch_num * batch_size
             end_idx = min(start_idx + batch_size, len(track_ids))
             batch_track_ids = track_ids[start_idx:end_idx]
@@ -395,6 +414,9 @@ class DownloadOrchestrator:
 
         with ThreadPoolExecutor(max_workers=1) as executor:
             for track in pending:
+                if _shutting_down.is_set():
+                    logger.warning("Shutdown requested; aborting librespot pre-sweep.")
+                    break
                 if not self._rate_limiter.is_healthy("librespot"):
                     logger.warning("librespot circuit breaker tripped; aborting pre-sweep.")
                     break
@@ -497,6 +519,9 @@ class DownloadOrchestrator:
         _spotdl_tiers = [("tier3_spotdl", self._tier3_spotdl)]
 
         for track in candidates:
+            if _shutting_down.is_set():
+                logger.warning("Shutdown requested; aborting spotdl sweep.")
+                break
             if time.monotonic() - sweep_start > max_seconds:
                 logger.info("spotdl sweep: time limit reached after %.0fs", max_seconds)
                 break

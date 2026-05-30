@@ -145,6 +145,13 @@ services:
       - 1.1.1.1
       - 8.8.8.8
     restart: unless-stopped
+    # P0-2: give uvicorn time to run the lifespan shutdown drain (reset
+    # in-flight DOWNLOADING rows) before SIGKILL. The default 10s is too short
+    # — uvicorn's graceful shutdown (connection drain + lifespan) can exceed it
+    # under an active download pipeline, killing the drain mid-way. With this,
+    # `docker compose stop/restart/down` drains cleanly; P0-1's boot reset stays
+    # the authoritative backstop if a hard kill still occurs.
+    stop_grace_period: 30s
     logging:
       driver: json-file
       options:
