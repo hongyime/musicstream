@@ -15,6 +15,13 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 # Import Base from models so Alembic can detect schema changes via autogenerate
+# P1-1: ensure the repo root is importable when alembic runs as a standalone
+# CLI. uvicorn puts /app on sys.path for the daemon process, but `alembic ...`
+# invoked directly does not — without this the next import raises
+# ModuleNotFoundError: No module named 'src.models'. Must precede that import.
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from src.models import Base
 
 # ── Load .env if DATABASE_URL is not already in the environment ───────────────
