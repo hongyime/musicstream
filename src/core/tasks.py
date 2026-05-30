@@ -157,10 +157,57 @@ def maybe_run_full_backfill() -> int:
         logger.error("Full backfill failed (non-fatal): %s", exc, exc_info=True)
         return 0
 
+def reset_orphaned_downloads(all_rows: bool = False, stale_after_minutes: int = 30) -> int:
+    """Reset stranded status='downloading' rows back to 'pending'. (P0-1)
+
+    Rows strand in DOWNLOADING when the process dies mid-sweep: phases 1
+    (librespot) and 3 (spotdl) of download_pipeline() claim rows outside the
+    Phase-2 reset in DownloadOrchestrator.download_pending(), so a hard restart
+    leaks queue slots permanently.
+
+    all_rows=True  - reset EVERY downloading row (boot path). Safe because
+                     --workers 1 guarantees no download worker survives a
+                     process restart, so nothing is genuinely in flight.
+    all_rows=False - only reset rows whose updated_at is older than
+                     ``stale_after_minutes`` (mid-run path). A scheduled run
+                     overlapping a still-running pipeline must not yank rows
+                     from under live workers, which bump updated_at on every
+                     tier transition, so an old timestamp is provably crashed.
+
+    Returns the number of rows reset.
+    """
+    from datetime import timedelta
+    from src.db import get_session
+    from src.models import Track, TrackStatus
+    try:
+        with get_session() as session:
+            q = session.query(Track).filter(Track.status == TrackStatus.DOWNLOADING.value)
+            if not all_rows:
+                cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_after_minutes)
+                q = q.filter(Track.updated_at < cutoff)
+            count = q.update({"status": TrackStatus.PENDING.value}, synchronize_session=False)
+            session.commit()
+        if count:
+            logger.info(
+                "reset_orphaned_downloads: %d stranded DOWNLOADING row(s) -> PENDING (all_rows=%s)",
+                count, all_rows,
+            )
+        return count
+    except Exception as exc:
+        logger.error("reset_orphaned_downloads failed: %s", exc, exc_info=True)
+        return 0
+
+
 def download_pipeline() -> tuple[int, int]:
     """Run the download pipeline for all pending tracks. Returns (downloaded, failed)."""
     logger.info("Running download pipeline…")
     try:
+        # P0-1 (defense-in-depth): clear rows stranded in DOWNLOADING by a
+        # crashed prior run before claiming new work. 30-min cutoff
+        # (all_rows=False) so a scheduled run overlapping a still-running
+        # pipeline cannot reset rows held by live workers; the authoritative
+        # all-rows reset runs once per boot in daemon._background_startup().
+        reset_orphaned_downloads(all_rows=False)
         from src.db import get_session
         from src.ingestion.downloader import DownloadOrchestrator
         orchestrator = DownloadOrchestrator()
