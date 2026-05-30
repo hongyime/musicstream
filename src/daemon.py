@@ -461,7 +461,7 @@ def _self_heal_lb_discovery_if_overdue():
         logger.info("LB discovery up-to-date; no self-heal needed.")
         return
     logger.warning("LB discovery overdue (>24h since last fetched_at); self-healing in background.")
-    asyncio.get_event_loop().run_in_executor(None, tasks.listenbrainz_discovery)
+    asyncio.get_running_loop().run_in_executor(None, tasks.listenbrainz_discovery)
 
 # ── API Routes ────────────────────────────────────────────────────────────────
 
