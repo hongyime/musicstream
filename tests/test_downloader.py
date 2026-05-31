@@ -628,3 +628,162 @@ class TestProperty2PreservationYouTubeDownloads:
         assert stem in opts["outtmpl"], \
             f"Output template should include stem path {stem}"
 
+
+
+
+# ── Failure-reason attribution: persist the REAL reason, not 'tier returned None' ─
+
+class TestFailureReasonAttribution:
+    """download_attempts.error must carry the tier's real reason (or the
+    explicit fallback constant), recorded thread-safely."""
+
+    def _orch(self):
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+        orch._rate_limiter = MagicMock()
+        orch._rate_limiter.is_healthy.return_value = True
+        orch._tier1_enabled = False
+        return orch
+
+    def test_records_real_reason_when_tier_notes_fail(self, session):
+        from src.ingestion import tier_errors
+        track = _make_track(session, "spotify:track:reason_real")
+        orch = self._orch()
+
+        def fake_tier(trk):
+            orch._note_fail(tier_errors.REGION_UNAVAIL)
+            return None
+
+        result = orch.download_track(
+            track, session, tiers_override=[("tier0_librespot", fake_tier)]
+        )
+        assert result is False
+        attempt = (
+            session.query(DownloadAttempt)
+            .filter_by(track_id=track.id, method="tier0_librespot")
+            .first()
+        )
+        assert attempt is not None
+        assert attempt.error == tier_errors.REGION_UNAVAIL
+        assert attempt.success is False
+
+    def test_fallback_when_tier_silent(self, session):
+        from src.ingestion import tier_errors
+        track = _make_track(session, "spotify:track:reason_fallback")
+        orch = self._orch()
+        result = orch.download_track(
+            track, session, tiers_override=[("tier2_ytdlp_ytm", lambda trk: None)]
+        )
+        assert result is False
+        attempt = session.query(DownloadAttempt).filter_by(track_id=track.id).first()
+        assert attempt.error == tier_errors.UNKNOWN_TIER_FAIL
+
+    def test_no_leak_into_success(self, session):
+        from src.ingestion import tier_errors
+        from src.models import TrackStatus as TS
+        track = _make_track(session, "spotify:track:reason_noleak")
+        orch = self._orch()
+        orch._tagger = MagicMock()
+        orch._organiser = MagicMock()
+
+        def _fake_org(path, trk, sess):
+            trk.status = TS.DOWNLOADED.value
+            return "/media/a/b/c.mp3"
+        orch._organiser.organise.side_effect = _fake_org
+
+        def failing(trk):
+            orch._note_fail(tier_errors.REGION_UNAVAIL)
+            return None
+
+        def succeeding(trk):
+            return "/tmp/ok_ytm.mp3"
+
+        result = orch.download_track(
+            track, session,
+            tiers_override=[("tier0_librespot", failing), ("tier2_ytdlp_ytm", succeeding)],
+        )
+        assert result is True
+        attempts = (
+            session.query(DownloadAttempt)
+            .filter_by(track_id=track.id)
+            .order_by(DownloadAttempt.id)
+            .all()
+        )
+        assert attempts[0].success is False
+        assert attempts[0].error == tier_errors.REGION_UNAVAIL
+        assert attempts[-1].success is True
+        assert attempts[-1].error is None
+
+    def test_thread_isolation(self):
+        """Two threads set different reasons concurrently; each must read its own
+        (proves the thread-local channel, not a shared instance attribute)."""
+        import threading
+        from src.ingestion import tier_errors
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+        results = {}
+        both_set = threading.Barrier(2)
+
+        def worker(name, reason):
+            orch._note_fail(reason)
+            both_set.wait()  # ensure both have written before either reads
+            results[name] = getattr(orch._fail_tls, "fail_reason", None)
+
+        t1 = threading.Thread(target=worker, args=("a", tier_errors.REGION_UNAVAIL))
+        t2 = threading.Thread(target=worker, args=("b", tier_errors.AUTH_FAILURE))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        assert results["a"] == tier_errors.REGION_UNAVAIL
+        assert results["b"] == tier_errors.AUTH_FAILURE
+
+
+class TestTier0FailureReasons:
+    """_tier0_librespot must categorize each return-None path via _note_fail."""
+
+    def _orch(self):
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+        orch._rate_limiter = MagicMock()
+        orch._rate_limiter.is_healthy.return_value = True
+        orch._fail_tls.fail_reason = None
+        return orch
+
+    def test_not_available(self, session):
+        import src.ingestion.downloader as dl
+        from src.ingestion import tier_errors
+        track = _make_track(session, "spotify:track:t0_unavail")
+        orch = self._orch()
+        with patch.object(dl, "LIBRESPOT_AVAILABLE", False):
+            assert orch._tier0_librespot(track) is None
+        assert orch._fail_tls.fail_reason == tier_errors.NOT_AVAILABLE
+
+    def test_circuit_open(self, session):
+        import src.ingestion.downloader as dl
+        from src.ingestion import tier_errors
+        track = _make_track(session, "spotify:track:t0_circuit")
+        orch = self._orch()
+        orch._rate_limiter.is_healthy.return_value = False
+        with patch.object(dl, "LIBRESPOT_AVAILABLE", True):
+            assert orch._tier0_librespot(track) is None
+        assert orch._fail_tls.fail_reason == tier_errors.CIRCUIT_OPEN
+
+    def test_no_source_id(self, session):
+        import src.ingestion.downloader as dl
+        from src.ingestion import tier_errors
+        track = _make_track(session, "spotify:track:t0_noid")
+        orch = self._orch()
+        with patch.object(dl, "LIBRESPOT_AVAILABLE", True):
+            assert orch._tier0_librespot(track) is None
+        assert orch._fail_tls.fail_reason == tier_errors.NO_SOURCE_ID
+
+    def test_region_unavailable(self, session):
+        import src.ingestion.downloader as dl
+        from src.ingestion import tier_errors
+        track = _make_track(session, "spotify:track:t0_region")
+        track.spotify_id = "abc"
+        session.flush()
+        orch = self._orch()
+        with patch.object(dl, "LIBRESPOT_AVAILABLE", True), \
+             patch.object(dl, "_get_librespot_session",
+                          side_effect=RuntimeError("Cannot get alternative track")):
+            assert orch._tier0_librespot(track) is None
+        assert orch._fail_tls.fail_reason == tier_errors.REGION_UNAVAIL
