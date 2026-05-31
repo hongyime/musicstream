@@ -143,7 +143,7 @@ def cmd_scrape(args: argparse.Namespace) -> None:
                 reset = (
                     session.query(Track)
                     .filter(Track.status != TrackStatus.DOWNLOADED.value)
-                    .update({"status": TrackStatus.PENDING.value})
+                    .update({"status": TrackStatus.PENDING.value, "attempt_count": 0, "last_attempt_at": None})
                 )
                 print_fresh_start("scrape")
                 if reset:
@@ -199,7 +199,7 @@ def cmd_download(args: argparse.Namespace) -> None:
                         TrackStatus.DOWNLOADING.value,
                         TrackStatus.FAILED.value,
                     ])
-                ).update({"status": TrackStatus.PENDING.value})
+                ).update({"status": TrackStatus.PENDING.value, "attempt_count": 0, "last_attempt_at": None})
                 print_fresh_start("download")
 
             pending_count = (
