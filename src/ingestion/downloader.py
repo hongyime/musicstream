@@ -79,6 +79,14 @@ _SPOTIFLAC_SEMAPHORE = threading.Semaphore(2)
 # parallel so the worker pool isn't bottlenecked when librespot is skipped.
 _LIBRESPOT_SEMAPHORE = threading.Semaphore(1)
 
+# Single-flight kill signal for the librespot pre-sweep timeout watchdog: set by
+# the sweep's main thread right before it nulls the streaming session to unblock a
+# hung read, and checked by download_track's loop so the killed worker does NOT also
+# record an attempt (the main thread writes the authoritative rate_limited row).
+# Safe as one global because the sweep is max_workers=1 — exactly one in-flight attempt.
+_librespot_kill_event = threading.Event()
+_LIBRESPOT_KILL_GRACE_S = 30.0  # max wait for a killed worker to observe + exit
+
 
 def _get_librespot_session():
     """Return the shared librespot Session, creating it on first call."""
@@ -420,6 +428,15 @@ class DownloadOrchestrator:
 
         _lib_tiers = [("tier0_librespot", self._tier0_librespot)]
 
+        def _librespot_one(track_id: int) -> bool:
+            """Download one track via librespot in its OWN session — no cross-thread
+            session sharing (mirrors download_pending's worker pattern)."""
+            with get_session() as ws:
+                t = ws.get(Track, track_id)
+                if t is None or t.status != TrackStatus.PENDING.value:
+                    return False
+                return self.download_track(t, ws, _lib_tiers)
+
         with ThreadPoolExecutor(max_workers=1) as executor:
             for track in pending:
                 if _shutting_down.is_set():
@@ -434,47 +451,47 @@ class DownloadOrchestrator:
                 if not track.spotify_id:
                     continue
                 try:
-                    with get_session() as ts:
-                        t = ts.get(Track, track.id)
-                        if t is None or t.status != TrackStatus.PENDING.value:
-                            continue
-                        future = executor.submit(
-                            self.download_track, t, ts, _lib_tiers
+                    future = executor.submit(_librespot_one, track.id)
+                    try:
+                        success = future.result(timeout=per_track_timeout)
+                    except FuturesTimeout:
+                        future.cancel()
+                        logger.warning(
+                            "librespot per-track timeout (%.0fs) for track %d ('%s')",
+                            per_track_timeout, track.id, track.title,
                         )
+                        # F1: timeouts are ALSO failures so the rate-limiter trips and
+                        # we stop hammering an already-rate-limited account (#325).
+                        self._rate_limiter.record_failure("librespot")
+                        # Tell the worker THIS attempt was killed so its download_track
+                        # loop skips recording — the main thread writes the single
+                        # authoritative rate_limited row below. Single global is safe:
+                        # max_workers=1 means exactly one in-flight librespot attempt.
+                        _librespot_kill_event.set()
+                        # F3: future.cancel() is a no-op on a worker blocked in a C-level
+                        # socket read. Nulling the singleton makes the next read raise
+                        # (closed socket) so the hung worker exits; the session rebuilds.
+                        global _librespot_session
                         try:
-                            success = future.result(timeout=per_track_timeout)
-                        except FuturesTimeout:
-                            future.cancel()
-                            logger.warning(
-                                "librespot per-track timeout (%.0fs) for track %d ('%s')",
-                                per_track_timeout, track.id, track.title,
-                            )
-                            # F1: timeouts are ALSO failures. Without this, the
-                            # rate-limiter never trips and we hammer a Spotify
-                            # account that's already rate-limited (upstream
-                            # librespot-python #325): hung packet reads silently
-                            # block until our 90s watchdog, library never raises.
-                            self._rate_limiter.record_failure("librespot")
-                            # F3: future.cancel() is a no-op on a worker blocked
-                            # in a C-level socket read. The only way to unblock
-                            # the worker is to kill the underlying connection.
-                            # Invalidating the singleton makes the next read
-                            # raise (closed socket) and the hung worker exits;
-                            # _get_librespot_session() rebuilds on next call.
-                            global _librespot_session
-                            try:
-                                old = _librespot_session
-                                _librespot_session = None
-                                if old is not None and hasattr(old, "close"):
-                                    old.close()
-                            except Exception as _close_exc:  # noqa: BLE001
-                                logger.debug("librespot session close on timeout: %s", _close_exc)
-                            success = False
-                            self._record_librespot_timeout(track.id)
-                        if success:
-                            downloaded += 1
-                        else:
-                            failed += 1
+                            old = _librespot_session
+                            _librespot_session = None
+                            if old is not None and hasattr(old, "close"):
+                                old.close()
+                        except Exception as _close_exc:  # noqa: BLE001
+                            logger.debug("librespot session close on timeout: %s", _close_exc)
+                        # Wait briefly for the killed worker to observe the kill and exit
+                        # before we record + clear, so it cannot race us into a double row.
+                        try:
+                            future.result(timeout=_LIBRESPOT_KILL_GRACE_S)
+                        except Exception:  # noqa: BLE001 - grace timeout or worker error
+                            pass
+                        self._record_librespot_timeout(track.id)
+                        _librespot_kill_event.clear()
+                        success = False
+                    if success:
+                        downloaded += 1
+                    else:
+                        failed += 1
                 except Exception as exc:
                     logger.error("librespot sweep error for track %d: %s", track.id, exc, exc_info=True)
                     failed += 1
@@ -659,6 +676,11 @@ class DownloadOrchestrator:
 
                 else:
                     # Tier returned None without raising — soft failure, try next tier
+                    if _librespot_kill_event.is_set():
+                        # Killed by the librespot timeout watchdog — the sweep's main
+                        # thread records the authoritative rate_limited row; skip ours
+                        # to avoid a double-record (Oracle review, Option B).
+                        break
                     logger.info(
                         "Tier %s → no result for track %d ('%s'); trying next tier",
                         method_name, track.id, track.title,

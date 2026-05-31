@@ -833,3 +833,54 @@ class TestLibrespotTimeoutRecording:
         with patch("src.db.get_session", boom):
             # must swallow the error, not propagate
             orch._record_librespot_timeout(track.id)
+
+
+# ── Librespot kill-event suppression (worker skips record; main is authoritative) ─
+
+class TestLibrespotKillSuppression:
+    """When the sweep's timeout watchdog sets the kill event, the worker's
+    download_track must NOT record an attempt — the main thread writes the single
+    authoritative rate_limited row (Option B, avoids a double-record)."""
+
+    def test_kill_event_suppresses_worker_record(self, session):
+        import src.ingestion.downloader as dl
+        track = _make_track(session, "spotify:track:kill1")
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+        orch._rate_limiter = MagicMock()
+        orch._rate_limiter.is_healthy.return_value = True
+        orch._tier1_enabled = False
+
+        def fake_tier(trk):
+            orch._note_fail("stream_error")  # would normally be recorded by the loop
+            return None
+
+        dl._librespot_kill_event.set()
+        try:
+            result = orch.download_track(
+                track, session, tiers_override=[("tier0_librespot", fake_tier)]
+            )
+        finally:
+            dl._librespot_kill_event.clear()
+
+        assert result is False
+        # worker recorded nothing; the sweep's main thread owns the timeout row
+        assert session.query(DownloadAttempt).filter_by(track_id=track.id).count() == 0
+
+    def test_no_kill_event_records_normally(self, session):
+        """Sanity: with the event clear, the worker records as usual."""
+        import src.ingestion.downloader as dl
+        from src.ingestion import tier_errors
+        assert not dl._librespot_kill_event.is_set()
+        track = _make_track(session, "spotify:track:kill2")
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+        orch._rate_limiter = MagicMock()
+        orch._rate_limiter.is_healthy.return_value = True
+        orch._tier1_enabled = False
+
+        def fake_tier(trk):
+            orch._note_fail(tier_errors.REGION_UNAVAIL)
+            return None
+
+        orch.download_track(track, session, tiers_override=[("tier0_librespot", fake_tier)])
+        attempt = session.query(DownloadAttempt).filter_by(track_id=track.id).one()
+        assert attempt.error == tier_errors.REGION_UNAVAIL
