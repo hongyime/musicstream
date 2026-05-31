@@ -470,6 +470,7 @@ class DownloadOrchestrator:
                             except Exception as _close_exc:  # noqa: BLE001
                                 logger.debug("librespot session close on timeout: %s", _close_exc)
                             success = False
+                            self._record_librespot_timeout(track.id)
                         if success:
                             downloaded += 1
                         else:
@@ -1549,6 +1550,33 @@ class DownloadOrchestrator:
         workers isolated from each other.
         """
         self._fail_tls.fail_reason = reason
+
+    def _record_librespot_timeout(self, track_id: int) -> None:
+        """Record a librespot per-track timeout as a rate_limited attempt.
+
+        Timeouts are the symptom of Spotify per-account rate limiting (a hung
+        C-level stream.read until the 90s watchdog fires). The worker's session
+        is racy to write from here, so we use an INDEPENDENT session that never
+        touches it (Oracle review). attempt_count is bumped to keep give-up
+        logic accurate; this may rarely double-count if the worker's own
+        _record_attempt commits before the sweep closes its session - accepted,
+        since a systematic undercount on timeouts is worse than a rare overcount.
+        """
+        from src.db import get_session
+        try:
+            with get_session() as rec:
+                self._record_attempt(
+                    rec, track_id, "tier0_librespot",
+                    error=te.RATE_LIMITED, success=False,
+                )
+                rt = rec.get(Track, track_id)
+                if rt is not None:
+                    rt.attempt_count = (rt.attempt_count or 0) + 1
+                    rt.last_attempt_at = _utcnow()
+        except Exception as exc:  # noqa: BLE001 - recording must never break the sweep
+            logger.debug(
+                "could not record librespot timeout attempt for %d: %s", track_id, exc,
+            )
 
     # ── Give-up logic ──────────────────────────────────────────────────────────
 
