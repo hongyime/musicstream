@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 from src.exceptions import DownloadError, OrganiserError, TaggingError
 from src.models import DownloadAttempt, Track, TrackStatus
 from src.rate_limiter import ServiceRateLimiter, ServiceThrottle
+from src.ingestion import tier_errors as te
 
 logger = logging.getLogger(__name__)
 errors_logger = logging.getLogger("errors")
@@ -169,6 +170,13 @@ class DownloadOrchestrator:
     """
 
     MAX_CONCURRENT: int = MAX_CONCURRENT
+
+    # Thread-local channel: a tier records WHY it returned None so the download
+    # loop can persist the real reason into download_attempts.error instead of a
+    # generic placeholder (Oracle review). Class-level so it survives
+    # DownloadOrchestrator.__new__(...) used in tests and is per-thread-isolated
+    # across the worker pool.
+    _fail_tls = threading.local()
 
     def __init__(self) -> None:
         # Check if Tier 1 (SpotiFLAC) is enabled
@@ -605,6 +613,7 @@ class DownloadOrchestrator:
 
         for method_name, tier_fn in tiers:
             try:
+                self._fail_tls.fail_reason = None
                 path = tier_fn(track)
                 if path:
                     self._record_attempt(
@@ -657,7 +666,7 @@ class DownloadOrchestrator:
                         session,
                         track.id,
                         method_name,
-                        error="tier returned None",
+                        error=getattr(self._fail_tls, "fail_reason", None) or te.UNKNOWN_TIER_FAIL,
                         success=False,
                     )
                     track.attempt_count = (track.attempt_count or 0) + 1
@@ -811,14 +820,17 @@ class DownloadOrchestrator:
         Returns temp MP3 path or None.
         """
         if not LIBRESPOT_AVAILABLE:
+            self._note_fail(te.NOT_AVAILABLE)
             return None
 
         if not self._rate_limiter.is_healthy("librespot"):
             logger.warning("librespot circuit breaker open; skipping Tier 0.")
+            self._note_fail(te.CIRCUIT_OPEN)
             return None
 
         if not track.spotify_id:
             logger.debug("Tier 0 skipped for track %d: no spotify_id", track.id)
+            self._note_fail(te.NO_SOURCE_ID)
             return None
 
         # F4: pre-filter tracks that librespot consistently can't fetch.
@@ -841,6 +853,7 @@ class DownloadOrchestrator:
                     "Tier 0 pre-skip for track %d ('%s'): title matches non-music heuristic",
                     track.id, track.title,
                 )
+                self._note_fail(te.NONMUSIC_SKIP)
                 return None
 
         out_dir: Optional[str] = None
@@ -873,6 +886,7 @@ class DownloadOrchestrator:
                 if not os.path.exists(ogg_path) or os.path.getsize(ogg_path) < 1024:
                     logger.warning("librespot: empty stream for track %d ('%s')", track.id, track.title)
                     self._rate_limiter.record_failure("librespot")
+                    self._note_fail(te.EMPTY_STREAM)
                     return None
 
             # FFmpeg conversion is CPU-bound, not librespot-session-bound — release
@@ -903,6 +917,7 @@ class DownloadOrchestrator:
                     track.id, mp3_size, ffmpeg_result.stderr.decode(errors="replace")[:200],
                 )
                 self._rate_limiter.record_failure("librespot")
+                self._note_fail(te.FFMPEG_FAIL)
                 return None
 
             # Promote MP3 OUT of the per-call workdir so the workdir can be
@@ -939,6 +954,7 @@ class DownloadOrchestrator:
                     "librespot: no playable variant for track %d ('%s') — cascading to next tier",
                     track.id, track.title,
                 )
+                self._note_fail(te.REGION_UNAVAIL)
                 return None
 
             self._rate_limiter.record_failure("librespot")
@@ -950,6 +966,7 @@ class DownloadOrchestrator:
             if is_auth_failure:
                 global _librespot_session
                 _librespot_session = None
+            self._note_fail(te.AUTH_FAILURE if is_auth_failure else te.STREAM_ERROR)
             return None
         finally:
             # Always remove the per-call workdir. Success path already moved
@@ -1522,6 +1539,16 @@ class DownloadOrchestrator:
         )
         session.add(attempt)
         session.flush()
+
+    def _note_fail(self, reason: str) -> None:
+        """Record (thread-locally) WHY the current tier is about to return None.
+
+        The tier loop consumes this in the _record_attempt call so
+        download_attempts.error holds the real reason (e.g. region_unavailable)
+        instead of a placeholder. threading.local keeps the concurrent download
+        workers isolated from each other.
+        """
+        self._fail_tls.fail_reason = reason
 
     # ── Give-up logic ──────────────────────────────────────────────────────────
 
