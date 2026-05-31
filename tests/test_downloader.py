@@ -787,3 +787,49 @@ class TestTier0FailureReasons:
                           side_effect=RuntimeError("Cannot get alternative track")):
             assert orch._tier0_librespot(track) is None
         assert orch._fail_tls.fail_reason == tier_errors.REGION_UNAVAIL
+
+
+# ── Librespot timeout → rate_limited attribution ─────────────────────────
+
+class TestLibrespotTimeoutRecording:
+    """A librespot per-track timeout (rate-limit symptom) must persist a
+    rate_limited download_attempts row via an independent session."""
+
+    def test_record_librespot_timeout_writes_rate_limited(self, session):
+        from contextlib import contextmanager
+        from src.ingestion import tier_errors
+        track = _make_track(session, "spotify:track:t0_ratelimit")
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+
+        @contextmanager
+        def fake_get_session():
+            # reuse the fixture session; conftest owns commit/rollback lifecycle
+            yield session
+
+        with patch("src.db.get_session", fake_get_session):
+            orch._record_librespot_timeout(track.id)
+
+        attempt = (
+            session.query(DownloadAttempt)
+            .filter_by(track_id=track.id, method="tier0_librespot")
+            .one()
+        )
+        assert attempt.error == tier_errors.RATE_LIMITED
+        assert attempt.success is False
+        refreshed = session.get(Track, track.id)
+        assert (refreshed.attempt_count or 0) == 1
+
+    def test_timeout_recording_never_raises_on_db_error(self, session):
+        """Recording must never break the sweep, even if the session blows up."""
+        from contextlib import contextmanager
+        track = _make_track(session, "spotify:track:t0_rl_safe")
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+
+        @contextmanager
+        def boom():
+            raise RuntimeError("db exploded")
+            yield  # pragma: no cover
+
+        with patch("src.db.get_session", boom):
+            # must swallow the error, not propagate
+            orch._record_librespot_timeout(track.id)
