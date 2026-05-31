@@ -720,12 +720,9 @@ async def trigger_integrity():
 @app.post("/api/musicstream/tracks/reset-failed", dependencies=[Depends(require_auth)])
 async def reset_failed():
     from src.db import get_session
-    from src.models import Track, TrackStatus
     try:
         with get_session() as session:
-            count = session.query(Track).filter(
-                Track.status.in_(["failed", "failed_validation", "timed_out"])
-            ).update({"status": TrackStatus.PENDING.value}, synchronize_session=False)
+            count = tasks.reset_failed_tracks(session)
             session.commit()
             return ApiResponse(data={"reset_count": count})
     except Exception as e:

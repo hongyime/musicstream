@@ -198,6 +198,30 @@ def reset_orphaned_downloads(all_rows: bool = False, stale_after_minutes: int = 
         return 0
 
 
+def reset_failed_tracks(session) -> int:
+    """Requeue failed / failed_validation / timed_out tracks to PENDING for a
+    fresh download cycle (POST /tracks/reset-failed).
+
+    CRITICAL: also clears attempt_count + last_attempt_at. A track only reaches
+    'failed' by hitting _GIVE_UP_THRESHOLD, so resetting status alone lets
+    _should_give_up() re-fail it on the first tier miss without a real retry —
+    defeating the entire point of the reset. Caller owns the transaction.
+    """
+    from src.models import Track, TrackStatus
+    return (
+        session.query(Track)
+        .filter(Track.status.in_(["failed", "failed_validation", "timed_out"]))
+        .update(
+            {
+                "status": TrackStatus.PENDING.value,
+                "attempt_count": 0,
+                "last_attempt_at": None,
+            },
+            synchronize_session=False,
+        )
+    )
+
+
 def _log_burn_rate() -> None:
     """P2-7: log throughput + ETA once per pipeline cycle. downloads/hr from
     successful attempts in the trailing hour, pending backlog, projected days.
