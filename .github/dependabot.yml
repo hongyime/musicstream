@@ -121,12 +121,6 @@ updates:
     schedule:
       interval: "daily"
       time: "15:00"
-    # P1-3: yt-dlp, spotdl, librespot, rich are pinned in requirements.txt;
-    # this ecosystem opens reviewable bump PRs (with CI) for them instead of
-    # silent rebuild surprises. Review yt-dlp bumps closely — high churn.
-    labels:
-      - "dependencies"
-      - "python"
 
   # Terraform (.tf files)
   - package-ecosystem: "terraform"
