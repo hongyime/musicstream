@@ -33,7 +33,7 @@ fastapi[all]==0.115.11
 uvicorn[standard]==0.34.0
 websockets==15.0
 httpx==0.28.1
-pydantic==2.10.6
+pydantic==2.13.4
 
 # Daemon
 APScheduler==3.11.0
