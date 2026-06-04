@@ -17,7 +17,7 @@ spotdl==3.9.6
 # setuptools >= 81 (Aug 2025) removed pkg_resources, breaking `import spotdl`
 # and the CLI. Pin <81 until spotdl upstream migrates to importlib.metadata.
 # Verified: setuptools 80.10.2 still ships pkg_resources.
-setuptools<81
+setuptools<83
 
 # Tier 0: direct Spotify CDN streaming (requires Spotify Premium account)
 # PyPI package: https://pypi.org/project/librespot/ (versions 0.0.x)
