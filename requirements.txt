@@ -31,7 +31,7 @@ SpotiFLAC==0.7.7
 # HTTP & API
 fastapi[all]==0.136.3
 uvicorn[standard]==0.49.0
-websockets==15.0
+websockets==16.0
 httpx==0.28.1
 pydantic==2.13.4
 
