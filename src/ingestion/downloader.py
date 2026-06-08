@@ -620,9 +620,9 @@ class DownloadOrchestrator:
         # semaphore or produce 11x the Spotify API hammering.
         tiers = tiers_override if tiers_override is not None else [
             ("tier1_spotiflac",        self._tier1_spotiflac),
-            ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),
             ("tier2_ytdlp_ytm",        self._tier2_ytdlp_ytm),
             ("tier4_ytdlp_youtube",    self._tier4_ytdlp_youtube),
+            ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),
         ]
 
         # Filter out disabled tiers
