@@ -10,7 +10,7 @@ python-dotenv==1.2.2
 # these exact versions in the running image, so pinning both IS resolvable (the
 # earlier 'unsolvable conflict' note was about pinning to arbitrary versions).
 # yt-dlp ships breaking changes often — bump deliberately via Dependabot PRs.
-yt-dlp[default]==2026.3.17
+yt-dlp[default]==2026.6.9
 ytmusicapi==1.12.0
 spotdl==3.9.6
 # spotdl 3.9.6 imports pkg_resources (legacy setuptools API).
