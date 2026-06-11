@@ -20,6 +20,7 @@ import { DataTable } from './components/DataTable';
 import { StatusBadge } from './components/StatusBadge';
 import { Button } from './components/Button';
 import { TokenPrompt } from './components/TokenPrompt';
+import { ArtworkCard } from './components/ArtworkCard';
 import { musicstreamService } from './services/api';
 import { useHealthWS, type ServiceHealth } from './hooks/useHealthWS';
 
@@ -218,19 +219,25 @@ function App() {
                 />
               </div>
               
-              <div className="col-span-12 lg:col-span-4">
-                <h2 className="text-xs uppercase tracking-wider text-muted font-bold mb-3 px-1">System Health</h2>
-                <div className="card p-4 space-y-4">
-                  {healthData.map((service) => (
-                    <div key={service.service} className="flex items-center justify-between p-2 rounded hover:bg-white/5 transition-colors">
-                      <div className="flex flex-col">
-                        <span className="text-sm font-medium">{service.service}</span>
-                        <span className="text-[10px] text-muted font-mono">{new Date(service.updated_at).toLocaleTimeString()}</span>
+              <div className="col-span-12 lg:col-span-4 flex flex-col space-y-6">
+                <div>
+                  <h2 className="text-xs uppercase tracking-wider text-muted font-bold mb-3 px-1">System Health</h2>
+                  <div className="card p-4 space-y-4">
+                    {healthData.map((service) => (
+                      <div key={service.service} className="flex items-center justify-between p-2 rounded hover:bg-white/5 transition-colors">
+                        <div className="flex flex-col">
+                          <span className="text-sm font-medium">{service.service}</span>
+                          <span className="text-[10px] text-muted font-mono">{new Date(service.updated_at).toLocaleTimeString()}</span>
+                        </div>
+                        <StatusBadge label={service.status} status={service.status as any} />
                       </div>
-                      <StatusBadge label={service.status} status={service.status as any} />
-                    </div>
-                  ))}
-                  {healthData.length === 0 && <div className="text-center py-8 text-muted text-sm italic">Waiting for telemetry...</div>}
+                    ))}
+                    {healthData.length === 0 && <div className="text-center py-8 text-muted text-sm italic">Waiting for telemetry...</div>}
+                  </div>
+                </div>
+                
+                <div className="flex-1">
+                  <ArtworkCard />
                 </div>
               </div>
             </div>
