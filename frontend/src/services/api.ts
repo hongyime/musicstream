@@ -157,4 +157,17 @@ export const musicstreamService = {
       client_id: string | null;
       redirect_uri: string;
     }>('/auth/status'),
+
+  getArtworkReport: () => fetch('/api/artwork-report', {
+    headers: {
+      ...(getDaemonToken() ? { 'Authorization': `Bearer ${getDaemonToken()}` } : {})
+    }
+  }).then(res => res.json()),
+
+  refreshArtwork: (mode: string = "missing", limit: number = 10, dryRun: number = 0) => fetch(`/api/artwork-refresh?mode=${mode}&limit=${limit}&dry_run=${dryRun}`, {
+    method: 'POST',
+    headers: {
+      ...(getDaemonToken() ? { 'Authorization': `Bearer ${getDaemonToken()}` } : {})
+    }
+  }).then(res => res.json()),
 };
