@@ -71,7 +71,7 @@ if SPOTIFLAC_AVAILABLE:
     logger.info("SpotiFLAC available — Tier 1 active")
 
 # SpotiFLAC serialisation — streaming services return 429 under concurrent load.
-_SPOTIFLAC_SEMAPHORE = threading.Semaphore(2)
+_SPOTIFLAC_SEMAPHORE = threading.Semaphore(1)
 
 # Librespot serialisation — single Spotify streaming session per account, parallel
 # stream loads cause 90s timeouts and circuit-breaker trips. Force strictly serial
@@ -499,8 +499,8 @@ class DownloadOrchestrator:
                 # confirms <5s between streams reliably triggers Spotify's
                 # per-account rate limit, after which the account is dead for
                 # 1-2 hours.  Override with LIBRESPOT_INTER_TRACK_SLEEP=0 for
-                # tests; default 5s in production.
-                _inter_sleep = float(os.environ.get("LIBRESPOT_INTER_TRACK_SLEEP", "5"))
+                # tests; default 10s in production.
+                _inter_sleep = float(os.environ.get("LIBRESPOT_INTER_TRACK_SLEEP", "10"))
                 if _inter_sleep > 0:
                     time.sleep(_inter_sleep)
 
@@ -614,13 +614,14 @@ class DownloadOrchestrator:
         # Refresh the in-memory ORM object so subsequent reads see DOWNLOADING.
         session.refresh(track)
 
-        # Tier 0 (librespot) and tier 3 (spotdl) are single-worker sweeps that
-        # run before/after this batch — not in the 12-worker pool.  Both require
-        # serialised access; running them here would block 11/12 workers on a
-        # semaphore or produce 11x the Spotify API hammering.
+        # Tier 0 (librespot) is a single-worker sweep that runs before this
+        # batch — not in the 12-worker pool. It requires serialised access;
+        # running it here would block 11/12 workers on a semaphore or produce
+        # 11x the Spotify API hammering.
         tiers = tiers_override if tiers_override is not None else [
             ("tier1_spotiflac",        self._tier1_spotiflac),
             ("tier2_ytdlp_ytm",        self._tier2_ytdlp_ytm),
+            ("tier3_spotdl",           self._tier3_spotdl),
             ("tier4_ytdlp_youtube",    self._tier4_ytdlp_youtube),
             ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),
         ]
