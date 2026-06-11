@@ -53,7 +53,7 @@ V6: admin endpoints ? token gate if token configured
 ## §P Plan
 
 ### P2 (next)
-- T7: integration tests — start daemon, hit all 4 endpoints
+- T7: integration tests — start daemon, hit all 4 endpoints ✓
 - T8: dashboard `/` → artwork card; link report; button → refresh (manual only; ⊥ auto)
 - T9: spotdl batch PoC
 
