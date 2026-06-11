@@ -2,11 +2,23 @@ import logging
 import os
 import subprocess
 from datetime import datetime, timezone
-from typing import Optional
+from functools import wraps
+from typing import Optional, Callable, Any
 
 from src.core.config import LOG_DIR, BACKUP_DIR, MAX_BACKUPS, DISABLE_DOWNLOADS, SPOTIFY_CLIENT_ID
 
 logger = logging.getLogger("musicstream.daemon")
+
+# ── Resilience Helpers ────────────────────────────────────────────────────────
+
+def pause_on_no_internet(func: Callable) -> Callable:
+    """Decorator that blocks execution until internet is available."""
+    @wraps(func)
+    def wrapper(*args, **kwargs) -> Any:
+        from src.utils import wait_for_internet
+        wait_for_internet()
+        return func(*args, **kwargs)
+    return wrapper
 
 # ── Stats Helpers ─────────────────────────────────────────────────────────────
 
@@ -46,6 +58,7 @@ def _get_errors_log_size() -> float:
 
 # ── Pipeline Tasks ────────────────────────────────────────────────────────────
 
+@pause_on_no_internet
 def integrity_check() -> None:
     """Run the file integrity checker and log results."""
     logger.info("Running integrity check…")
@@ -62,6 +75,7 @@ def integrity_check() -> None:
     except Exception as exc:
         logger.error("Integrity check failed: %s", exc, exc_info=True)
 
+@pause_on_no_internet
 def spotify_incremental_sync() -> None:
     """Run Spotify incremental sync and log new track count."""
     logger.info("Running Spotify incremental sync.")
@@ -76,6 +90,7 @@ def spotify_incremental_sync() -> None:
         logger.error("Spotify incremental sync failed: %s", exc, exc_info=True)
 
 
+@pause_on_no_internet
 def spotify_saved_albums_sync() -> None:
     """Pull every Spotify Saved Album and upsert all its tracks."""
     logger.info("Running Spotify saved-albums sync.")
@@ -90,6 +105,7 @@ def spotify_saved_albums_sync() -> None:
         logger.error("Spotify saved-albums sync failed: %s", exc, exc_info=True)
 
 
+@pause_on_no_internet
 def spotify_followed_artists_sync() -> None:
     """Pull every followed artist's full discography (heavy weekly sweep)."""
     logger.info("Running Spotify followed-artists sync.")
@@ -104,6 +120,7 @@ def spotify_followed_artists_sync() -> None:
         logger.error("Spotify followed-artists sync failed: %s", exc, exc_info=True)
 
 
+@pause_on_no_internet
 def spotify_liked_artists_expand(batch_size: int = 50) -> None:
     """LIKED_ARTISTS_EXPAND_V1: discography-expand artists from Liked Songs +
     Saved Albums, including appears_on (guest features). Bounded daily job —
@@ -125,6 +142,7 @@ def spotify_liked_artists_expand(batch_size: int = 50) -> None:
         logger.error("Spotify liked-artists expand failed: %s", exc, exc_info=True)
 
 
+@pause_on_no_internet
 def maybe_run_full_backfill() -> int:
     """One-time catch-up: if the DB has no album/artist sources yet, run a full
     backfill so saved-albums and followed-artists data lands. Idempotent — once

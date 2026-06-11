@@ -54,6 +54,13 @@ This file defines how AI coding agents (Cursor, Antigravity, Claude Code, GitHub
 - Admit uncertainty when present
 - Ask for clarification when requirements are ambiguous
 
+### 5. Handoff Protocol (MANDATORY)
+- **ALWAYS** create a handoff document at the end of every session or when approaching context limits.
+- **LOCATION**: `.claude/handoffs/YYYY-MM-DD-HHMMSS-[task-slug].md`
+- **CONTENT**: Must include Current State, Important Context, Immediate Next Steps, and Decisions Made.
+- **PURPOSE**: Ensure seamless continuity for subsequent agents, especially in long-running tasks.
+- **CONTINUATION**: If continuing previous work, link to the predecessor handoff.
+
 ## Repository-Specific Overrides
 
 ### source-repo-code (Template/Source)

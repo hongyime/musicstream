@@ -272,6 +272,10 @@ async def lifespan(app: FastAPI):
 async def _background_startup():
     """Run the 9-step startup sequence in the background."""
     try:
+        # Wait for internet before doing anything that might require it (sync, backfill, discovery).
+        from src.utils import wait_for_internet
+        await asyncio.to_thread(wait_for_internet)
+
         # Permission audit on credential files. Bind-mounted secrets often
         # come over from the host with permissive mode bits because Docker
         # inherits the host's umask. We don't *enforce* a tight mode (many
