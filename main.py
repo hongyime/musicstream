@@ -130,8 +130,10 @@ def _require_client_id() -> str:
 def cmd_scrape(args: argparse.Namespace) -> None:
     from src.db import get_session, init_db
     from src.ingestion.scraper import SpotifyScraper
+    from src.utils import wait_for_internet
 
     print_header("Scrape")
+    wait_for_internet()
     client_id = _require_client_id()
     init_db()
 
@@ -178,8 +180,10 @@ def cmd_scrape(args: argparse.Namespace) -> None:
 def cmd_download(args: argparse.Namespace) -> None:
     from src.db import get_session, init_db
     from src.ingestion.downloader import DownloadOrchestrator
+    from src.utils import wait_for_internet
 
     print_header("Download")
+    wait_for_internet()
     if not _check_ffmpeg():
         logger.error(
             "FFmpeg not found. Install it or place ffmpeg.exe in the project directory.\n"
@@ -301,19 +305,12 @@ def cmd_integrity(_args: argparse.Namespace) -> None:
 
 def cmd_daemon(_args: argparse.Namespace) -> None:
     """Start the musicstream daemon (APScheduler + FastAPI control plane).
-
-    Audit #16: previous implementation called ``daemon_module.app.run(...)``
-    which assumes Flask. The daemon was migrated to FastAPI but main.py was
-    never updated — running ``musicstream daemon`` raised AttributeError on
-    ``app.run`` and the daemon never came up via this entrypoint. Production
-    used ``docker-compose`` → ``uvicorn src.daemon:app`` directly, masking
-    the bug from the deployed system but breaking every local-dev workflow.
-    Also: the second startup_sequence thread was redundant — FastAPI's
-    lifespan handler runs the same sequence under the proper event loop.
-
+    ...
     Fix: launch uvicorn programmatically pointing at ``src.daemon:app``.
     """
+    from src.utils import wait_for_internet
     print_header("Daemon")
+    wait_for_internet()
     try:
         from src.db import init_db, run_migrations, wait_for_db
         _engine = wait_for_db(max_retries=5, backoff_s=5.0)
