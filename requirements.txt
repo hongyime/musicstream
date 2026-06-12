@@ -42,7 +42,7 @@ APScheduler==3.11.2
 rich==15.0.0
 
 # Dev tools
-ruff==0.15.16
+ruff==0.15.17
 mypy==2.1.0
 pytest==9.0.3
 hypothesis==6.155.2
