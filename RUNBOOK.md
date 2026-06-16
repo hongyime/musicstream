@@ -77,7 +77,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:9079/api/musicst
 T0 librespot (Spotify Premium, single-flight, serial pre-sweep) → T1 SpotiFLAC (lossless)
 → T2 yt-dlp+ytmusicapi → T3 spotdl → T4 yt-dlp YouTube → T5 yt-dlp SoundCloud.
 T0/T3 are serial sweeps; T1/T2/T4/T5 run in a `MAX_CONCURRENT_WORKERS` (default 12) ThreadPool.
-A track is marked `failed` after `_GIVE_UP_THRESHOLD` (25) failed attempts (tracked in `tracks.attempt_count`).
+A track is marked `failed` after `_GIVE_UP_THRESHOLD` (20) failed attempts (tracked in `tracks.attempt_count`).
 
 ---
 

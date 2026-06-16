@@ -143,7 +143,7 @@ except ImportError:
 
 TEMP_DIR: str = os.environ.get("TEMP_DIR", "temp")
 _DURATION_TOLERANCE_S = 5  # ±5 seconds for duration validation
-_GIVE_UP_THRESHOLD = 25    # ~5 complete tier-chain runs before giving up
+_GIVE_UP_THRESHOLD = 20    # ~4 complete tier-chain runs before giving up
 
 # Worker concurrency — configurable via environment variable
 # Default: 4 workers, can be increased to 6 or 8 for faster downloads
