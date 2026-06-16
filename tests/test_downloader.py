@@ -94,8 +94,8 @@ class TestConstants:
         assert isinstance(DownloadOrchestrator.MAX_CONCURRENT, int)
         assert DownloadOrchestrator.MAX_CONCURRENT >= 1
 
-    def test_give_up_threshold_is_25(self):
-        assert _GIVE_UP_THRESHOLD == 25
+    def test_give_up_threshold_is_20(self):
+        assert _GIVE_UP_THRESHOLD == 20
 
 
 # ── _should_give_up ───────────────────────────────────────────────────────────
@@ -109,7 +109,7 @@ class TestShouldGiveUp:
 
     def test_at_threshold_returns_true(self, session):
         track = _make_track(session, "spotify:track:giveup_at")
-        _add_failed_attempts(session, track.id, 25)
+        _add_failed_attempts(session, track.id, 20)
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         assert orch._should_give_up(session, track.id) is True
 
