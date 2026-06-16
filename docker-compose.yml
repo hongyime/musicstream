@@ -5,7 +5,7 @@ services:
     # Bumped 16.4 -> 16.13 so the server's bundled psql understands the `\restrict`
     # directive emitted by pg_dump 16.13+, so backups restore byte-clean with the
     # server's own client (16.4 psql errored: "invalid command \restrict").
-    image: postgres:18.4-alpine
+    image: postgres:16.13-alpine
     container_name: musicstream-postgres
     environment:
       POSTGRES_DB: musicstream
@@ -16,6 +16,10 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
     # Cap docker json-file logs — without this, /var/lib/docker/containers/<id>-json.log
     # grows without bound (saw 44 MB on neighbour projects). 10m × 3 = 30 MB max per service.
     logging:
@@ -48,6 +52,10 @@ services:
     ports:
       - "0.0.0.0:32400:32400"
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
     logging:
       driver: json-file
       options:
@@ -70,6 +78,10 @@ services:
     environment:
       - TZ=Asia/Singapore
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
     logging:
       driver: json-file
       options:
@@ -128,7 +140,7 @@ services:
       - DISABLE_DOWNLOADS=${DISABLE_DOWNLOADS:-}
       # Worker concurrency for parallel downloads (default: 12 - MAXIMUM SPEED 🚀)
       # 12 workers = 3x faster than original 4 workers. Monitor for rate limits!
-      - MAX_CONCURRENT_WORKERS=${MAX_CONCURRENT_WORKERS:-12}
+      - MAX_CONCURRENT_WORKERS=${MAX_CONCURRENT_WORKERS:-2}
       # Audit #6/#28: Bearer token enforced on all mutating endpoints.
       # Daemon refuses to start (503 on every protected route) unless this
       # is set, so it MUST be present in your .env.  See .env.example for
@@ -171,7 +183,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: 512M
     depends_on:
       postgres:
         condition: service_healthy
