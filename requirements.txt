@@ -1,6 +1,6 @@
 # Core
 spotipy==2.26.0
-SQLAlchemy==2.0.50
+SQLAlchemy==2.0.51
 alembic==1.18.4
 psycopg2-binary==2.9.12
 python-dotenv==1.2.2
