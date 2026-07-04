@@ -703,12 +703,15 @@ async def artwork_report():
 
 @app.post("/api/artwork-refresh", dependencies=[Depends(require_auth)])
 async def artwork_refresh(mode: str = "missing", limit: int = 10, dry_run: int = 0):
-    # Simple placeholder to satisfy T7 integration tests
     if mode not in ("missing", "all"):
         raise HTTPException(status_code=400, detail="Invalid mode")
     if limit <= 0:
         raise HTTPException(status_code=400, detail="Invalid limit")
-    return {"summary": {"processed": 0, "refreshed": 0, "errors": 0}}
+    
+    from src.ingestion.artwork_checker import generate_folder_jpgs
+    is_dry_run = bool(dry_run)
+    result = await asyncio.to_thread(generate_folder_jpgs, mode, limit, is_dry_run)
+    return result
 
 @app.post("/api/musicstream/sync", dependencies=[Depends(require_auth)])
 async def trigger_sync():
