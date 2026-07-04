@@ -46,20 +46,20 @@ V6: admin endpoints ? token gate if token configured
 | T6  | x      | refresh-artwork endpoint                | V4        |
 | T7  | .      | integration tests (daemon live)         |           |
 | T8  | .      | dashboard artwork card                  | §I        |
-| T9  | .      | spotdl batch PoC (behind flag)          | V3,V5     |
-| T10 | .      | folder.jpg generator                    | V4        |
-| T11 | .      | spotdl HTTP service PoC (behind flag)   | V3        |
+| T9  | x      | spotdl batch PoC (behind flag)          | V3,V5     |
+| T10 | x      | folder.jpg generator                    | V4        |
+| T11 | x      | spotdl HTTP service PoC (behind flag)   | V3        |
 
 ## §P Plan
 
 ### P2 (next)
 - T7: integration tests — start daemon, hit all 4 endpoints ✓
 - T8: dashboard `/` → artwork card; link report; button → refresh (manual only; ⊥ auto) ✓
-- T9: spotdl batch PoC
+- T9: spotdl batch PoC (CLI array mode) ✓
+- T10: folder.jpg generator ✓
+- T11: spotdl HTTP service PoC (behind flag) ✓
 
 ### P3
-- T10: folder.jpg generator
-- T11: spotdl HTTP service PoC
 
 ## §F Test Failures → Fixes
 

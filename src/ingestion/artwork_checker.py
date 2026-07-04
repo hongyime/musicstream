@@ -187,3 +187,72 @@ def _extract_m4a_artwork(file_path: str) -> Optional[bytes]:
     except Exception as e:
         logger.debug("Error extracting M4A artwork: %s", e)
         return None
+
+def generate_folder_jpgs(mode: str = "missing", limit: int = 10, dry_run: bool = False) -> dict:
+    """
+    Generate folder.jpg for downloaded albums using embedded artwork.
+    """
+    import os
+    from pathlib import Path
+    from src.db import get_session
+    from src.models import Track, TrackStatus
+    
+    processed = 0
+    refreshed = 0
+    errors = 0
+    
+    try:
+        with get_session() as session:
+            # Find all downloaded tracks
+            tracks = session.query(Track).filter(
+                Track.status == TrackStatus.DOWNLOADED.value,
+                Track.file_path != None
+            ).all()
+            
+            # Map directory -> sample file path
+            album_dirs = {}
+            for track in tracks:
+                if not track.file_path:
+                    continue
+                try:
+                    directory = str(Path(track.file_path).parent)
+                    if directory not in album_dirs:
+                        album_dirs[directory] = track.file_path
+                except Exception:
+                    pass
+            
+            for directory, sample_file in album_dirs.items():
+                if processed >= limit:
+                    break
+                    
+                folder_jpg_path = os.path.join(directory, "folder.jpg")
+                exists = os.path.exists(folder_jpg_path)
+                
+                if mode == "missing" and exists:
+                    continue
+                    
+                processed += 1
+                
+                if dry_run:
+                    refreshed += 1
+                    continue
+                    
+                try:
+                    artwork_bytes = extract_first_artwork(sample_file)
+                    if artwork_bytes:
+                        # V4: no silent overwrites - only write if mode is "all" and user explicitly requested it, or if it doesn't exist.
+                        # Since mode="missing" skips existing, mode="all" will overwrite.
+                        with open(folder_jpg_path, "wb") as f:
+                            f.write(artwork_bytes)
+                        refreshed += 1
+                        logger.info("Generated folder.jpg for %s", directory)
+                    else:
+                        errors += 1
+                except Exception as e:
+                    logger.error("Error generating folder.jpg for %s: %s", directory, e)
+                    errors += 1
+                    
+        return {"summary": {"processed": processed, "refreshed": refreshed, "errors": errors}}
+    except Exception as exc:
+        logger.error("Failed to generate folder.jpgs: %s", exc)
+        return {"summary": {"processed": processed, "refreshed": refreshed, "errors": errors + 1}}

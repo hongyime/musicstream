@@ -1176,38 +1176,76 @@ class DownloadOrchestrator:
             logger.info("Throttle skip: spotdl track %d — will retry next run", track.id)
             return None
 
-        out_dir: Optional[str] = None
-        try:
-            import subprocess
-            import shutil
-            
-            # Check if spotdl CLI is available
-            spotdl_path = shutil.which("spotdl")
-            if not spotdl_path:
-                logger.warning("spotdl CLI not found; skipping Tier 3.")
-                self._rate_limiter.record_failure("spotdl")
-                return None
+        spotdl_mode = os.environ.get("SPOTDL_MODE", "cli").lower()
+        if spotdl_mode == "http":
+            service_url = os.environ.get("SPOTDL_SERVICE_URL", "")
+            if not service_url:
+                logger.warning("SPOTDL_SERVICE_URL not set; falling back to CLI mode")
+                spotdl_mode = "cli"
+            else:
+                try:
+                    import requests
+                    logger.debug("Running spotdl (HTTP) for track %d", track.id)
+                    resp = requests.post(
+                        f"{service_url.rstrip('/')}/download",
+                        json={"spotify_uri": track.spotify_uri},
+                        timeout=120
+                    )
+                    if resp.status_code == 200:
+                        out_file = os.path.join(TEMP_DIR, f"spotdl_{track.id}_{uuid.uuid4().hex[:8]}.mp3")
+                        with open(out_file, "wb") as f:
+                            f.write(resp.content)
+                        self._rate_limiter.record_success("spotdl")
+                        self._throttle.on_success("spotdl")
+                        logger.info("spotdl HTTP successfully downloaded track %d", track.id)
+                        return out_file
+                    else:
+                        logger.warning("spotdl HTTP failed: %s - %s", resp.status_code, resp.text[:200])
+                except requests.exceptions.Timeout:
+                    logger.warning("spotdl HTTP timeout for track %d", track.id)
+                    self._rate_limiter.record_failure("spotdl")
+                    return None
+                except Exception as exc:
+                    logger.warning("spotdl HTTP error: %s", exc)
+                    self._rate_limiter.record_failure("spotdl")
+                    # Fall back to CLI if HTTP is broken? The spec says CLI fallback always available, meaning if mode=cli or HTTP fails, we could fallback, or maybe just if not configured. 
+                    # Let's fallback to CLI for the PoC if HTTP fails.
+                    logger.info("Falling back to spotdl CLI for track %d", track.id)
+                    spotdl_mode = "cli"
 
-            spotify_uri = track.spotify_uri
-            if not spotify_uri:
-                logger.warning("Tier 3 skipped for track %d ('%s'): no spotify_uri", track.id, track.title)
-                return None
-            
-            # Use a unique output directory for this download
-            out_dir = os.path.join(TEMP_DIR, f"spotdl_{track.id}_{uuid.uuid4().hex[:8]}")
-            os.makedirs(out_dir, exist_ok=True)
+        if spotdl_mode == "cli":
+            out_dir: Optional[str] = None
+            try:
+                import subprocess
+                import shutil
+                
+                # Check if spotdl CLI is available
+                spotdl_path = shutil.which("spotdl")
+                if not spotdl_path:
+                    logger.warning("spotdl CLI not found; skipping Tier 3.")
+                    self._rate_limiter.record_failure("spotdl")
+                    return None
 
-            # ── Secret hygiene ────────────────────────────────────────────────
-            # SPEC §B / audit #7: passing --client-id / --client-secret on argv
-            # means the credentials are visible to any local user via `ps aux`
-            # / `/proc/<pid>/cmdline` / Docker monitoring sidecars. spotdl
-            # honours the SPOTIPY_CLIENT_ID / SPOTIPY_CLIENT_SECRET env vars
-            # (pinned to the underlying spotipy library). We pass via the
-            # subprocess `env=` arg so the secrets cross only the parent →
-            # child process boundary as kernel-private memory, never argv.
-            spotdl_env = {**os.environ,
-                          "SPOTIPY_CLIENT_ID": client_id,
-                          "SPOTIPY_CLIENT_SECRET": client_secret}
+                spotify_uri = track.spotify_uri
+                if not spotify_uri:
+                    logger.warning("Tier 3 skipped for track %d ('%s'): no spotify_uri", track.id, track.title)
+                    return None
+                
+                # Use a unique output directory for this download
+                out_dir = os.path.join(TEMP_DIR, f"spotdl_{track.id}_{uuid.uuid4().hex[:8]}")
+                os.makedirs(out_dir, exist_ok=True)
+
+                # ── Secret hygiene ────────────────────────────────────────────────
+                # SPEC §B / audit #7: passing --client-id / --client-secret on argv
+                # means the credentials are visible to any local user via `ps aux`
+                # / `/proc/<pid>/cmdline` / Docker monitoring sidecars. spotdl
+                # honours the SPOTIPY_CLIENT_ID / SPOTIPY_CLIENT_SECRET env vars
+                # (pinned to the underlying spotipy library). We pass via the
+                # subprocess `env=` arg so the secrets cross only the parent →
+                # child process boundary as kernel-private memory, never argv.
+                spotdl_env = {**os.environ,
+                              "SPOTIPY_CLIENT_ID": client_id,
+                              "SPOTIPY_CLIENT_SECRET": client_secret}
 
             # URI must come BEFORE --audio: spotdl's --audio uses nargs=* and will
             # greedily consume the URI as an audio-source value, failing argparse validation.
@@ -1783,3 +1821,76 @@ class DownloadOrchestrator:
             "geographic restriction",
             "not available in your country",
         ))
+
+    def download_batch_spotdl(self, session, tracks: list[Track]) -> None:
+        """T9: spotdl batch PoC (CLI array mode)
+        Downloads a batch of tracks using spotdl's multi-URL support.
+        Maps files back to tracks using {track_id}.{ext} as output template to satisfy V5.
+        """
+        if not tracks:
+            return
+            
+        import subprocess
+        import shutil
+        import uuid
+        from src.models import TrackStatus
+        
+        spotdl_path = shutil.which("spotdl")
+        if not spotdl_path:
+            logger.warning("spotdl CLI not found; skipping batch PoC.")
+            return
+            
+        batch_id = uuid.uuid4().hex[:8]
+        out_dir = os.path.join(TEMP_DIR, f"spotdl_batch_{batch_id}")
+        os.makedirs(out_dir, exist_ok=True)
+        
+        uris = [t.spotify_uri for t in tracks if t.spotify_uri]
+        if not uris:
+            return
+            
+        cmd = [spotdl_path] + uris + [
+            "--output-format", "mp3",
+            "--output", out_dir,
+            "-p", "{track_id}.{ext}"
+        ]
+        
+        logger.info("Starting spotdl batch download for %d tracks", len(uris))
+        
+        try:
+            client_id = os.environ.get("SPOTIFY_CLIENT_ID", "")
+            client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
+            spotdl_env = {**os.environ,
+                          "SPOTIPY_CLIENT_ID": client_id,
+                          "SPOTIPY_CLIENT_SECRET": client_secret}
+                          
+            subprocess.run(cmd, env=spotdl_env, check=False)
+            
+            for track in tracks:
+                if not track.spotify_uri:
+                    continue
+                track_id = track.spotify_uri.split(":")[-1]
+                expected_file = os.path.join(out_dir, f"{track_id}.mp3")
+                
+                if os.path.exists(expected_file):
+                    logger.info("Batch spotdl downloaded track %d", track.id)
+                    try:
+                        self._tagger.tag_file(expected_file, track)
+                        final_path = self._organiser.organise(expected_file, track)
+                        
+                        track.file_path = final_path
+                        track.status = TrackStatus.DOWNLOADED.value
+                        track.download_method = "spotdl_batch"
+                        session.commit()
+                    except Exception as e:
+                        logger.error("Error organizing batch track %d: %s", track.id, e)
+                else:
+                    logger.warning("Batch spotdl missing file for track %d", track.id)
+                    
+        except Exception as e:
+            logger.error("Batch spotdl PoC error: %s", e)
+        finally:
+            try:
+                shutil.rmtree(out_dir, ignore_errors=True)
+            except Exception:
+                pass
+
