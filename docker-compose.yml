@@ -19,7 +19,13 @@ services:
     deploy:
       resources:
         limits:
-          memory: 128M
+          # 2026-07-08: bumped 128M -> 256M.  With 195k tracks in the DB, the
+          # daemon's `SELECT tracks.id FROM tracks WHERE status='pending'` for
+          # the pending sweep pushed the server past 128M and Postgres OOM-killed
+          # itself mid-COMMIT (see incident post-mortem in commit body).  256M
+          # gives ~130M headroom over baseline (~90M idle) which comfortably
+          # covers the largest working set observed under load.
+          memory: 256M
     # Cap docker json-file logs — without this, /var/lib/docker/containers/<id>-json.log
     # grows without bound (saw 44 MB on neighbour projects). 10m × 3 = 30 MB max per service.
     logging:
