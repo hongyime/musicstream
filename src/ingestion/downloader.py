@@ -285,19 +285,22 @@ class DownloadOrchestrator:
                 len(stuck), stuck_cutoff.isoformat(),
             )
 
-        pending_tracks = (
+        # P2-4 memory fix: hydrate only Track.id — the batch loop below never
+        # touches other columns (per-track workers re-fetch via session.get in
+        # their own session).  Loading full Track rows for 100k+ pending tracks
+        # was pushing the Postgres 128M container over its cap and OOM-killing
+        # the server (see incident 2026-07-08).
+        track_ids = list(
             session.execute(
-                select(Track).where(Track.status == TrackStatus.PENDING.value)
-            )
-            .scalars()
-            .all()
+                select(Track.id).where(Track.status == TrackStatus.PENDING.value)
+            ).scalars()
         )
 
-        if not pending_tracks:
+        if not track_ids:
             logger.info("No pending tracks to download.")
             return 0, 0
 
-        logger.info("Starting download of %d pending tracks.", len(pending_tracks))
+        logger.info("Starting download of %d pending tracks.", len(track_ids))
 
         downloaded = 0
         failed = 0
@@ -322,8 +325,6 @@ class DownloadOrchestrator:
                     exc_info=True,
                 )
                 return False
-
-        track_ids = [t.id for t in pending_tracks]
 
         # Process in batches with delays between batches to avoid rate limits
         batch_size = MAX_CONCURRENT
@@ -403,12 +404,15 @@ class DownloadOrchestrator:
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
         from src.db import get_session
 
-        pending = (
+        # P2-4 memory fix: fetch only the three columns the loop actually reads
+        # (id, spotify_id, title) so 100k+ pending tracks don't materialise as
+        # full ORM rows in Postgres RAM. See download_pending() for context.
+        pending = list(
             session.execute(
-                select(Track).where(Track.status == TrackStatus.PENDING.value)
+                select(Track.id, Track.spotify_id, Track.title).where(
+                    Track.status == TrackStatus.PENDING.value
+                )
             )
-            .scalars()
-            .all()
         )
 
         if not pending:
@@ -438,7 +442,7 @@ class DownloadOrchestrator:
                 return self.download_track(t, ws, _lib_tiers)
 
         with ThreadPoolExecutor(max_workers=1) as executor:
-            for track in pending:
+            for track_id, track_spotify_id, track_title in pending:
                 if _shutting_down.is_set():
                     logger.warning("Shutdown requested; aborting librespot pre-sweep.")
                     break
@@ -448,17 +452,17 @@ class DownloadOrchestrator:
                 if time.monotonic() - sweep_start > max_seconds:
                     logger.info("librespot pre-sweep: total time limit reached after %.0fs", max_seconds)
                     break
-                if not track.spotify_id:
+                if not track_spotify_id:
                     continue
                 try:
-                    future = executor.submit(_librespot_one, track.id)
+                    future = executor.submit(_librespot_one, track_id)
                     try:
                         success = future.result(timeout=per_track_timeout)
                     except FuturesTimeout:
                         future.cancel()
                         logger.warning(
                             "librespot per-track timeout (%.0fs) for track %d ('%s')",
-                            per_track_timeout, track.id, track.title,
+                            per_track_timeout, track_id, track_title,
                         )
                         # F1: timeouts are ALSO failures so the rate-limiter trips and
                         # we stop hammering an already-rate-limited account (#325).
@@ -485,7 +489,7 @@ class DownloadOrchestrator:
                             future.result(timeout=_LIBRESPOT_KILL_GRACE_S)
                         except Exception:  # noqa: BLE001 - grace timeout or worker error
                             pass
-                        self._record_librespot_timeout(track.id)
+                        self._record_librespot_timeout(track_id)
                         _librespot_kill_event.clear()
                         success = False
                     if success:
@@ -493,7 +497,7 @@ class DownloadOrchestrator:
                     else:
                         failed += 1
                 except Exception as exc:
-                    logger.error("librespot sweep error for track %d: %s", track.id, exc, exc_info=True)
+                    logger.error("librespot sweep error for track %d: %s", track_id, exc, exc_info=True)
                     failed += 1
                 # F2: pace inter-track attempts. Upstream contributor (cvdub)
                 # confirms <5s between streams reliably triggers Spotify's
@@ -526,25 +530,26 @@ class DownloadOrchestrator:
         """
         from src.db import get_session
 
-        candidates = (
+        # P2-4 memory fix: hydrate only Track.id — the loop below re-fetches via
+        # session.get() in its own session anyway. Loading full rows for 100k+
+        # pending tracks OOM-killed the 128M Postgres container (2026-07-08).
+        candidate_ids = list(
             session.execute(
-                select(Track).where(Track.status == TrackStatus.PENDING.value)
-            )
-            .scalars()
-            .all()
+                select(Track.id).where(Track.status == TrackStatus.PENDING.value)
+            ).scalars()
         )
 
-        if not candidates:
+        if not candidate_ids:
             logger.info("spotdl sweep: no pending tracks to process.")
             return 0, 0
 
-        logger.info("spotdl sweep: %d tracks (max %.0fs)", len(candidates), max_seconds)
+        logger.info("spotdl sweep: %d tracks (max %.0fs)", len(candidate_ids), max_seconds)
         downloaded = 0
         failed = 0
         sweep_start = time.monotonic()
         _spotdl_tiers = [("tier3_spotdl", self._tier3_spotdl)]
 
-        for track in candidates:
+        for track_id in candidate_ids:
             if _shutting_down.is_set():
                 logger.warning("Shutdown requested; aborting spotdl sweep.")
                 break
@@ -553,7 +558,7 @@ class DownloadOrchestrator:
                 break
             try:
                 with get_session() as ts:
-                    t = ts.get(Track, track.id)
+                    t = ts.get(Track, track_id)
                     if t is None or t.status != TrackStatus.PENDING.value:
                         continue
                     success = self.download_track(t, ts, tiers_override=_spotdl_tiers)
@@ -562,7 +567,7 @@ class DownloadOrchestrator:
                     else:
                         failed += 1
             except Exception as exc:
-                logger.error("spotdl sweep unhandled error for track %d: %s", track.id, exc, exc_info=True)
+                logger.error("spotdl sweep unhandled error for track %d: %s", track_id, exc, exc_info=True)
                 failed += 1
 
         elapsed = time.monotonic() - sweep_start
@@ -1247,101 +1252,101 @@ class DownloadOrchestrator:
                               "SPOTIPY_CLIENT_ID": client_id,
                               "SPOTIPY_CLIENT_SECRET": client_secret}
 
-            # URI must come BEFORE --audio: spotdl's --audio uses nargs=* and will
-            # greedily consume the URI as an audio-source value, failing argparse validation.
-            base_cmd = [
-                spotdl_path,
-                spotify_uri,
-                "--output", out_dir,
-                "--format", "mp3",
-                "--bitrate", "320k",
-                "--log-level", "ERROR",
-            ]
+                # URI must come BEFORE --audio: spotdl's --audio uses nargs=* and will
+                # greedily consume the URI as an audio-source value, failing argparse validation.
+                base_cmd = [
+                    spotdl_path,
+                    spotify_uri,
+                    "--output", out_dir,
+                    "--format", "mp3",
+                    "--bitrate", "320k",
+                    "--log-level", "ERROR",
+                ]
 
-            # Attempt 1: youtube-music (Spotify-matched, most accurate)
-            cmd_ytm = base_cmd + ["--audio", "youtube-music"]
-            logger.debug("Running spotdl (youtube-music) for track %d", track.id)
-            result = subprocess.run(
-                cmd_ytm,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                env=spotdl_env,
-            )
-
-            # OFFICIAL_SOURCE_FILTER_V1: previously fell back to --audio youtube
-            # which often picks lyric videos / fan uploads. Drop that fallback
-            # entirely — let the track cascade to Tier 4 yt-dlp YouTube which
-            # now scores candidates and rejects unofficial sources.
-            if result.returncode != 0:
-                logger.info(
-                    "spotdl --audio youtube-music failed for track %d ('%s'); cascading to Tier 4 (no plain youtube fallback): %s",
-                    track.id, track.title, (result.stderr or "")[:120],
+                # Attempt 1: youtube-music (Spotify-matched, most accurate)
+                cmd_ytm = base_cmd + ["--audio", "youtube-music"]
+                logger.debug("Running spotdl (youtube-music) for track %d", track.id)
+                result = subprocess.run(
+                    cmd_ytm,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    env=spotdl_env,
                 )
 
-            if result.returncode != 0:
-                logger.warning(
-                    "spotdl CLI failed for track %d ('%s'): returncode=%d, stderr=%s",
-                    track.id, track.title, result.returncode, result.stderr[:200],
-                )
+                # OFFICIAL_SOURCE_FILTER_V1: previously fell back to --audio youtube
+                # which often picks lyric videos / fan uploads. Drop that fallback
+                # entirely — let the track cascade to Tier 4 yt-dlp YouTube which
+                # now scores candidates and rejects unofficial sources.
+                if result.returncode != 0:
+                    logger.info(
+                        "spotdl --audio youtube-music failed for track %d ('%s'); cascading to Tier 4 (no plain youtube fallback): %s",
+                        track.id, track.title, (result.stderr or "")[:120],
+                    )
+
+                if result.returncode != 0:
+                    logger.warning(
+                        "spotdl CLI failed for track %d ('%s'): returncode=%d, stderr=%s",
+                        track.id, track.title, result.returncode, result.stderr[:200],
+                    )
+                    self._rate_limiter.record_failure("spotdl")
+                    return None
+
+                # Find downloaded file
+                downloaded_file = None
+                for root, _, files in os.walk(out_dir):
+                    for fname in files:
+                        if fname.endswith((".mp3", ".m4a", ".flac", ".ogg", ".opus")):
+                            full_path = os.path.join(root, fname)
+                            if os.path.getsize(full_path) > 0:
+                                downloaded_file = full_path
+                                break
+                    if downloaded_file:
+                        break
+
+                if not downloaded_file:
+                    logger.warning("spotdl CLI did not produce a file for track %d", track.id)
+                    self._rate_limiter.record_failure("spotdl")
+                    return None
+
+                # Promote the downloaded file OUT of out_dir so we can clean
+                # the workdir without losing the result.
+                ext = os.path.splitext(downloaded_file)[1]
+                promoted = os.path.join(TEMP_DIR, f"spotdl_{uuid.uuid4().hex}{ext}")
+                shutil.move(downloaded_file, promoted)
+                shutil.rmtree(out_dir, ignore_errors=True)
+
+                self._rate_limiter.record_success("spotdl")
+                self._throttle.on_success("spotdl")
+                logger.info("spotdl CLI successfully downloaded track %d via %s", track.id, os.path.basename(promoted))
+                return promoted
+
+            except subprocess.TimeoutExpired:
+                logger.warning("spotdl CLI timeout for track %d", track.id)
                 self._rate_limiter.record_failure("spotdl")
                 return None
-
-            # Find downloaded file
-            downloaded_file = None
-            for root, _, files in os.walk(out_dir):
-                for fname in files:
-                    if fname.endswith((".mp3", ".m4a", ".flac", ".ogg", ".opus")):
-                        full_path = os.path.join(root, fname)
-                        if os.path.getsize(full_path) > 0:
-                            downloaded_file = full_path
-                            break
-                if downloaded_file:
-                    break
-
-            if not downloaded_file:
-                logger.warning("spotdl CLI did not produce a file for track %d", track.id)
+            except Exception as exc:
+                msg = str(exc)
+                if "rate" in msg.lower() or "limit" in msg.lower() or "retry will occur" in msg.lower():
+                    logger.warning(
+                        "spotdl rate-limited for track %d ('%s'): %s — skipping this run",
+                        track.id, track.title, msg.splitlines()[0],
+                    )
+                    self._throttle.on_rate_limit("spotdl")
+                    return None
                 self._rate_limiter.record_failure("spotdl")
-                return None
-
-            # Promote the downloaded file OUT of out_dir so we can clean
-            # the workdir without losing the result.
-            ext = os.path.splitext(downloaded_file)[1]
-            promoted = os.path.join(TEMP_DIR, f"spotdl_{uuid.uuid4().hex}{ext}")
-            shutil.move(downloaded_file, promoted)
-            shutil.rmtree(out_dir, ignore_errors=True)
-
-            self._rate_limiter.record_success("spotdl")
-            self._throttle.on_success("spotdl")
-            logger.info("spotdl CLI successfully downloaded track %d via %s", track.id, os.path.basename(promoted))
-            return promoted
-
-        except subprocess.TimeoutExpired:
-            logger.warning("spotdl CLI timeout for track %d", track.id)
-            self._rate_limiter.record_failure("spotdl")
-            return None
-        except Exception as exc:
-            msg = str(exc)
-            if "rate" in msg.lower() or "limit" in msg.lower() or "retry will occur" in msg.lower():
-                logger.warning(
-                    "spotdl rate-limited for track %d ('%s'): %s — skipping this run",
-                    track.id, track.title, msg.splitlines()[0],
-                )
-                self._throttle.on_rate_limit("spotdl")
-                return None
-            self._rate_limiter.record_failure("spotdl")
-            raise DownloadError(f"Tier 3 spotdl failed: {exc}") from exc
-        finally:
-            # Always remove the per-call workdir. Success path moved the
-            # promoted file out and already removed out_dir; failure paths
-            # (timeout, exception, early return) reach here with out_dir
-            # still on disk.
-            if out_dir is not None:
-                try:
-                    import shutil as _shutil
-                    _shutil.rmtree(out_dir, ignore_errors=True)
-                except Exception:  # noqa: BLE001
-                    pass
+                raise DownloadError(f"Tier 3 spotdl failed: {exc}") from exc
+            finally:
+                # Always remove the per-call workdir. Success path moved the
+                # promoted file out and already removed out_dir; failure paths
+                # (timeout, exception, early return) reach here with out_dir
+                # still on disk.
+                if out_dir is not None:
+                    try:
+                        import shutil as _shutil
+                        _shutil.rmtree(out_dir, ignore_errors=True)
+                    except Exception:  # noqa: BLE001
+                        pass
 
     # ── Tier 4: yt-dlp YouTube direct search ─────────────────────────────────
 
