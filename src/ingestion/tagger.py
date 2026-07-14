@@ -297,20 +297,31 @@ class MetadataTagger:
         try:
             import spotipy  # type: ignore[import-untyped]
             from spotipy.cache_handler import CacheFileHandler
-            from spotipy.oauth2 import SpotifyPKCE
+            from spotipy.oauth2 import SpotifyOAuth, SpotifyPKCE
             client_id = os.environ.get("SPOTIFY_CLIENT_ID", "")
+            client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
             if not client_id:
                 logger.info("Spotify backfill disabled: SPOTIFY_CLIENT_ID unset")
                 return None
             cache_path = os.environ.get("SPOTIFY_TOKEN_CACHE", "/app/spotify_token.json")
             cache_handler = CacheFileHandler(cache_path=cache_path)
-            auth_manager = SpotifyPKCE(
-                client_id=client_id,
-                redirect_uri="http://127.0.0.1:8888/callback",
-                scope="user-library-read",
-                open_browser=False,
-                cache_handler=cache_handler,
-            )
+            if client_secret:
+                auth_manager = SpotifyOAuth(
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    redirect_uri="http://127.0.0.1:8888/callback",
+                    scope="user-library-read",
+                    open_browser=False,
+                    cache_handler=cache_handler,
+                )
+            else:
+                auth_manager = SpotifyPKCE(
+                    client_id=client_id,
+                    redirect_uri="http://127.0.0.1:8888/callback",
+                    scope="user-library-read",
+                    open_browser=False,
+                    cache_handler=cache_handler,
+                )
             if auth_manager.validate_token(auth_manager.get_cached_token()) is None:
                 logger.warning("Spotify backfill disabled: no valid token at %s", cache_path)
                 return None
