@@ -321,11 +321,20 @@ function App() {
                   <h3 className="text-lg font-bold">Spotify Authentication</h3>
                   <p className="text-sm text-secondary mt-1">Connect your account to enable library scraping and high-quality streaming.</p>
                 </div>
-                <form action="/auth/spotify/login" method="POST">
-                  <Button variant="primary" icon={<Play size={14} />}>
-                    Connect Spotify
-                  </Button>
-                </form>
+                <div className="flex items-center space-x-4">
+                  {authStatus?.status === 'authenticated' ? (
+                    <div className="flex items-center text-success space-x-2 bg-success/10 px-4 py-2 rounded-lg border border-success/20">
+                      <CheckCircle2 size={16} />
+                      <span className="text-sm font-bold">Connected</span>
+                    </div>
+                  ) : (
+                    <form action="/auth/spotify/login" method="POST">
+                      <Button variant="primary" icon={<Play size={14} />}>
+                        Connect Spotify
+                      </Button>
+                    </form>
+                  )}
+                </div>
               </div>
               
               <div className="pt-6 border-t border-border">

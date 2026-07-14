@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import uuid
+import inspect
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Optional
@@ -69,6 +70,9 @@ except ImportError:
 
 if SPOTIFLAC_AVAILABLE:
     logger.info("SpotiFLAC available — Tier 1 active")
+    _SPOTIFLAC_PARAMS = set(inspect.signature(_SpotiFLAC).parameters)
+else:
+    _SPOTIFLAC_PARAMS = set()
 
 # SpotiFLAC serialisation — streaming services return 429 under concurrent load.
 _SPOTIFLAC_SEMAPHORE = threading.Semaphore(1)
@@ -772,13 +776,17 @@ class DownloadOrchestrator:
                 # Iterate services manually to detect which one succeeds
                 for service in services:
                     try:
-                        _SpotiFLAC(
-                            url=spotify_url,
-                            output_dir=out_dir,
-                            services=[service],
-                            quality="LOSSLESS",
-                            log_level=logging.WARNING,
-                        )
+                        kwargs = {
+                            "url": spotify_url,
+                            "output_dir": out_dir,
+                            "services": [service],
+                        }
+                        if "quality" in _SPOTIFLAC_PARAMS:
+                            kwargs["quality"] = "LOSSLESS"
+                        if "log_level" in _SPOTIFLAC_PARAMS:
+                            kwargs["log_level"] = logging.WARNING
+
+                        _SpotiFLAC(**kwargs)
 
                         # Find the downloaded file
                         for root, _, files in os.walk(out_dir):
@@ -1898,4 +1906,3 @@ class DownloadOrchestrator:
                 shutil.rmtree(out_dir, ignore_errors=True)
             except Exception:
                 pass
-
