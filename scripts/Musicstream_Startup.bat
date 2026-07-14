@@ -23,7 +23,17 @@ echo [%date% %time%] ERROR: Docker not ready after 300s >> %LOGFILE%
 exit /b 1
 
 :DOCKER_READY
-echo [%date% %time%] Docker ready. Starting containers... >> %LOGFILE%
+echo [%date% %time%] Docker ready. Waiting for internet... >> %LOGFILE%
+
+:WAIT_INTERNET
+ping -n 1 -w 2000 8.8.8.8 >nul 2>&1
+if %errorlevel% == 0 goto INTERNET_READY
+echo [%date% %time%] No internet, retrying in 10s... >> %LOGFILE%
+timeout /t 10 /nobreak >nul
+goto WAIT_INTERNET
+
+:INTERNET_READY
+echo [%date% %time%] Internet available. Starting containers... >> %LOGFILE%
 cd /d C:\musicstream
 docker compose up -d >> %LOGFILE% 2>&1
 echo [%date% %time%] docker compose up -d done (exit %errorlevel%) >> %LOGFILE%
