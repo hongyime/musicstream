@@ -20,12 +20,12 @@ from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from apscheduler.schedulers.background import BackgroundScheduler
 from spotipy.cache_handler import CacheFileHandler
-from spotipy.oauth2 import SpotifyPKCE
+from spotipy.oauth2 import SpotifyOAuth, SpotifyPKCE
 
 from src.schemas.responses import ApiResponse, TrackStats
 from src.ws.manager import manager
 from src.core.config import (
-    LOG_DIR, TIMEZONE, SPOTIFY_CLIENT_ID, SPOTIFY_TOKEN_CACHE, DAEMON_API_TOKEN,
+    LOG_DIR, TIMEZONE, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_TOKEN_CACHE, DAEMON_API_TOKEN,
 )
 import src.core.tasks as tasks
 
@@ -774,19 +774,29 @@ _REDIRECT_URI = "http://127.0.0.1:9079/auth/spotify/callback"
 # /auth/spotify/callback so the PKCE code_verifier generated at login time is
 # the same one used at exchange time. Without this, each request rebuilt the
 # manager and the exchange failed silently with code_verifier mismatch.
-_active_auth_manager: Optional[SpotifyPKCE] = None
+_active_auth_manager: Optional[object] = None
 
-def _get_auth_manager(*, fresh: bool = False) -> SpotifyPKCE:
-    """Reuse the active SpotifyPKCE instance unless *fresh* is set (login start)."""
+def _get_auth_manager(*, fresh: bool = False):
+    """Reuse the active auth manager unless *fresh* is set (login start)."""
     global _active_auth_manager
     if _active_auth_manager is None or fresh:
-        _active_auth_manager = SpotifyPKCE(
-            client_id=SPOTIFY_CLIENT_ID,
-            redirect_uri=_REDIRECT_URI,
-            scope=_SCOPES,
-            cache_handler=CacheFileHandler(cache_path=SPOTIFY_TOKEN_CACHE),
-            open_browser=False,
-        )
+        if SPOTIFY_CLIENT_SECRET:
+            _active_auth_manager = SpotifyOAuth(
+                client_id=SPOTIFY_CLIENT_ID,
+                client_secret=SPOTIFY_CLIENT_SECRET,
+                redirect_uri=_REDIRECT_URI,
+                scope=_SCOPES,
+                cache_handler=CacheFileHandler(cache_path=SPOTIFY_TOKEN_CACHE),
+                open_browser=False,
+            )
+        else:
+            _active_auth_manager = SpotifyPKCE(
+                client_id=SPOTIFY_CLIENT_ID,
+                redirect_uri=_REDIRECT_URI,
+                scope=_SCOPES,
+                cache_handler=CacheFileHandler(cache_path=SPOTIFY_TOKEN_CACHE),
+                open_browser=False,
+            )
     return _active_auth_manager
 
 @app.api_route(

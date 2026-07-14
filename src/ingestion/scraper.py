@@ -1,8 +1,8 @@
 """
-musicstream/ingestion/scraper.py — Spotify PKCE ingestion
+musicstream/ingestion/scraper.py — Spotify OAuth ingestion
 
 Scrapes a user's entire Spotify library (playlists + liked songs) into
-PostgreSQL using spotipy with OAuth PKCE (no client secret required).
+PostgreSQL using spotipy with Spotify OAuth.
 
 Supports:
   - full_backfill()     : scrape everything from scratch
@@ -22,9 +22,10 @@ from typing import Optional
 
 import spotipy
 from spotipy.cache_handler import CacheFileHandler
-from spotipy.oauth2 import SpotifyPKCE
+from spotipy.oauth2 import SpotifyOAuth, SpotifyPKCE
 from sqlalchemy.orm import Session
 
+from src.core.config import SPOTIFY_CLIENT_SECRET
 from src.exceptions import SpotifyRateLimitError
 from src.models import Source, SourceType, Track, TrackStatus
 from src.rate_limiter import ServiceRateLimiter
@@ -50,7 +51,7 @@ def _utcnow() -> datetime:
 
 class SpotifyScraper:
     """
-    Spotify PKCE ingestion scraper.
+    Spotify ingestion scraper.
 
     Args:
         client_id: Spotify application client ID (from .env SPOTIFY_CLIENT_ID).
@@ -73,13 +74,23 @@ class SpotifyScraper:
         if self._sp is None:
             cache_path = os.environ.get("SPOTIFY_TOKEN_CACHE", "/app/spotify_token.json")
             cache_handler = CacheFileHandler(cache_path=cache_path)
-            auth_manager = SpotifyPKCE(
-                client_id=self._client_id,
-                redirect_uri="http://127.0.0.1:8888/callback",
-                scope=_SCOPES,
-                open_browser=False,
-                cache_handler=cache_handler,
-            )
+            if SPOTIFY_CLIENT_SECRET:
+                auth_manager = SpotifyOAuth(
+                    client_id=self._client_id,
+                    client_secret=SPOTIFY_CLIENT_SECRET,
+                    redirect_uri="http://127.0.0.1:8888/callback",
+                    scope=_SCOPES,
+                    open_browser=False,
+                    cache_handler=cache_handler,
+                )
+            else:
+                auth_manager = SpotifyPKCE(
+                    client_id=self._client_id,
+                    redirect_uri="http://127.0.0.1:8888/callback",
+                    scope=_SCOPES,
+                    open_browser=False,
+                    cache_handler=cache_handler,
+                )
             # If no valid cached token exists, raise instead of blocking for
             # manual OAuth input (which hangs forever in a headless container).
             if auth_manager.validate_token(auth_manager.get_cached_token()) is None:
@@ -90,7 +101,7 @@ class SpotifyScraper:
                     "SPOTIFY_TOKEN_CACHE or the default /app/spotify_token.json volume mount."
                 )
             self._sp = spotipy.Spotify(auth_manager=auth_manager)
-            logger.info("Spotify PKCE client initialised (token from %s).", cache_path)
+            logger.info("Spotify client initialised (token from %s).", cache_path)
         return self._sp
 
     # ── Public API ─────────────────────────────────────────────────────────────
