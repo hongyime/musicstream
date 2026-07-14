@@ -197,14 +197,32 @@ class DownloadOrchestrator:
 
         # SpotiFLAC sub-provider list (controllable via env).
         # Default skips tidal+amazon — Tidal mirrors are returning 403/502/timeouts
-        # cluster-wide and Amazon Songlink resolution is broken upstream.  Order
-        # matters: first hit wins, so put healthy providers first.
-        # Override with: SPOTIFLAC_SERVICES=qobuz,deezer,youtube,tidal,amazon
-        _raw_services = os.environ.get("SPOTIFLAC_SERVICES", "qobuz,deezer,youtube")
-        self._spotiflac_services = [
+        # cluster-wide and Amazon Songlink resolution is broken upstream.
+        # Default also skips YouTube here because Tier 2/4 already cover YouTube
+        # with a more controllable path. Keep Tier 1 focused on FLAC-capable
+        # providers and only opt into spotiflac-youtube explicitly.
+        # Override with: SPOTIFLAC_SERVICES=qobuz,deezer,tidal,amazon,youtube
+        _raw_services = os.environ.get("SPOTIFLAC_SERVICES", "qobuz,deezer")
+        requested_services = [
             s.strip().lower() for s in _raw_services.split(",") if s.strip()
-        ] or ["qobuz", "deezer", "youtube"]
-        logger.info("SpotiFLAC providers (in order): %s", ",".join(self._spotiflac_services))
+        ] or ["qobuz", "deezer"]
+
+        qobuz_email = os.environ.get("QOBUZ_EMAIL", "").strip()
+        qobuz_password_md5 = os.environ.get("QOBUZ_PASSWORD_MD5", "").strip()
+        filtered_services = []
+        for service in requested_services:
+            if service == "qobuz" and (not qobuz_email or not qobuz_password_md5):
+                logger.info("Skipping SpotiFLAC provider qobuz: QOBUZ_EMAIL/QOBUZ_PASSWORD_MD5 not configured.")
+                continue
+            filtered_services.append(service)
+
+        self._spotiflac_services = filtered_services
+        if self._tier1_enabled and not self._spotiflac_services:
+            self._tier1_enabled = False
+            logger.warning("Tier 1 (SpotiFLAC) auto-disabled: no usable providers configured.")
+
+        provider_label = ",".join(self._spotiflac_services) if self._spotiflac_services else "<none>"
+        logger.info("SpotiFLAC providers (in order): %s", provider_label)
 
         # Trip after one full round of all workers failing plus a small buffer.
         # MAX_CONCURRENT*5 (=60) was too lenient — a broken service would rack up
