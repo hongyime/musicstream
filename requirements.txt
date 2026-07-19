@@ -1,6 +1,6 @@
 # Core
 spotipy==2.26.0
-SQLAlchemy==2.0.50
+SQLAlchemy==2.0.51
 alembic==1.18.4
 psycopg2-binary==2.9.12
 python-dotenv==1.2.2
@@ -42,8 +42,8 @@ APScheduler==3.11.2
 rich==13.9.4
 
 # Dev tools
-ruff==0.15.16
+ruff==0.15.17
 mypy==2.1.0
-pytest==9.0.3
+pytest==9.1.0
 hypothesis==6.155.2
 pytest-cov==7.1.0
