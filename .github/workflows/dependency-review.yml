@@ -19,7 +19,7 @@ jobs:
           echo "Dependency Review requires dependency graph/GHAS support on private repositories."
           echo "Skipping instead of failing this Dependabot PR."
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: ${{ !github.event.repository.private }}
 
       - name: Dependency Review
