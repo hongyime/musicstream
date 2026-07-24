@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -14,7 +15,7 @@ for _mod in ("yt_dlp", "spotipy", "spotipy.oauth2", "ytmusicapi", "spotdl"):
     sys.modules.setdefault(_mod, MagicMock())
 
 from src.models import Track, TrackStatus  # noqa: E402
-from src.core.tasks import reset_failed_tracks  # noqa: E402
+from src.core.tasks import reset_failed_tracks, reset_orphaned_downloads  # noqa: E402
 
 
 def _track(session, uri, status, attempt_count):
@@ -27,6 +28,10 @@ def _track(session, uri, status, attempt_count):
         status=status,
         attempt_count=attempt_count,
         last_attempt_at=datetime.now(timezone.utc),
+        claimed_at=datetime.now(timezone.utc),
+        heartbeat_at=datetime.now(timezone.utc),
+        claim_owner="worker:test",
+        daemon_run_id=123,
     )
     session.add(t)
     session.flush()
@@ -46,6 +51,10 @@ class TestResetFailedTracks:
         assert rt.status == TrackStatus.PENDING.value
         assert (rt.attempt_count or 0) == 0
         assert rt.last_attempt_at is None
+        assert rt.claimed_at is None
+        assert rt.heartbeat_at is None
+        assert rt.claim_owner is None
+        assert rt.daemon_run_id is None
 
     def test_covers_failed_validation_and_timed_out(self, session):
         a = _track(session, "spotify:track:rf2", "failed_validation", attempt_count=30)
@@ -53,9 +62,13 @@ class TestResetFailedTracks:
         n = reset_failed_tracks(session)
         session.expire_all()
         assert n == 2
-        assert session.get(Track, a.id).status == TrackStatus.PENDING.value
-        assert (session.get(Track, a.id).attempt_count or 0) == 0
-        assert (session.get(Track, b.id).attempt_count or 0) == 0
+        ra = session.get(Track, a.id)
+        rb = session.get(Track, b.id)
+        assert ra.status == TrackStatus.PENDING.value
+        assert (ra.attempt_count or 0) == 0
+        assert ra.claim_owner is None
+        assert (rb.attempt_count or 0) == 0
+        assert rb.claim_owner is None
 
     def test_leaves_pending_and_downloaded_untouched(self, session):
         p = _track(session, "spotify:track:rf4", "pending", attempt_count=3)
@@ -66,3 +79,53 @@ class TestResetFailedTracks:
         assert session.get(Track, p.id).attempt_count == 3
         assert session.get(Track, d.id).attempt_count == 7
         assert session.get(Track, d.id).status == "downloaded"
+
+
+class TestResetOrphanedDownloads:
+    def test_resets_stale_heartbeat_and_clears_claim(self, session):
+        now = datetime.now(timezone.utc)
+        stale = _track(session, "spotify:track:orphan1", "downloading", attempt_count=1)
+        stale.heartbeat_at = now - timedelta(minutes=45)
+        stale.claim_owner = "worker:stale"
+
+        fresh = _track(session, "spotify:track:orphan2", "downloading", attempt_count=1)
+        fresh.heartbeat_at = now - timedelta(minutes=5)
+        fresh.claim_owner = "worker:fresh"
+        session.flush()
+
+        @contextmanager
+        def fake_get_session():
+            yield session
+
+        with patch("src.db.get_session", fake_get_session):
+            n = reset_orphaned_downloads(all_rows=False, stale_after_minutes=30)
+
+        session.expire_all()
+        stale = session.get(Track, stale.id)
+        fresh = session.get(Track, fresh.id)
+        assert n == 1
+        assert stale.status == TrackStatus.PENDING.value
+        assert stale.heartbeat_at is None
+        assert stale.claim_owner is None
+        assert fresh.status == TrackStatus.DOWNLOADING.value
+        assert fresh.claim_owner == "worker:fresh"
+
+    def test_resets_old_rows_without_heartbeat_by_updated_at(self, session):
+        old = _track(session, "spotify:track:orphan3", "downloading", attempt_count=1)
+        old.heartbeat_at = None
+        old.updated_at = datetime.now(timezone.utc) - timedelta(minutes=45)
+        old.claim_owner = "worker:old"
+        session.flush()
+
+        @contextmanager
+        def fake_get_session():
+            yield session
+
+        with patch("src.db.get_session", fake_get_session):
+            n = reset_orphaned_downloads(all_rows=False, stale_after_minutes=30)
+
+        session.expire_all()
+        old = session.get(Track, old.id)
+        assert n == 1
+        assert old.status == TrackStatus.PENDING.value
+        assert old.claim_owner is None

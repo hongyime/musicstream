@@ -17,6 +17,7 @@ import hashlib
 import os
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -257,6 +258,10 @@ class TestOrganise:
                 year="2024",
                 track_number=1,
                 status=TrackStatus.PENDING.value,
+                claimed_at=datetime.now(timezone.utc),
+                heartbeat_at=datetime.now(timezone.utc),
+                claim_owner="worker:test",
+                daemon_run_id=123,
                 cover_art_source="none",
             )
             session.add(track)
@@ -272,6 +277,10 @@ class TestOrganise:
             assert len(track.file_sha256) == 64  # SHA-256 hex digest
             assert track.file_size_bytes > 0
             assert track.format == "mp3"
+            assert track.claimed_at is None
+            assert track.heartbeat_at is None
+            assert track.claim_owner is None
+            assert track.daemon_run_id is None
 
     def test_sha256_computed_from_final_path_not_temp(self, session):
         """P3 correctness: SHA-256 must be of the file at its final path."""
@@ -311,10 +320,87 @@ class TestOrganise:
 
             assert track.file_sha256 == expected_sha
 
+    def test_plex_refresh_failure_does_not_abort_organise(self, session):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_file = os.path.join(tmpdir, "source.mp3")
+            with open(src_file, "wb") as f:
+                f.write(b"fake mp3 data")
+
+            media_drive = os.path.join(tmpdir, "media")
+            os.makedirs(media_drive, exist_ok=True)
+
+            org = FileOrganiser(
+                media_drive=media_drive,
+                plex_url="http://localhost:32400",
+                plex_token="tok",
+                plex_section_id="1",
+            )
+
+            track = Track(
+                spotify_uri="spotify:track:plex_refresh_failure_test",
+                title="Plex Failure Song",
+                artist="Artist",
+                album_artist="Artist",
+                album="Album",
+                year="2024",
+                track_number=3,
+                status=TrackStatus.PENDING.value,
+                cover_art_source="none",
+            )
+            session.add(track)
+            session.flush()
+
+            with patch.object(org, "_refresh_plex", side_effect=RuntimeError("plex down")):
+                final_path = org.organise(src_file, track, session)
+
+            assert os.path.exists(final_path)
+            assert track.status == TrackStatus.DOWNLOADED.value
+
 
 # ── _refresh_plex ─────────────────────────────────────────────────────────────
 
 class TestRefreshPlex:
+    def test_refresh_if_due_refreshes_first_move(self):
+        org = _make_organiser()
+        with patch.object(org, "_refresh_plex") as mock_refresh:
+            org._refresh_plex_if_due(now=100.0)
+        mock_refresh.assert_called_once_with()
+
+    def test_refresh_if_due_batches_by_move_count(self):
+        with patch.dict(
+            os.environ,
+            {
+                "PLEX_REFRESH_INTERVAL_SECONDS": "3600",
+                "PLEX_REFRESH_BATCH_SIZE": "3",
+            },
+        ):
+            org = _make_organiser()
+
+        with patch.object(org, "_refresh_plex") as mock_refresh:
+            org._refresh_plex_if_due(now=100.0)
+            org._refresh_plex_if_due(now=101.0)
+            org._refresh_plex_if_due(now=102.0)
+            org._refresh_plex_if_due(now=103.0)
+
+        assert mock_refresh.call_count == 2
+
+    def test_refresh_if_due_batches_by_interval(self):
+        with patch.dict(
+            os.environ,
+            {
+                "PLEX_REFRESH_INTERVAL_SECONDS": "10",
+                "PLEX_REFRESH_BATCH_SIZE": "99",
+            },
+        ):
+            org = _make_organiser()
+
+        with patch.object(org, "_refresh_plex") as mock_refresh:
+            org._refresh_plex_if_due(now=100.0)
+            org._refresh_plex_if_due(now=105.0)
+            org._refresh_plex_if_due(now=111.0)
+
+        assert mock_refresh.call_count == 2
+
     def test_gets_correct_url(self):
         org = _make_organiser()
         with patch.object(org._http, "get") as mock_get:

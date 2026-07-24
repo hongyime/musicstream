@@ -124,6 +124,13 @@ class Track(Base):
     attempt_count:   Mapped[int]                = mapped_column(Integer, nullable=False, default=0, server_default="0")
     last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Download claim observability/recovery (migration 0004). These fields are
+    # nullable so older queued/downloaded rows do not need a backfill.
+    claimed_at:     Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at:   Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_owner:    Mapped[Optional[str]]      = mapped_column(String, nullable=True)
+    daemon_run_id:  Mapped[Optional[int]]      = mapped_column(Integer, nullable=True)
+
     # File info
     format:          Mapped[Optional[str]] = mapped_column(String, nullable=True)   # 'flac' | 'mp3'
     file_path:       Mapped[Optional[str]] = mapped_column(String, nullable=True)

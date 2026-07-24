@@ -326,7 +326,7 @@ async def _background_startup():
         _background_tasks.add(_lb_task)
         _lb_task.add_done_callback(_background_tasks.discard)
 
-        dl, fail = await asyncio.to_thread(tasks.download_pipeline)
+        dl, fail = await asyncio.to_thread(tasks.download_pipeline, run_id=run_id)
         await asyncio.to_thread(tasks._record_run_complete, run_id=run_id, downloaded=dl, failed=fail)
 
         logger.info("Step 8/9: Running DB backup…")

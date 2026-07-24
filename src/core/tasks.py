@@ -195,6 +195,7 @@ def reset_orphaned_downloads(all_rows: bool = False, stale_after_minutes: int = 
     Returns the number of rows reset.
     """
     from datetime import timedelta
+    from sqlalchemy import or_
     from src.db import get_session
     from src.models import Track, TrackStatus
     try:
@@ -202,8 +203,22 @@ def reset_orphaned_downloads(all_rows: bool = False, stale_after_minutes: int = 
             q = session.query(Track).filter(Track.status == TrackStatus.DOWNLOADING.value)
             if not all_rows:
                 cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_after_minutes)
-                q = q.filter(Track.updated_at < cutoff)
-            count = q.update({"status": TrackStatus.PENDING.value}, synchronize_session=False)
+                q = q.filter(
+                    or_(
+                        Track.heartbeat_at < cutoff,
+                        (Track.heartbeat_at.is_(None)) & (Track.updated_at < cutoff),
+                    )
+                )
+            count = q.update(
+                {
+                    "status": TrackStatus.PENDING.value,
+                    "claimed_at": None,
+                    "heartbeat_at": None,
+                    "claim_owner": None,
+                    "daemon_run_id": None,
+                },
+                synchronize_session=False,
+            )
             session.commit()
         if count:
             logger.info(
@@ -234,6 +249,10 @@ def reset_failed_tracks(session) -> int:
                 "status": TrackStatus.PENDING.value,
                 "attempt_count": 0,
                 "last_attempt_at": None,
+                "claimed_at": None,
+                "heartbeat_at": None,
+                "claim_owner": None,
+                "daemon_run_id": None,
             },
             synchronize_session=False,
         )
@@ -266,7 +285,7 @@ def _log_burn_rate() -> None:
         logger.warning("Burn-rate logging failed: %s", exc)
 
 
-def download_pipeline() -> tuple[int, int]:
+def download_pipeline(run_id: Optional[int] = None) -> tuple[int, int]:
     """Run the download pipeline for all pending tracks. Returns (downloaded, failed)."""
     logger.info("Running download pipeline…")
     try:
@@ -278,19 +297,7 @@ def download_pipeline() -> tuple[int, int]:
         reset_orphaned_downloads(all_rows=False)
         from src.db import get_session
         from src.ingestion.downloader import DownloadOrchestrator
-        orchestrator = DownloadOrchestrator()
-
-        # T0 tier-ordering (pre-P2-3 throughput fix): run the Tier-0 librespot
-        # pre-sweep CONCURRENTLY with the 12-worker batch instead of blocking the
-        # batch behind librespot's up-to-2h serial budget — the measured
-        # bottleneck (see SCOPING_P2-9_P2-3.md / burn-rate). Safety (Oracle-
-        # reviewed): download_track's atomic UPDATE...WHERE status=PENDING claim
-        # makes double-downloads impossible (the loser sees status!=PENDING and
-        # skips); _LIBRESPOT_SEMAPHORE(1) still serialises librespot WITHIN this
-        # process so single-flight holds and the Spotify account is not locked
-        # (a worker thread is not a second process); batch tiers 1/2/4/5 never
-        # touch that semaphore. Net: batch + librespot overlap instead of serial.
-        import concurrent.futures as _cf
+        orchestrator = DownloadOrchestrator(daemon_run_id=run_id)
 
         def _librespot_phase() -> tuple[int, int]:
             try:
@@ -301,20 +308,35 @@ def download_pipeline() -> tuple[int, int]:
                 return 0, 0
 
         lib_dl = 0
-        with _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="librespot-sweep") as _lib_ex:
-            _lib_future = _lib_ex.submit(_librespot_phase)
+        lib_fail = 0
+        if os.environ.get("LIBRESPOT_SWEEP_CONCURRENT", "false").lower() in ("1", "true", "yes", "on"):
+            # Escape hatch for controlled experiments. Default stays serial so
+            # streaming workers never overlap with the pooled downloader.
+            import concurrent.futures as _cf
+
+            with _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="librespot-sweep") as _lib_ex:
+                _lib_future = _lib_ex.submit(_librespot_phase)
+                try:
+                    with get_session() as session:
+                        downloaded, failed = orchestrator.download_pending(session)
+                except Exception as exc:  # noqa: BLE001 — non-fatal; one bad batch != dead cycle
+                    logger.error("batch sweep failed (non-fatal): %s", exc, exc_info=True)
+                    downloaded, failed = 0, 0
+                lib_dl, lib_fail = _lib_future.result()
+        else:
+            lib_dl, lib_fail = _librespot_phase()
             try:
                 with get_session() as session:
                     downloaded, failed = orchestrator.download_pending(session)
             except Exception as exc:  # noqa: BLE001 — non-fatal; one bad batch != dead cycle
                 logger.error("batch sweep failed (non-fatal): %s", exc, exc_info=True)
                 downloaded, failed = 0, 0
-            lib_dl, _lib_fail = _lib_future.result()
         logger.info(
-            "Download pipeline complete (concurrent T0): batch=%d librespot=%d failed=%d",
-            downloaded, lib_dl, failed,
+            "Download pipeline phase complete: batch=%d librespot=%d failed=%d",
+            downloaded, lib_dl, failed + lib_fail,
         )
         downloaded += lib_dl
+        failed += lib_fail
 
         # Phase 3: spotdl sweep
         try:
@@ -482,12 +504,13 @@ def full_download_pipeline() -> None:
     if DISABLE_DOWNLOADS:
         logger.info("Downloads disabled - skipping download pipeline")
         return
-    _record_run_start("scheduled")
+    run_id = _record_run_start("scheduled")
     try:
-        downloaded, failed = download_pipeline()
-        _record_run_complete(downloaded=downloaded, failed=failed)
+        downloaded, failed = download_pipeline(run_id=run_id)
+        _record_run_complete(run_id=run_id, downloaded=downloaded, failed=failed)
     except Exception as exc:
         logger.error("Full download pipeline error: %s", exc, exc_info=True)
+        _record_run_complete(run_id=run_id, notes=f"error: {exc}")
 
 def full_integrity_check() -> None:
     integrity_check()

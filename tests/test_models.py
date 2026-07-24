@@ -109,6 +109,8 @@ class TestTrackModel:
             "cover_art_url", "cover_art_source",
             "mb_recording_id", "mb_release_id", "acoustid_id",
             "status", "download_method", "format",
+            "attempt_count", "last_attempt_at",
+            "claimed_at", "heartbeat_at", "claim_owner", "daemon_run_id",
             "file_path", "file_size_bytes", "file_sha256",
             "plex_verified", "created_at", "updated_at", "last_checked_at",
         }

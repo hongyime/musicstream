@@ -2,12 +2,14 @@
 musicstream/ingestion/downloader.py — 5-tier download orchestrator
 
 Implements the full tier chain for downloading tracks:
+  Tier 0: librespot serial pre-sweep
+  Tier 1: SpotiFLAC — serialised, lossless provider chain
   Tier 2: yt-dlp + ytmusicapi (songs→videos→no filter) — MP3 320kbps, ±5s duration check
-  Tier 3: spotdl Python API — MP3 320kbps, requires Spotify credentials
+  Tier 3: spotDL serial post-sweep — MP3 320kbps, requires Spotify credentials
   Tier 4: yt-dlp YouTube direct search (ytsearch12) — MP3 320kbps
   Tier 5: yt-dlp SoundCloud (scsearch8) — MP3 320kbps, uses separate "soundcloud" circuit breaker
 
-After ≥25 failed attempts: status='failed', log [DOWNLOAD_FAIL] to errors.log.
+After ≥20 failed attempts: status='failed', log [DOWNLOAD_FAIL] to errors.log.
 MAX_CONCURRENT = 4 parallel workers via ThreadPoolExecutor.
 """
 
@@ -16,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import socket
 import tempfile
 import threading
 import time
@@ -26,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import yt_dlp  # type: ignore[import-untyped]
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from src.exceptions import DownloadError, OrganiserError, TaggingError
@@ -39,20 +42,13 @@ errors_logger = logging.getLogger("errors")
 
 # ── librespot optional import (Tier 0: direct Spotify CDN) ───────────────────
 
-try:
-    from librespot.core import Session as _LibrespotSession
-    from librespot.metadata import TrackId as _TrackId
-    from librespot.audio.decoders import (
-        VorbisOnlyAudioQuality as _VorbisQuality,
-        AudioQuality as _AudioQuality,  # AudioQuality lives in decoders, not audio
-    )
-    LIBRESPOT_AVAILABLE = True
-except ImportError:
-    LIBRESPOT_AVAILABLE = False
-    logger.warning("librespot not available; Tier 0 skipped")
-
-if LIBRESPOT_AVAILABLE:
-    logger.info("librespot available — Tier 0 active")
+LIBRESPOT_AVAILABLE = os.environ.get("ENABLE_TIER0", "true").lower() in ("1", "true", "yes", "on")
+_LibrespotSession = None
+_TrackId = None
+_VorbisQuality = None
+_AudioQuality = None
+_librespot_import_checked = False
+_librespot_import_error: Optional[str] = None
 
 # Module-level librespot session singleton (created once, reused across all workers)
 _librespot_session: Optional[object] = None
@@ -61,12 +57,18 @@ _librespot_session_lock = threading.Lock()
 
 # ── SpotiFLAC optional import (Tier 1: Lossless from other services) ──────────
 
-try:
-    from SpotiFLAC import SpotiFLAC as _SpotiFLAC
-    SPOTIFLAC_AVAILABLE = True
-except ImportError:
+if os.environ.get("ENABLE_TIER1", "true").lower() == "true":
+    try:
+        from SpotiFLAC import SpotiFLAC as _SpotiFLAC
+        SPOTIFLAC_AVAILABLE = True
+    except Exception as exc:  # noqa: BLE001 - optional dependency can be installed but unusable
+        _SpotiFLAC = None
+        SPOTIFLAC_AVAILABLE = False
+        logger.warning("SpotiFLAC not available; Tier 1 will be skipped: %s", exc)
+else:
+    _SpotiFLAC = None
     SPOTIFLAC_AVAILABLE = False
-    logger.warning("SpotiFLAC not available; Tier 1 will be skipped")
+    logger.info("SpotiFLAC import skipped because ENABLE_TIER1=false")
 
 if SPOTIFLAC_AVAILABLE:
     logger.info("SpotiFLAC available — Tier 1 active")
@@ -95,6 +97,8 @@ _LIBRESPOT_KILL_GRACE_S = 30.0  # max wait for a killed worker to observe + exit
 def _get_librespot_session():
     """Return the shared librespot Session, creating it on first call."""
     global _librespot_session
+    if not _ensure_librespot_available():
+        raise RuntimeError(f"librespot unavailable: {_librespot_import_error or 'disabled'}")
     if _librespot_session is not None:
         return _librespot_session
     with _librespot_session_lock:
@@ -125,6 +129,40 @@ def _get_librespot_session():
         return _librespot_session
 
 
+def _ensure_librespot_available() -> bool:
+    """Import librespot lazily so daemon startup does not block on Tier 0."""
+    global LIBRESPOT_AVAILABLE
+    global _AudioQuality, _LibrespotSession, _TrackId, _VorbisQuality
+    global _librespot_import_checked, _librespot_import_error
+
+    if not LIBRESPOT_AVAILABLE:
+        return False
+    if _librespot_import_checked:
+        return _librespot_import_error is None
+
+    _librespot_import_checked = True
+    try:
+        from librespot.core import Session as LibrespotSession
+        from librespot.metadata import TrackId as TrackId
+        from librespot.audio.decoders import (
+            VorbisOnlyAudioQuality as VorbisQuality,
+            AudioQuality as AudioQuality,
+        )
+    except Exception as exc:  # noqa: BLE001 - optional dependency can be installed but unusable
+        LIBRESPOT_AVAILABLE = False
+        _librespot_import_error = str(exc)
+        logger.warning("librespot not available; Tier 0 skipped: %s", exc)
+        return False
+
+    _LibrespotSession = LibrespotSession
+    _TrackId = TrackId
+    _VorbisQuality = VorbisQuality
+    _AudioQuality = AudioQuality
+    _librespot_import_error = None
+    logger.info("librespot available — Tier 0 active")
+    return True
+
+
 # ── ytmusicapi optional import ─────────────────────────────────────────────────
 
 try:
@@ -133,15 +171,6 @@ try:
 except ImportError:
     YTMUSICAPI_AVAILABLE = False
     logger.warning("ytmusicapi not available; Tier 2 will be skipped")
-
-# ── spotdl optional import ─────────────────────────────────────────────────────
-
-try:
-    import spotdl  # type: ignore[import-untyped]  # noqa: F401
-    SPOTDL_AVAILABLE = True
-except ImportError:
-    SPOTDL_AVAILABLE = False
-    logger.warning("spotdl not available; Tier 3 will be skipped")
 
 # ── Constants ───────────────────────────────────────────────────────────────────
 
@@ -154,6 +183,7 @@ _GIVE_UP_THRESHOLD = 20    # ~4 complete tier-chain runs before giving up
 # Note: Increasing significantly may trigger API rate limits
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_WORKERS", "4"))
 logger.info("Worker concurrency set to: MAX_CONCURRENT=%d", MAX_CONCURRENT)
+SPOTDL_IN_POOL = os.environ.get("SPOTDL_IN_POOL", "false").lower() in ("1", "true", "yes", "on")
 
 # ── P0-2: cooperative drain-on-shutdown ──────────────────────────────────────
 # Lifespan shutdown (daemon.py) calls request_shutdown() on SIGTERM. The three
@@ -170,6 +200,17 @@ def request_shutdown() -> None:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _claim_owner() -> str:
+    return f"{socket.gethostname()}:{os.getpid()}:{threading.get_ident()}"
+
+
+def _clear_download_claim(track: Track) -> None:
+    track.claimed_at = None
+    track.heartbeat_at = None
+    track.claim_owner = None
+    track.daemon_run_id = None
 
 
 class DownloadOrchestrator:
@@ -190,7 +231,9 @@ class DownloadOrchestrator:
     # across the worker pool.
     _fail_tls = threading.local()
 
-    def __init__(self) -> None:
+    def __init__(self, daemon_run_id: Optional[int] = None) -> None:
+        self._daemon_run_id = daemon_run_id
+
         # Check if Tier 1 (SpotiFLAC) is enabled
         self._tier1_enabled = os.environ.get("ENABLE_TIER1", "true").lower() == "true"
         logger.info("Tier 1 (SpotiFLAC) %s", "enabled" if self._tier1_enabled else "disabled via ENABLE_TIER1=false")
@@ -292,7 +335,10 @@ class DownloadOrchestrator:
             session.execute(
                 select(Track).where(
                     Track.status == TrackStatus.DOWNLOADING.value,
-                    Track.updated_at < stuck_cutoff,
+                    or_(
+                        Track.heartbeat_at < stuck_cutoff,
+                        (Track.heartbeat_at.is_(None)) & (Track.updated_at < stuck_cutoff),
+                    ),
                 )
             )
             .scalars()
@@ -301,6 +347,7 @@ class DownloadOrchestrator:
         if stuck:
             for t in stuck:
                 t.status = TrackStatus.PENDING.value
+                _clear_download_claim(t)
             session.flush()
             logger.info(
                 "Reset %d stuck DOWNLOADING tracks (updated_at < %s) to PENDING",
@@ -317,6 +364,7 @@ class DownloadOrchestrator:
                 select(Track.id).where(Track.status == TrackStatus.PENDING.value)
             ).scalars()
         )
+        session.commit()
 
         if not track_ids:
             logger.info("No pending tracks to download.")
@@ -436,6 +484,7 @@ class DownloadOrchestrator:
                 )
             )
         )
+        session.commit()
 
         if not pending:
             return 0, 0
@@ -560,6 +609,7 @@ class DownloadOrchestrator:
                 select(Track.id).where(Track.status == TrackStatus.PENDING.value)
             ).scalars()
         )
+        session.commit()
 
         if not candidate_ids:
             logger.info("spotdl sweep: no pending tracks to process.")
@@ -622,13 +672,20 @@ class DownloadOrchestrator:
         # succeeds if the row is STILL pending. If rowcount==0 another
         # worker beat us — return False so the caller skips it.
         from sqlalchemy import update
+        now = _utcnow()
         result = session.execute(
             update(Track)
             .where(
                 Track.id == track.id,
                 Track.status == TrackStatus.PENDING.value,
             )
-            .values(status=TrackStatus.DOWNLOADING.value)
+            .values(
+                status=TrackStatus.DOWNLOADING.value,
+                claimed_at=now,
+                heartbeat_at=now,
+                claim_owner=_claim_owner(),
+                daemon_run_id=getattr(self, "_daemon_run_id", None),
+            )
         )
         if result.rowcount == 0:
             logger.debug(
@@ -641,17 +698,20 @@ class DownloadOrchestrator:
         # Refresh the in-memory ORM object so subsequent reads see DOWNLOADING.
         session.refresh(track)
 
-        # Tier 0 (librespot) is a single-worker sweep that runs before this
-        # batch — not in the 12-worker pool. It requires serialised access;
-        # running it here would block 11/12 workers on a semaphore or produce
-        # 11x the Spotify API hammering.
-        tiers = tiers_override if tiers_override is not None else [
-            ("tier1_spotiflac",        self._tier1_spotiflac),
-            ("tier2_ytdlp_ytm",        self._tier2_ytdlp_ytm),
-            ("tier3_spotdl",           self._tier3_spotdl),
-            ("tier4_ytdlp_youtube",    self._tier4_ytdlp_youtube),
-            ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),
-        ]
+        # Tier 0 (librespot) and Tier 3 (spotDL) run as serial sweeps outside
+        # this pool. The pooled path stays limited to tiers safe for modest
+        # MAX_CONCURRENT_WORKERS ramps.
+        if tiers_override is not None:
+            tiers = tiers_override
+        else:
+            tiers = [
+                ("tier1_spotiflac",        self._tier1_spotiflac),
+                ("tier2_ytdlp_ytm",        self._tier2_ytdlp_ytm),
+                ("tier4_ytdlp_youtube",    self._tier4_ytdlp_youtube),
+                ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),
+            ]
+            if SPOTDL_IN_POOL:
+                tiers.insert(2, ("tier3_spotdl", self._tier3_spotdl))
 
         # Filter out disabled tiers
         if not self._tier1_enabled:
@@ -660,6 +720,8 @@ class DownloadOrchestrator:
         for method_name, tier_fn in tiers:
             try:
                 self._fail_tls.fail_reason = None
+                track.heartbeat_at = _utcnow()
+                session.commit()
                 path = tier_fn(track)
                 if path:
                     self._record_attempt(
@@ -688,6 +750,8 @@ class DownloadOrchestrator:
                     # ── Move file into Plex library (fatal: no file = no point) ─
                     try:
                         final_path = self._organiser.organise(path, track, session)
+                        _clear_download_claim(track)
+                        session.flush()
                         logger.info(
                             "Track %d ('%s') delivered via %s → %s",
                             track.id, track.title, download_method, final_path,
@@ -699,6 +763,7 @@ class DownloadOrchestrator:
                             track.id, track.title, org_exc,
                         )
                         track.status = TrackStatus.FAILED_VALIDATION.value
+                        _clear_download_claim(track)
                         session.flush()
                         return False
 
@@ -738,6 +803,7 @@ class DownloadOrchestrator:
         # All tiers exhausted
         if self._should_give_up(session, track.id):
             track.status = TrackStatus.FAILED.value
+            _clear_download_claim(track)
             session.flush()
             errors_logger.error(
                 "[DOWNLOAD_FAIL] %s | %s | attempts=%d | last_error=all tiers exhausted",
@@ -754,6 +820,7 @@ class DownloadOrchestrator:
         else:
             # Leave as pending for the next run
             track.status = TrackStatus.PENDING.value
+            _clear_download_claim(track)
             session.flush()
             logger.info(
                 "Track id=%d '%s' — all tiers failed this run; will retry next run.",
@@ -995,10 +1062,15 @@ class DownloadOrchestrator:
             # aren't actually actionable. The track will cascade to tiers 1-5
             # cleanly the same way our F4 pre-skip path handles it.
             exc_str = str(exc).lower()
+            is_unavailable = "librespot unavailable" in exc_str
             is_alt_track_signal = "cannot get alternative track" in exc_str
             is_auth_failure = not _librespot_auth_ok or any(
                 kw in exc_str for kw in ("auth", "credential", "login", "token", "unauthorized", "403", "invalid")
             )
+
+            if is_unavailable:
+                self._note_fail(te.NOT_AVAILABLE)
+                return None
 
             if is_alt_track_signal:
                 # Log at INFO and DO NOT count against the circuit breaker.
@@ -1665,6 +1737,9 @@ class DownloadOrchestrator:
                 if rt is not None:
                     rt.attempt_count = (rt.attempt_count or 0) + 1
                     rt.last_attempt_at = _utcnow()
+                    if rt.status == TrackStatus.DOWNLOADING.value and rt.file_path is None:
+                        rt.status = TrackStatus.PENDING.value
+                        _clear_download_claim(rt)
         except Exception as exc:  # noqa: BLE001 - recording must never break the sweep
             logger.debug(
                 "could not record librespot timeout attempt for %d: %s", track_id, exc,

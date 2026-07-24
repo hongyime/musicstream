@@ -254,6 +254,9 @@ class TestDownloadTrackIsolation:
         assert result is True
         assert track.status == TrackStatus.DOWNLOADED.value
         assert track.download_method == "ytdlp_ytm"
+        assert track.claimed_at is None
+        assert track.heartbeat_at is None
+        assert track.claim_owner is None
 
     def test_status_set_to_failed_after_give_up(self, session):
         track = _make_track(session, "spotify:track:give_up_test")
@@ -272,6 +275,9 @@ class TestDownloadTrackIsolation:
 
         assert result is False
         assert track.status == TrackStatus.FAILED.value
+        assert track.claimed_at is None
+        assert track.heartbeat_at is None
+        assert track.claim_owner is None
 
 
 # ── _is_content_error ─────────────────────────────────────────────────────────
@@ -818,6 +824,29 @@ class TestLibrespotTimeoutRecording:
         assert attempt.success is False
         refreshed = session.get(Track, track.id)
         assert (refreshed.attempt_count or 0) == 1
+
+    def test_record_librespot_timeout_requeues_claimed_track(self, session):
+        from contextlib import contextmanager
+        track = _make_track(session, "spotify:track:t0_ratelimit_requeue")
+        track.status = TrackStatus.DOWNLOADING.value
+        track.claimed_at = datetime.now(timezone.utc)
+        track.heartbeat_at = datetime.now(timezone.utc)
+        track.claim_owner = "worker:test"
+        session.flush()
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+
+        @contextmanager
+        def fake_get_session():
+            yield session
+
+        with patch("src.db.get_session", fake_get_session):
+            orch._record_librespot_timeout(track.id)
+
+        refreshed = session.get(Track, track.id)
+        assert refreshed.status == TrackStatus.PENDING.value
+        assert refreshed.claimed_at is None
+        assert refreshed.heartbeat_at is None
+        assert refreshed.claim_owner is None
 
     def test_timeout_recording_never_raises_on_db_error(self, session):
         """Recording must never break the sweep, even if the session blows up."""
