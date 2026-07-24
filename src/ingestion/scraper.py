@@ -23,11 +23,12 @@ from typing import Optional
 import spotipy
 from spotipy.cache_handler import CacheFileHandler
 from spotipy.oauth2 import SpotifyOAuth, SpotifyPKCE
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.core.config import SPOTIFY_CLIENT_SECRET
 from src.exceptions import SpotifyRateLimitError
-from src.models import Source, SourceType, Track, TrackStatus
+from src.models import Source, SourceType, Track, TrackStatus, track_sources
 from src.rate_limiter import ServiceRateLimiter
 
 logger = logging.getLogger(__name__)
@@ -234,14 +235,25 @@ class SpotifyScraper:
         new_count = 0
 
         # ── Playlists ──────────────────────────────────────────────────────────
-        playlist_sources = (
-            session.query(Source)
-            .filter(Source.source_type == SourceType.PLAYLIST.value)
-            .all()
-        )
+        playlist_sources = [
+            {
+                "id": source.id,
+                "spotify_id": source.spotify_id,
+                "name": source.name,
+                "snapshot_id": source.snapshot_id,
+            }
+            for source in (
+                session.query(Source)
+                .filter(Source.source_type == SourceType.PLAYLIST.value)
+                .all()
+            )
+        ]
+        session.commit()
 
-        for source in playlist_sources:
-            pl_id = source.spotify_id
+        for source_info in playlist_sources:
+            pl_id = source_info["spotify_id"]
+            source_name = source_info["name"]
+            previous_snapshot = source_info["snapshot_id"]
 
             # 1 lightweight API call to get current snapshot_id
             try:
@@ -252,8 +264,8 @@ class SpotifyScraper:
 
             current_snapshot = pl_meta.get("snapshot_id")
 
-            if current_snapshot and current_snapshot == source.snapshot_id:
-                logger.debug("Playlist '%s' unchanged (snapshot_id match). Skipping.", source.name)
+            if current_snapshot and current_snapshot == previous_snapshot:
+                logger.debug("Playlist '%s' unchanged (snapshot_id match). Skipping.", source_name)
                 continue
 
             # Snapshot changed — fetch all tracks (re-fetch entire playlist)
@@ -261,40 +273,60 @@ class SpotifyScraper:
             # De-duplication in _upsert_tracks() prevents duplicate inserts.
             logger.info(
                 "Playlist '%s' changed (snapshot %s != %s). Re-fetching all tracks for de-duplication.",
-                source.name,
+                source_name,
                 current_snapshot[:8] if current_snapshot else "none",
-                (source.snapshot_id[:8] if source.snapshot_id else "none"),
+                (previous_snapshot[:8] if previous_snapshot else "none"),
             )
 
             new_raw_tracks = self.get_playlist_tracks(pl_id, offset=0)
+            source = session.get(Source, source_info["id"])
+            if source is None:
+                logger.warning("Playlist source %s disappeared before update; skipping.", pl_id)
+                session.rollback()
+                continue
+
             added = self._upsert_tracks(session, new_raw_tracks, source)
             new_count += added
 
             # Update snapshot_id and track_count to current total
             self._update_source(session, source, current_snapshot, len(new_raw_tracks))
+            session.commit()
             logger.info(
                 "Playlist '%s': %d tracks upserted (%d new).", source.name, len(new_raw_tracks), added
             )
 
         # ── Liked Songs — always re-fetch ──────────────────────────────────────
-        liked_source = (
+        liked_source_info = (
             session.query(Source)
             .filter(Source.spotify_id == _LIKED_SONGS_ID)
             .first()
         )
+        liked_source_id = liked_source_info.id if liked_source_info is not None else None
+        session.commit()
 
-        if liked_source is None:
+        liked_tracks = self.get_liked_songs()
+
+        if liked_source_id is None:
             liked_source = self._get_or_create_source(
                 session,
                 spotify_id=_LIKED_SONGS_ID,
                 name="Liked Songs",
                 source_type=SourceType.LIKED.value,
             )
+        else:
+            liked_source = session.get(Source, liked_source_id)
+            if liked_source is None:
+                liked_source = self._get_or_create_source(
+                    session,
+                    spotify_id=_LIKED_SONGS_ID,
+                    name="Liked Songs",
+                    source_type=SourceType.LIKED.value,
+                )
 
-        liked_tracks = self.get_liked_songs()
         added = self._upsert_tracks(session, liked_tracks, liked_source)
         new_count += added
         self._update_source(session, liked_source, snapshot_id=None, track_count=len(liked_tracks))
+        session.commit()
         logger.info("Liked Songs: %d new tracks added.", added)
 
         logger.info("Incremental sync complete. Total new tracks: %d.", new_count)
@@ -930,6 +962,8 @@ class SpotifyScraper:
             Number of newly inserted tracks.
         """
         new_count = 0
+        parsed_items: list[dict] = []
+        seen_uris: set[str] = set()
 
         for item in raw_items:
             data = self._extract_track_data(item)
@@ -937,12 +971,46 @@ class SpotifyScraper:
                 continue  # skip local files / null entries
 
             spotify_uri = data["spotify_uri"]
+            if spotify_uri in seen_uris:
+                continue
+            seen_uris.add(spotify_uri)
+            parsed_items.append(data)
 
-            existing = (
-                session.query(Track)
-                .filter(Track.spotify_uri == spotify_uri)
-                .first()
+        if not parsed_items:
+            return 0
+
+        def _chunks(values: list[str] | list[int], size: int = 1000):
+            for idx in range(0, len(values), size):
+                yield values[idx:idx + size]
+
+        uris = [data["spotify_uri"] for data in parsed_items]
+        existing_by_uri: dict[str, Track] = {}
+        for chunk in _chunks(uris):
+            rows = session.execute(
+                select(Track).where(Track.spotify_uri.in_(chunk))
+            ).scalars()
+            existing_by_uri.update({track.spotify_uri: track for track in rows})
+
+        if source.id is None:
+            session.flush()
+
+        existing_ids = [track.id for track in existing_by_uri.values() if track.id is not None]
+        linked_track_ids: set[int] = set()
+        for chunk in _chunks(existing_ids):
+            linked_track_ids.update(
+                session.execute(
+                    select(track_sources.c.track_id).where(
+                        track_sources.c.source_id == source.id,
+                        track_sources.c.track_id.in_(chunk),
+                    )
+                ).scalars()
             )
+
+        links_to_add: list[dict[str, int]] = []
+
+        for data in parsed_items:
+            spotify_uri = data["spotify_uri"]
+            existing = existing_by_uri.get(spotify_uri)
 
             if existing is None:
                 # New track — insert with status=pending
@@ -964,6 +1032,7 @@ class SpotifyScraper:
                 )
                 session.add(track)
                 session.flush()  # populate track.id
+                existing_by_uri[spotify_uri] = track
                 new_count += 1
                 logger.debug("Inserted new track: %s — %s", data["artist"], data["title"])
             else:
@@ -984,8 +1053,12 @@ class SpotifyScraper:
                 track = existing
 
             # Link track ↔ source (idempotent — skip if already linked)
-            if source not in track.sources:
-                track.sources.append(source)
+            if track.id is not None and track.id not in linked_track_ids:
+                links_to_add.append({"track_id": track.id, "source_id": source.id})
+                linked_track_ids.add(track.id)
+
+        if links_to_add:
+            session.execute(track_sources.insert(), links_to_add)
 
         return new_count
 

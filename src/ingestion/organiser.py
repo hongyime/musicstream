@@ -3,7 +3,7 @@ musicstream/ingestion/organiser.py — File organisation and Plex library refres
 
 Moves a downloaded audio file from temp/ into the Plex-compatible directory
 structure on the external HDD, computes a SHA-256 checksum, updates the DB
-record, and triggers a Plex library section refresh.
+record, and triggers batched Plex library section refreshes.
 
 Directory structure:
     {media_drive}/{Album Artist}/{Album} ({Year})/{NN} - {Title}.{ext}
@@ -19,16 +19,23 @@ Rules:
     a numeric suffix " (2)", " (3)", … is appended to the stem until the path
     is unique.
   - SHA-256 is computed from the FINAL file at its FINAL path (not temp path).
+  - Plex refreshes are batched: first successful move refreshes immediately,
+    then refresh occurs after PLEX_REFRESH_INTERVAL_SECONDS or
+    PLEX_REFRESH_BATCH_SIZE moves.
   - Plex refresh is triggered via:
-      POST http://{plex_url}/library/sections/{section_id}/refresh?X-Plex-Token={token}
+      GET http://{plex_url}/library/sections/{section_id}/refresh
+      with X-Plex-Token in the request header.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import shutil
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -50,6 +57,9 @@ _WINDOWS_RESERVED = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
+
+_DEFAULT_PLEX_REFRESH_INTERVAL_SECONDS = 300.0
+_DEFAULT_PLEX_REFRESH_BATCH_SIZE = 25
 
 
 class FileOrganiser:
@@ -80,6 +90,17 @@ class FileOrganiser:
         self._plex_url = plex_url.rstrip("/")
         self._plex_token = plex_token
         self._plex_section_id = plex_section_id
+        self._plex_refresh_interval_seconds = self._read_float_env(
+            "PLEX_REFRESH_INTERVAL_SECONDS",
+            _DEFAULT_PLEX_REFRESH_INTERVAL_SECONDS,
+        )
+        self._plex_refresh_batch_size = self._read_int_env(
+            "PLEX_REFRESH_BATCH_SIZE",
+            _DEFAULT_PLEX_REFRESH_BATCH_SIZE,
+        )
+        self._plex_refresh_lock = threading.Lock()
+        self._last_plex_refresh_at: Optional[float] = None
+        self._moves_since_plex_refresh = 0
 
         # Build a requests.Session that puts the Plex token in the
         # X-Plex-Token HEADER instead of the URL query string. SPEC §B15:
@@ -220,9 +241,10 @@ class FileOrganiser:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Sidecar artwork write failed (non-fatal): %s", exc)
 
-        # Trigger Plex refresh (non-fatal on failure)
+        # Trigger Plex refresh when due (non-fatal on failure). The first move
+        # refreshes immediately; following moves are batched by count/time.
         try:
-            self._refresh_plex()
+            self._refresh_plex_if_due()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Plex refresh failed (non-fatal): %s", exc)
 
@@ -325,6 +347,73 @@ class FileOrganiser:
             raise OrganiserError(f"Cannot read file for SHA-256: {path!r}: {exc}") from exc
 
     # ── Plex refresh ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _read_float_env(name: str, default: float) -> float:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        try:
+            parsed = float(value)
+        except ValueError:
+            logger.warning("Invalid %s=%r; using default %s", name, value, default)
+            return default
+        if parsed < 0 or not math.isfinite(parsed):
+            logger.warning("Invalid %s=%r; using default %s", name, value, default)
+            return default
+        return parsed
+
+    @staticmethod
+    def _read_int_env(name: str, default: int) -> int:
+        value = os.environ.get(name)
+        if value is None:
+            return default
+        try:
+            parsed = int(value)
+        except ValueError:
+            logger.warning("Invalid %s=%r; using default %s", name, value, default)
+            return default
+        if parsed < 1:
+            logger.warning("Invalid %s=%r; using default %s", name, value, default)
+            return default
+        return parsed
+
+    def _refresh_plex_if_due(self, now: Optional[float] = None) -> None:
+        """
+        Trigger Plex refresh for the first move, then batch later moves.
+
+        Env knobs:
+          - PLEX_REFRESH_INTERVAL_SECONDS: refresh after this many seconds.
+          - PLEX_REFRESH_BATCH_SIZE: refresh after this many successful moves.
+        """
+        now = time.monotonic() if now is None else now
+        should_refresh = False
+        skipped_moves = 0
+
+        with self._plex_refresh_lock:
+            self._moves_since_plex_refresh += 1
+
+            if self._last_plex_refresh_at is None:
+                should_refresh = True
+            else:
+                elapsed = now - self._last_plex_refresh_at
+                interval_due = elapsed >= self._plex_refresh_interval_seconds
+                batch_due = self._moves_since_plex_refresh >= self._plex_refresh_batch_size
+                should_refresh = interval_due or batch_due
+
+            if should_refresh:
+                self._last_plex_refresh_at = now
+                self._moves_since_plex_refresh = 0
+            else:
+                skipped_moves = self._moves_since_plex_refresh
+
+        if should_refresh:
+            self._refresh_plex()
+        else:
+            logger.debug(
+                "Skipping Plex refresh; %d moves since last refresh.",
+                skipped_moves,
+            )
 
     def _refresh_plex(self) -> None:
         """
@@ -441,6 +530,10 @@ class FileOrganiser:
         track.file_size_bytes = size
         track.status = TrackStatus.DOWNLOADED.value
         track.format = fmt
+        track.claimed_at = None
+        track.heartbeat_at = None
+        track.claim_owner = None
+        track.daemon_run_id = None
         session.add(track)
         logger.debug(
             "DB updated for track %d: path=%r sha256=%s… size=%d fmt=%s",
