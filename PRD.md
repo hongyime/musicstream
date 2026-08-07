@@ -1,6 +1,6 @@
 # musicstream — PRD v3.0
 
-**Repository:** github.com/bryanseah234/musicstream
+**Repository:** github.com/hongyime/musicstream
 **Version:** 3.0
 **Status:** DRAFT
 **Date:** 2026-04-22
@@ -414,7 +414,7 @@ MusicBrainz is queried when any tag field is missing after the Spotify pass.
 **Rate limiting:** MusicBrainz enforces 1 req/s. Enforced via `rate_limiter.py`
 with `musicbrainz` service config. User-Agent header required:
 ```
-User-Agent: musicstream/3.0.0 ( github.com/bryanseah234/musicstream )
+User-Agent: musicstream/3.0.0 ( github.com/hongyime/musicstream )
 ```
 
 **Cover art:** Fetched from Cover Art Archive:

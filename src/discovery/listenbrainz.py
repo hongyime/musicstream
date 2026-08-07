@@ -43,7 +43,7 @@ _error_logger = logging.getLogger("musicstream.errors")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MB_USER_AGENT  = "musicstream/3.0.0 ( github.com/bryanseah234/musicstream )"
+MB_USER_AGENT  = "musicstream/3.0.0 ( github.com/hongyime/musicstream )"
 MB_WS2_BASE    = "https://musicbrainz.org/ws/2"
 
 BACKFILL_COUNT = 200

@@ -72,7 +72,7 @@ _error_logger = logging.getLogger("musicstream.errors")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MB_USER_AGENT = "musicstream/3.0.0 ( github.com/bryanseah234/musicstream )"
+MB_USER_AGENT = "musicstream/3.0.0 ( github.com/hongyime/musicstream )"
 MB_WS2_BASE   = "https://musicbrainz.org/ws/2"
 CAA_BASE      = "https://coverartarchive.org"
 ACOUSTID_BASE = "https://api.acoustid.org/v2"
