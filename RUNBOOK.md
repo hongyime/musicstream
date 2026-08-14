@@ -217,15 +217,35 @@ psql -U musicstream -d musicstream < backups/musicstream_<TS>.sql   # ignore the
 `liked_artists_expand` 02:00 · `download_pipeline` 03:00 · `lb_discovery` 04:00 ·
 `integrity_check` Wed/Sun 05:00 · `db_backup` Sun 05:00. (misfire_grace_time=3600.)
 
-### Host-scheduled watchdogs (Windows Startup folder — `shell:startup`)
-This environment cannot register Scheduled Tasks (`schtasks` Access denied); use the
-Startup folder with a `.bat` that loops Git Bash:
+### Host-scheduled watchdogs
+
+`scripts/musicstream_self_heal.ps1` is the Windows host watchdog. It waits for
+Docker Desktop, persists `PLEX_HOST_PORT` in `.env`, skips host ports that are
+already held by Docker's networking backend, starts only the `C:\musicstream`
+Compose project, restarts unhealthy musicstream containers, and logs to
+`logs/self_heal.log`.
+
+Install or refresh the scheduled task:
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\musicstream_self_heal.ps1 -InstallTask
+```
+If Task Scheduler denies registration, the installer falls back to the current
+user's Startup folder and copies both `Musicstream_Startup.bat` and
+`Musicstream_SelfHeal_Loop.cmd`.
+
+Run one recovery pass manually:
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\musicstream_self_heal.ps1 -Once
+```
+
+The older stuck-download alert-only watchdog can still run from the Startup folder:
 ```bat
 @echo off
 "C:\Program Files\Git\bin\bash.exe" -lc "while true; do /c/musicstream/scripts/watchdog_stuck_downloads.sh; sleep 600; done"
 ```
-- `scripts/watchdog_stuck_downloads.sh` — alerts if tracks sit in `downloading` >30min (silent otherwise).
-- `scripts/verify_backup_restore.sh` — monthly restore check.
+- `scripts/musicstream_self_heal.ps1` -- starts/repairs the stack and handles Plex host-port conflicts.
+- `scripts/watchdog_stuck_downloads.sh` -- alerts if tracks sit in `downloading` >30min (silent otherwise).
+- `scripts/verify_backup_restore.sh` -- monthly restore check.
 
 ---
 
@@ -247,5 +267,7 @@ The file logger self-heals via a 60s watchdog after uvicorn's dictConfig wipes h
 ---
 
 ## 9. Boot autostart
-The whole stack autostarts via a Startup-folder `.bat` running `docker compose up -d`
-(see `scripts/Musicstream_Startup.bat`). Plex/Tailscale mobile access details are in `README.md`.
+The whole stack autostarts via the self-heal scheduled task and the
+Startup-folder `.bat` wrapper (see `scripts/Musicstream_Startup.bat`).
+Plex/Tailscale mobile access details are in `README.md`; use the port in
+`.env` as `PLEX_HOST_PORT`.

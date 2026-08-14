@@ -240,6 +240,7 @@ if not exist ".env" (
         echo PLEX_TOKEN=!PLEX_TOKEN!
         echo PLEX_LIBRARY_SECTION_ID=!PLEX_LIBRARY_SECTION_ID!
         echo TAILSCALE_IP=!TAILSCALE_IP!
+        echo PLEX_HOST_PORT=32401
         echo PLEX_URL=http://musicstream-plex:32400
         echo SPOTIFY_TOKEN_CACHE=/app/spotify_token.json
         echo ACOUSTID_API_KEY=!ACOUSTID_API_KEY!
@@ -259,12 +260,16 @@ if not exist ".env" (
     call :patch_env PLEX_TOKEN "!PLEX_TOKEN!"
     call :patch_env PLEX_LIBRARY_SECTION_ID "!PLEX_LIBRARY_SECTION_ID!"
     call :patch_env TAILSCALE_IP "!TAILSCALE_IP!"
+    findstr /i /b /c:"PLEX_HOST_PORT=" ".env" >nul 2>&1
+    if errorlevel 1 echo PLEX_HOST_PORT=32401>> .env
     call :patch_env PLEX_URL "http://musicstream-plex:32400"
     call :patch_env SPOTIFY_TOKEN_CACHE "/app/spotify_token.json"
     call :patch_env ACOUSTID_API_KEY "!ACOUSTID_API_KEY!"
     echo [OK]   .env patched.
 )
 echo.
+call :read_env PLEX_HOST_PORT
+if "!PLEX_HOST_PORT!"=="" set "PLEX_HOST_PORT=32401"
 
 :: ============================================================
 :: STEP 3/10 - Create directories
@@ -364,15 +369,18 @@ if "%ADMIN%"=="0" (
 
 for /f "tokens=*" %%i in ('powershell -NoProfile -Command "Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*Tailscale*'} | Select-Object -ExpandProperty Name" 2^>nul') do set TAILSCALE_IF=%%i
 
+call :read_env PLEX_HOST_PORT
+if "!PLEX_HOST_PORT!"=="" set "PLEX_HOST_PORT=32401"
+
 if "!TAILSCALE_IF!"=="" (
-    echo [WARN] Could not detect Tailscale adapter. Allowing TCP 32400 on all interfaces.
-    powershell -NoProfile -Command "New-NetFirewallRule -DisplayName 'Plex TCP 32400' -Direction Inbound -Protocol TCP -LocalPort 32400 -Action Allow -Profile Any -ErrorAction SilentlyContinue" >nul 2>&1
+    echo [WARN] Could not detect Tailscale adapter. Allowing TCP !PLEX_HOST_PORT! on all interfaces.
+    powershell -NoProfile -Command "New-NetFirewallRule -DisplayName 'Plex TCP !PLEX_HOST_PORT!' -Direction Inbound -Protocol TCP -LocalPort !PLEX_HOST_PORT! -Action Allow -Profile Any -ErrorAction SilentlyContinue" >nul 2>&1
 ) else (
     echo [INFO] Tailscale adapter: !TAILSCALE_IF!
-    powershell -NoProfile -Command "Remove-NetFirewallRule -DisplayName 'Plex TCP 32400*' -ErrorAction SilentlyContinue" >nul 2>&1
-    powershell -NoProfile -Command "New-NetFirewallRule -DisplayName 'Plex TCP 32400 Tailscale Allow' -Direction Inbound -Protocol TCP -LocalPort 32400 -Action Allow -InterfaceAlias '!TAILSCALE_IF!' -Profile Any" >nul 2>&1
-    powershell -NoProfile -Command "New-NetFirewallRule -DisplayName 'Plex TCP 32400 Block Others' -Direction Inbound -Protocol TCP -LocalPort 32400 -Action Block -Profile Any" >nul 2>&1
-    echo [OK]   Firewall: TCP 32400 allowed on Tailscale, blocked elsewhere.
+    powershell -NoProfile -Command "Remove-NetFirewallRule -DisplayName 'Plex TCP 32400*' -ErrorAction SilentlyContinue; Remove-NetFirewallRule -DisplayName 'Plex TCP !PLEX_HOST_PORT!*' -ErrorAction SilentlyContinue" >nul 2>&1
+    powershell -NoProfile -Command "New-NetFirewallRule -DisplayName 'Plex TCP !PLEX_HOST_PORT! Tailscale Allow' -Direction Inbound -Protocol TCP -LocalPort !PLEX_HOST_PORT! -Action Allow -InterfaceAlias '!TAILSCALE_IF!' -Profile Any" >nul 2>&1
+    powershell -NoProfile -Command "New-NetFirewallRule -DisplayName 'Plex TCP !PLEX_HOST_PORT! Block Others' -Direction Inbound -Protocol TCP -LocalPort !PLEX_HOST_PORT! -Action Block -Profile Any" >nul 2>&1
+    echo [OK]   Firewall: TCP !PLEX_HOST_PORT! allowed on Tailscale, blocked elsewhere.
 )
 echo.
 
@@ -460,12 +468,12 @@ echo   MUSICSTREAM SETUP - Complete
 echo ============================================================
 echo.
 echo   Tailscale IP : !TAILSCALE_IP!
-echo   Plex URL     : http://!TAILSCALE_IP!:32400/web
+echo   Plex URL     : http://!TAILSCALE_IP!:!PLEX_HOST_PORT!/web
 echo   Daemon API   : http://localhost:9079/health
 echo.
 echo   Next steps:
 echo     1. Run startup.bat to start the full stack
-echo     2. Open Plex at http://!TAILSCALE_IP!:32400/web to finish setup
+echo     2. Open Plex at http://!TAILSCALE_IP!:!PLEX_HOST_PORT!/web to finish setup
 echo     3. Daemon will sync Spotify automatically every 15 minutes
 echo.
 echo   Useful commands:

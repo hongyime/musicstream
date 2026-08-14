@@ -49,14 +49,14 @@ services:
     container_name: musicstream-plex
     environment:
       - PLEX_CLAIM=${PLEX_CLAIM_TOKEN}
-      - ADVERTISE_IP=http://${TAILSCALE_IP}:32400/
+      - ADVERTISE_IP=http://${TAILSCALE_IP}:${PLEX_HOST_PORT:-32401}/
       - TZ=Asia/Singapore
     volumes:
       - ${EXTERNAL_MEDIA_DRIVE}:/media:ro
       - ./plex/config:/config
       - ./plex/transcode:/transcode
     ports:
-      - "0.0.0.0:32400:32400"
+      - "0.0.0.0:${PLEX_HOST_PORT:-32401}:32400"
     restart: unless-stopped
     deploy:
       resources:

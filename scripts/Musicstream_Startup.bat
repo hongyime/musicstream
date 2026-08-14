@@ -33,9 +33,14 @@ timeout /t 10 /nobreak >nul
 goto WAIT_INTERNET
 
 :INTERNET_READY
-echo [%date% %time%] Internet available. Starting containers... >> %LOGFILE%
+echo [%date% %time%] Internet available. Running self-heal start sequence... >> %LOGFILE%
 cd /d C:\musicstream
-docker compose up -d >> %LOGFILE% 2>&1
-echo [%date% %time%] docker compose up -d done (exit %errorlevel%) >> %LOGFILE%
+where pwsh >nul 2>&1
+if %errorlevel% == 0 (
+    pwsh -NoProfile -ExecutionPolicy Bypass -File "C:\musicstream\scripts\musicstream_self_heal.ps1" -Once >> %LOGFILE% 2>&1
+) else (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "C:\musicstream\scripts\musicstream_self_heal.ps1" -Once >> %LOGFILE% 2>&1
+)
+echo [%date% %time%] self-heal done (exit %errorlevel%) >> %LOGFILE%
 echo [%date% %time%] Startup complete. >> %LOGFILE%
 exit /b 0
