@@ -67,6 +67,7 @@ docker-compose.override.yaml
 
 
 
+
 # AI / editor dot directories (managed via sourcerepo)
 .*
 !.github/
