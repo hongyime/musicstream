@@ -437,7 +437,8 @@ def _register_scheduler_jobs():
     scheduler.add_job(tasks.upgrade_pass_scheduled, "cron", day_of_week="sat", hour=2, id="upgrade_pass", replace_existing=True, misfire_grace_time=GRACE)
     # §W3 T23: troi generates weekly playlists on Mondays.
     scheduler.add_job(tasks.discover_weekly_task, "cron", day_of_week="mon", hour=6, id="discover_weekly", replace_existing=True, misfire_grace_time=GRACE)
-
+    # Self-heal: keep yt-dlp fresh so YouTube tiers never rot again (§W3 ops).
+    scheduler.add_job(tasks.update_ytdlp, "cron", hour=7, id="ytdlp_update", replace_existing=True, misfire_grace_time=GRACE)
 
 def _lb_discovery_overdue() -> bool:
     """

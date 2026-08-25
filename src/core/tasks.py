@@ -703,6 +703,32 @@ def discover_weekly_task() -> None:
         logger.error("Discover-weekly task failed: %s", exc, exc_info=True)
 
 
+def update_ytdlp() -> None:
+    """Daily self-heal: yt-dlp breaks against YouTube changes every few weeks.
+
+    Stale scrapers took Tier 2/4 to 100% failure once already (2026-08-25).
+    The downloader shells out to the yt-dlp CLI, so an on-disk upgrade takes
+    effect on the next subprocess call — no restart needed. Runs as root in
+    the container, so the system site-packages copy is updated in place.
+    """
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["pip", "install", "--quiet", "--upgrade", "yt-dlp"],
+            capture_output=True, timeout=600,
+        )
+        if proc.returncode == 0:
+            logger.info("[YTDLP] auto-update OK")
+        else:
+            logger.warning(
+                "[YTDLP] auto-update failed rc=%d: %s",
+                proc.returncode, (proc.stderr or b"")[-200:],
+            )
+    except Exception as exc:
+        logger.warning("[YTDLP] auto-update error: %s", exc)
+
+
 def probe_spotify_token() -> None:
     """§W3 T18/V13 hourly early-warning: refresh-or-alert on near-expiry.
 
