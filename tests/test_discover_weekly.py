@@ -97,7 +97,9 @@ def seeded(session):
 @pytest.fixture()
 def dwe(session, seeded):
     http = _StubHTTP({
-        "/playlists": PLAYLIST_LIST,
+        # Order matters: createdfor must match before the generic /playlists key.
+        "/playlists/createdfor": PLAYLIST_LIST,
+        "/playlists": {"payload": {"playlists": []}},
         "/playlist/aaaa1111": {"playlist": JSPF},
     })
     dwe_engine = DiscoverWeekly(username="qa_user", http_session=http)
@@ -128,7 +130,9 @@ def test_run_resolves_queues_and_exports(session, tmp_path, monkeypatch, seeded)
     monkeypatch.setattr(ListenBrainzDiscovery, "_fetch_mb_metadata", lambda self, mbid: None)
     monkeypatch.setattr("src.core.config.PLAYLISTS_EXPORT_DIR", str(tmp_path))
     http = _StubHTTP({
-        "/playlists": PLAYLIST_LIST,
+        # Order matters: createdfor must match before the generic /playlists key.
+        "/playlists/createdfor": PLAYLIST_LIST,
+        "/playlists": {"payload": {"playlists": []}},
         "/playlist/aaaa1111": {"playlist": JSPF},
     })
     dwe = DiscoverWeekly(username="qa_user", http_session=http)
@@ -184,6 +188,8 @@ def test_blocked_tracks_never_resolve(session, seeded):
         "Known MBID Hit", "Alpha", 201000,
     )
     assert resolved is None or resolved.blocked is False
+
+
 
 
 

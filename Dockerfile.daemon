@@ -77,7 +77,10 @@ RUN groupadd --gid 1000 musicstream \
 # then transfer ownership of /app to the runtime user.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir yt-dlp-ejs==0.8.0
+    && pip install --no-cache-dir yt-dlp-ejs==0.8.0 \
+    # yt-dlp breaks against YouTube changes every few weeks — always build
+    # with the freshest release, not whatever requirements.txt pinned.
+    && pip install --no-cache-dir --upgrade yt-dlp
 
 # Copy backend code
 COPY . .

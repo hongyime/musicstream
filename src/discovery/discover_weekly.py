@@ -88,31 +88,38 @@ class DiscoverWeekly:
     # ── Playlist discovery ────────────────────────────────────────────────────
 
     def find_weekly_playlists(self) -> list[dict]:
-        """Return metadata for the latest weekly-jams/exploration playlists."""
-        url = f"{_LB_BASE}/1/user/{self._username}/playlists"
-        resp = self._get(url)
-        items = (
-            resp.get("payload", {})
-            .get("playlists", [])
-        )
+        """Return metadata for the latest weekly-jams/exploration playlists.
+
+        troi-bot delivers to TWO feeds: the user's own playlist list AND the
+        'Created for You' feed (/playlists/createdfor). Scan both, newest-first,
+        dedupe by kind.
+        """
+        feeds = [
+            f"{_LB_BASE}/1/user/{self._username}/playlists",
+            f"{_LB_BASE}/1/user/{self._username}/playlists/createdfor",
+        ]
 
         found: dict[str, dict] = {}
-        for item in items:
-            title = (item.get("playlist") or {}).get("title") or item.get("title") or ""
-            matched_kind = self._match_weekly(title)
-            if not matched_kind:
-                continue
-            # Keep only the newest per kind — list is newest-first.
-            if matched_kind not in found:
-                found[matched_kind] = {
-                    "kind": matched_kind,
-                    "title": title,
-                    "mbid": self._mbid_from_identifier(
-                        item.get("identifier") or item.get("mbid") or ""
-                    ),
-                }
+        for feed_url in feeds:
+            resp = self._get(feed_url)
+            items = resp.get("payload", {}).get("playlists", []) or []
+            for item in items:
+                title = (item.get("playlist") or {}).get("title") or item.get("title") or ""
+                matched_kind = self._match_weekly(title)
+                if not matched_kind or matched_kind in found:
+                    continue
+                mbid = self._mbid_from_identifier(
+                    item.get("identifier") or item.get("mbid") or ""
+                )
+                if mbid:
+                    found[matched_kind] = {
+                        "kind": matched_kind,
+                        "title": title,
+                        "mbid": mbid,
+                        "feed": "createdfor" if "createdfor" in feed_url else "own",
+                    }
 
-        out = [v for v in found.values() if v["mbid"]]
+        out = list(found.values())
         logger.info("Found %d weekly playlist(s): %s", len(out), [p["title"] for p in out])
         return out
 
