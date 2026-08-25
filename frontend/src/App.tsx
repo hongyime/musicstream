@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { 
   LayoutDashboard, 
@@ -89,6 +89,14 @@ function App() {
     },
   });
 
+  // §W3 T26: quarantine a poison track straight from the Failed table.
+  const blockTrackMut = useMutation({
+    mutationFn: (id: number) => musicstreamService.blockTrack(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['tracks'] });
+      queryClient.invalidateQueries({ queryKey: ['stats'] });
+    },
+  });
   // Audit #26: keep stale data on transient errors so the banner does
   // not flicker every refetch.  The banner is binary (authenticated or
   // not) — flashing it draws the operator's eye to a non-event.
@@ -105,6 +113,7 @@ function App() {
     { id: 'dashboard', label: 'Dashboard', icon: <LayoutDashboard size={18} /> },
     { id: 'pending', label: 'Pending Queue', icon: <Clock size={18} /> },
     { id: 'failed', label: 'Failed Tracks', icon: <AlertCircle size={18} /> },
+    { id: 'library', label: 'Library', icon: <Database size={18} /> },
     { id: 'database', label: 'Metrics', icon: <Activity size={18} /> },
     { id: 'settings', label: 'Settings', icon: <Settings size={18} /> },
   ];
@@ -162,6 +171,21 @@ function App() {
               </div>
             )}
 
+            {/* §W3 T26: degraded-token banner — the hourly probe self-heals,
+                this tells the operator why downloads may stall if it can't. */}
+            {(authStatus as any)?.token_degraded && (
+              <div className="col-span-12 mb-4">
+                <div className="bg-warning/10 border border-warning/20 rounded-lg p-4 flex items-start space-x-3">
+                  <AlertTriangle className="text-warning w-5 h-5 mt-0.5" />
+                  <div>
+                    <p className="text-sm font-bold text-primary">Spotify token degraded</p>
+                    <p className="text-xs text-secondary mt-1">
+                      Hourly probe will attempt a silent refresh. If downloads stall, reconnect from Settings.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
             <div className="grid grid-cols-12 gap-3 mb-6">
               <div className="col-span-12 md:col-span-3">
                 <MetricCard 
@@ -277,11 +301,19 @@ function App() {
                 { header: 'Status', accessor: (item) => <span className="capitalize">{item.status.replace('_', ' ')}</span> },
                 { header: 'Method', accessor: (item) => <span className="text-xs opacity-60">{item.method || '-'}</span> },
                 { header: 'Updated', accessor: (item) => item.updated_at ? new Date(item.updated_at).toLocaleString() : '-' },
+                { header: '', accessor: (item: any) => (
+                  item.blocked
+                    ? <span className="text-[10px] uppercase tracking-widest text-error font-bold">Blocked</span>
+                    : <Button variant="ghost" size="sm" onClick={() => blockTrackMut.mutate(item.id)} disabled={blockTrackMut.isPending}>Block</Button>
+                ) },
               ]}
               maxHeight="calc(100vh - 250px)"
             />
           </div>
         );
+
+      case 'library':
+        return <LibraryView />;
 
       case 'database':
         return (
@@ -414,3 +446,115 @@ function App() {
 }
 
 export default App;
+
+
+// ── §W3 T24/T25: Library browse/search ───────────────────────────────────────
+
+function LibraryView() {
+  const queryClient = useQueryClient();
+  const [q, setQ] = useState('');
+  const [debouncedQ, setDebouncedQ] = useState('');
+  const [fmt, setFmt] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
+  const [page, setPage] = useState(1);
+  const pageSize = 50;
+
+  // Debounce the search box so typing doesn't hammer the API.
+  useEffect(() => {
+    const t = setTimeout(() => { setDebouncedQ(q); setPage(1); }, 300);
+    return () => clearTimeout(t);
+  }, [q]);
+
+  const { data, isLoading } = useQuery({
+    queryKey: ['library', debouncedQ, fmt, statusFilter, page],
+    queryFn: () =>
+      musicstreamService.getLibrary({
+        q: debouncedQ || undefined,
+        format: fmt || undefined,
+        status: statusFilter || undefined,
+        page,
+        page_size: pageSize,
+      }),
+    placeholderData: (prev: any) => prev,
+  });
+
+  const unblockMut = useMutation({
+    mutationFn: (id: number) => musicstreamService.unblockTrack(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['library'] }),
+  });
+
+  const total = data?.total ?? 0;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Search title / artist / album…"
+          className="flex-1 min-w-[220px] bg-white/5 border border-border rounded-lg px-4 py-2 text-sm text-primary placeholder:text-muted focus:outline-none focus:border-success/40"
+        />
+        <select
+          value={fmt}
+          onChange={(e) => { setFmt(e.target.value); setPage(1); }}
+          className="bg-white/5 border border-border rounded-lg px-3 py-2 text-sm text-secondary"
+        >
+          <option value="">All formats</option>
+          <option value="mp3">MP3</option>
+          <option value="flac">FLAC</option>
+        </select>
+        <select
+          value={statusFilter}
+          onChange={(e) => { setStatusFilter(e.target.value); setPage(1); }}
+          className="bg-white/5 border border-border rounded-lg px-3 py-2 text-sm text-secondary"
+        >
+          <option value="">All statuses</option>
+          <option value="downloaded">Downloaded</option>
+          <option value="pending">Pending</option>
+          <option value="failed">Failed</option>
+        </select>
+      </div>
+
+      <DataTable<any>
+        data={data?.items ?? []}
+        isLoading={isLoading}
+        columns={[
+          { header: 'Title', accessor: 'title', className: 'text-primary font-medium' },
+          { header: 'Artist', accessor: 'artist' },
+          { header: 'Album', accessor: (r: any) => r.album ?? '-' },
+          {
+            header: 'Format', accessor: (r: any) =>
+              <span className="uppercase text-xs opacity-70">{r.format ?? '-'}</span>,
+          },
+          { header: 'Status', accessor: (r: any) =>
+            <StatusBadge label={r.status} status={r.status === 'downloaded' ? 'online' : r.status === 'failed' ? 'offline' : 'idle'} /> },
+          { header: '', accessor: (r: any) =>
+            r.blocked
+              ? (
+                <span className="flex items-center gap-2">
+                  <span className="text-[10px] uppercase tracking-widest text-error font-bold">Blocked</span>
+                  <Button variant="ghost" size="sm" onClick={() => unblockMut.mutate(r.id)} disabled={unblockMut.isPending}>Unblock</Button>
+                </span>
+              )
+              : null },
+        ]}
+        maxHeight="calc(100vh - 320px)"
+        emptyMessage={debouncedQ ? `No results for "${debouncedQ}"` : 'Library is empty.'}
+      />
+
+      <div className="flex items-center justify-between text-xs text-muted px-1">
+        <span>{total.toLocaleString()} track(s)</span>
+        <div className="flex items-center gap-2">
+          <Button variant="ghost" size="sm" onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1}>
+            Prev
+          </Button>
+          <span className="font-mono">{page} / {totalPages}</span>
+          <Button variant="ghost" size="sm" onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages}>
+            Next
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}

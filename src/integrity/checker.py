@@ -37,6 +37,7 @@ class IntegrityResult:
     ok: int = 0
     total_checked: int = 0
     no_method: int = 0
+    skipped: int = 0   # §W3 V7: blocked tracks seen but left untouched
 
 
 class IntegrityChecker:
@@ -89,6 +90,12 @@ class IntegrityChecker:
 
         for track in tracks:
             result.total_checked += 1
+
+            # §W3 T13/V7: blocked tracks are inert — never auto-requeued.
+            if track.blocked:
+                result.skipped += 1
+                continue
+
             file_path: str = track.file_path  # type: ignore[assignment]  # filtered above
 
             # ── 1. Existence check ─────────────────────────────────────────────
@@ -228,11 +235,23 @@ class IntegrityChecker:
             )
 
         logger.info(
-            "Integrity check complete: total=%d ok=%d missing=%d corrupt=%d no_method=%d",
+            "Integrity check complete: total=%d ok=%d missing=%d corrupt=%d no_method=%d skipped_blocked=%d",
             result.total_checked,
             result.ok,
             result.missing,
             result.corrupt,
             result.no_method,
+            result.skipped,
         )
+
+        # §W3 T17: immediate alert when corruption/missing files are found.
+        if result.missing or result.corrupt:
+            try:
+                from src.services.notify import notify_failure
+                notify_failure(
+                    "Library integrity problems detected",
+                    detail=f"missing={result.missing} corrupt={result.corrupt}",
+                )
+            except Exception as exc:
+                logger.debug("integrity webhook skipped: %s", exc)
         return result

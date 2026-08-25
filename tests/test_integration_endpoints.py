@@ -18,7 +18,20 @@ def daemon_process() -> Generator[subprocess.Popen, None, None]:
     env["DAEMON_API_TOKEN"] = TEST_TOKEN
     env["PORT"] = str(TEST_PORT)
     env["PYTHONPATH"] = str(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-    
+
+    # Load .env into the child env (same pattern as migrations/env.py). Without
+    # this the spawned daemon dies immediately with KeyError: DATABASE_URL on
+    # machines that don't export it globally.
+    if "DATABASE_URL" not in env:
+        from pathlib import Path
+        env_path = Path(__file__).resolve().parent.parent / ".env"
+        if env_path.exists():
+            for _line in env_path.read_text(encoding="utf-8").splitlines():
+                _line = _line.strip()
+                if _line and not _line.startswith("#") and "=" in _line:
+                    _k, _, _v = _line.partition("=")
+                    env.setdefault(_k.strip(), _v.strip())
+
     # Start the daemon
     process = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "src.daemon:app", "--port", str(TEST_PORT)],
@@ -39,7 +52,11 @@ def daemon_process() -> Generator[subprocess.Popen, None, None]:
     else:
         process.terminate()
         stdout, stderr = process.communicate()
-        raise RuntimeError(f"Daemon failed to start in time.\nSTDOUT:\n{stdout.decode()}\nSTDERR:\n{stderr.decode()}")
+        raise RuntimeError(
+            "Daemon failed to start in time.\nSTDOUT:\n{}\nSTDERR:\n{}".format(
+                stdout.decode(errors="replace"), stderr.decode(errors="replace")
+            )
+        )
         
     yield process
     

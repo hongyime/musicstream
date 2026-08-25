@@ -156,6 +156,8 @@ export const musicstreamService = {
       status: 'authenticated' | 'needs_auth' | 'missing_config';
       client_id: string | null;
       redirect_uri: string;
+      token_hours_left?: number | null;
+      token_degraded?: boolean;
     }>('/auth/status'),
 
   getArtworkReport: () => fetch('/api/artwork-report', {
@@ -170,4 +172,37 @@ export const musicstreamService = {
       ...(getDaemonToken() ? { 'Authorization': `Bearer ${getDaemonToken()}` } : {})
     }
   }).then(res => res.json()),
+
+  // ── §W3 T24/T25: Library search ──────────────────────────────────────
+  getLibrary: (params: {
+    q?: string; artist?: string; album?: string; format?: string;
+    status?: string; page?: number; page_size?: number;
+  }) => {
+    const usp = new URLSearchParams();
+    if (params.q) usp.set('q', params.q);
+    if (params.artist) usp.set('artist', params.artist);
+    if (params.album) usp.set('album', params.album);
+    if (params.format) usp.set('format', params.format);
+    if (params.status) usp.set('status', params.status);
+    usp.set('page', String(params.page ?? 1));
+    usp.set('page_size', String(params.page_size ?? 50));
+    return fetchApi<{
+      items: {
+        id: number; title: string; artist: string; album: string | null;
+        status: string; format: string | null; blocked: boolean;
+        duration_ms: number | null; file_path: string | null;
+      }[];
+      total: number; page: number; page_size: number;
+    }>(`/library?${usp.toString()}`);
+  },
+
+  // ── §W3 T13/T26: block / unblock ─────────────────────────────────────
+  blockTrack: (id: number) =>
+    fetchApi<{ id: number; blocked: boolean }>(`/tracks/${id}/block`, { method: 'POST' }),
+  unblockTrack: (id: number) =>
+    fetchApi<{ id: number; blocked: boolean }>(`/tracks/${id}/unblock`, { method: 'POST' }),
+
+  // ── §W3 T23: discover-weekly trigger ──────────────────────────────────
+  runDiscoverWeekly: () => fetchApi<any>('/discover-weekly', { method: 'POST' }),
 };
+

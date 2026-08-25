@@ -430,6 +430,13 @@ def _register_scheduler_jobs():
     scheduler.add_job(tasks.listenbrainz_discovery, "cron", hour=4, id="lb_discovery", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.full_integrity_check, "cron", day_of_week="wed,sun", hour=5, id="integrity_check", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.db_backup, "cron", day_of_week="sun", hour=5, id="db_backup", replace_existing=True, misfire_grace_time=GRACE)
+    # §W3 T18/V13: hourly token early-warning probe.
+    scheduler.add_job(tasks.probe_spotify_token, "interval", hours=1, id="token_probe", replace_existing=True, misfire_grace_time=GRACE)
+    # §W3 T20: weekly quality-upgrade requeue (before the 03:00 daily pipeline
+    # so requeued tracks download the same night).
+    scheduler.add_job(tasks.upgrade_pass_scheduled, "cron", day_of_week="sat", hour=2, id="upgrade_pass", replace_existing=True, misfire_grace_time=GRACE)
+    # §W3 T23: troi generates weekly playlists on Mondays.
+    scheduler.add_job(tasks.discover_weekly_task, "cron", day_of_week="mon", hour=6, id="discover_weekly", replace_existing=True, misfire_grace_time=GRACE)
 
 
 def _lb_discovery_overdue() -> bool:
@@ -765,6 +772,125 @@ async def reset_failed():
     except Exception as e:
         return ApiResponse(error=str(e))
 
+@app.post("/api/musicstream/tracks/{track_id}/block", dependencies=[Depends(require_auth)])
+async def block_track_endpoint(track_id: int):
+    """§W3 T13: quarantine a track (inert everywhere until unblocked)."""
+    from src.db import get_session
+    try:
+        with get_session() as session:
+            ok = tasks.block_track(session, track_id)
+            session.commit()
+            if not ok:
+                return ApiResponse(error=f"track {track_id} not found")
+            return ApiResponse(data={"id": track_id, "blocked": True})
+    except Exception as e:
+        return ApiResponse(error=str(e))
+
+@app.post("/api/musicstream/tracks/{track_id}/unblock", dependencies=[Depends(require_auth)])
+async def unblock_track_endpoint(track_id: int):
+    """§W3 T13: release a quarantined track back to PENDING."""
+    from src.db import get_session
+    try:
+        with get_session() as session:
+            ok = tasks.unblock_track(session, track_id)
+            session.commit()
+            if not ok:
+                return ApiResponse(error=f"track {track_id} not found")
+            return ApiResponse(data={"id": track_id, "blocked": False})
+    except Exception as e:
+        return ApiResponse(error=str(e))
+
+@app.post("/api/musicstream/upgrade-pass", dependencies=[Depends(require_auth)])
+async def upgrade_pass_endpoint():
+    """§W3 T20: requeue sub-cutoff MP3s so the next download pass upgrades them."""
+    from src.db import get_session
+    try:
+        with get_session() as session:
+            count = tasks.upgrade_pass(session)
+            session.commit()
+            return ApiResponse(data={"requeued": count})
+    except Exception as e:
+        return ApiResponse(error=str(e))
+
+@app.post("/api/musicstream/discover-weekly", dependencies=[Depends(require_auth)])
+async def discover_weekly_endpoint():
+    """§W3 T21–T23: fetch LB weekly playlists, resolve, queue missing, export m3u."""
+    from src.db import get_session
+    try:
+        from src.discovery.discover_weekly import DiscoverWeekly
+        engine = DiscoverWeekly()
+        with get_session() as session:
+            summary = engine.run(session)
+            session.commit()
+        return ApiResponse(data=summary)
+    except Exception as e:
+        logger.error("discover-weekly failed: %s", e, exc_info=True)
+        return ApiResponse(error=str(e))
+
+@app.get("/api/musicstream/library")
+async def library(
+    q: str | None = None,
+    artist: str | None = None,
+    album: str | None = None,
+    format: str | None = None,
+    status: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+):
+    """§W3 T24: read-only library search for the dashboard Library tab."""
+    from sqlalchemy import or_
+
+    from src.db import get_session
+    from src.models import Track
+    try:
+        page = max(page, 1)
+        page_size = min(max(page_size, 1), 200)
+        with get_session() as session:
+            query = session.query(Track)
+            if q:
+                like = f"%{q}%"
+                query = query.filter(
+                    or_(
+                        Track.title.ilike(like),
+                        Track.artist.ilike(like),
+                        Track.album.ilike(like),
+                    )
+                )
+            if artist:
+                query = query.filter(Track.artist.ilike(f"%{artist}%"))
+            if album:
+                query = query.filter(Track.album.ilike(f"%{album}%"))
+            if format:
+                query = query.filter(Track.format == format.lower())
+            if status:
+                query = query.filter(Track.status == status)
+            total = query.count()
+            rows = (
+                query.order_by(Track.artist.asc(), Track.album.asc(), Track.title.asc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+                .all()
+            )
+            items = [
+                {
+                    "id": t.id,
+                    "title": t.title,
+                    "artist": t.artist,
+                    "album": t.album,
+                    "status": t.status,
+                    "format": t.format,
+                    "blocked": bool(t.blocked),
+                    "duration_ms": t.duration_ms,
+                    "file_path": t.file_path,
+                }
+                for t in rows
+            ]
+            return ApiResponse(
+                data={"items": items, "total": total, "page": page, "page_size": page_size}
+            )
+    except Exception as e:
+        return ApiResponse(error=str(e))
+
 # ── Spotify Auth ──────────────────────────────────────────────────────────────
 
 _SCOPES = "playlist-read-private playlist-read-collaborative user-library-read user-follow-read user-read-recently-played"
@@ -862,12 +988,24 @@ async def spotify_callback(code: str = None, error: str = None):
 async def get_auth_status(request: Request):
     if not SPOTIFY_CLIENT_ID:
         return ApiResponse(data={"status": "missing_config", "client_id": None})
+    from src.core import config as _w3_cfg
+    from src.ingestion.spotify_auth import token_freshness
+
     auth_manager = _get_auth_manager()
     is_valid = auth_manager.validate_token(auth_manager.get_cached_token()) is not None
+    fresh = token_freshness()
+    hours_left = fresh.get("hours_left")
+    # degraded = needs human action: invalid token or EXPIRED cache entry.
+    # A low-but-positive hours_left is normal (access tokens live ~1h); the
+    # hourly probe + refresher handle rolling it forward automatically.
+    expired = hours_left is not None and hours_left < 0
+    degraded = (not is_valid) or expired
     return ApiResponse(data={
         "status": "authenticated" if is_valid else "needs_auth",
         "client_id": SPOTIFY_CLIENT_ID,
-        "redirect_uri": _REDIRECT_URI
+        "redirect_uri": _REDIRECT_URI,
+        "token_hours_left": hours_left,
+        "token_degraded": degraded,
     })
 
 # ── WebSockets ────────────────────────────────────────────────────────────────

@@ -252,7 +252,7 @@ class ListenBrainzDiscovery:
 
     # ── Internal: ingest a single recommendation ───────────────────────────────
 
-    def _ingest_recommendation(self, rec: dict, session: Session) -> bool:
+    def _ingest_recommendation(self, rec: dict, session: Session, kind: str = "cf") -> bool:
         """
         Insert a new LbRecommendation row and a corresponding Track row.
 
@@ -316,6 +316,7 @@ class ListenBrainzDiscovery:
             score=score,
             fetched_at=now,
             status="pending",
+            kind=kind,  # §W3 T22
         )
         session.add(lb_rec)
 

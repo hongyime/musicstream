@@ -361,7 +361,10 @@ class DownloadOrchestrator:
         # the server (see incident 2026-07-08).
         track_ids = list(
             session.execute(
-                select(Track.id).where(Track.status == TrackStatus.PENDING.value)
+                select(Track.id).where(
+                    Track.status == TrackStatus.PENDING.value,
+                    Track.blocked.is_(False),  # §W3 V7
+                )
             ).scalars()
         )
         session.commit()
@@ -480,7 +483,8 @@ class DownloadOrchestrator:
         pending = list(
             session.execute(
                 select(Track.id, Track.spotify_id, Track.title).where(
-                    Track.status == TrackStatus.PENDING.value
+                    Track.status == TrackStatus.PENDING.value,
+                    Track.blocked.is_(False),  # §W3 V7
                 )
             )
         )
@@ -606,7 +610,10 @@ class DownloadOrchestrator:
         # pending tracks OOM-killed the 128M Postgres container (2026-07-08).
         candidate_ids = list(
             session.execute(
-                select(Track.id).where(Track.status == TrackStatus.PENDING.value)
+                select(Track.id).where(
+                    Track.status == TrackStatus.PENDING.value,
+                    Track.blocked.is_(False),  # §W3 V7
+                )
             ).scalars()
         )
         session.commit()
@@ -678,6 +685,7 @@ class DownloadOrchestrator:
             .where(
                 Track.id == track.id,
                 Track.status == TrackStatus.PENDING.value,
+                Track.blocked.is_(False),  # §W3 V7: never claim a blocked row
             )
             .values(
                 status=TrackStatus.DOWNLOADING.value,
@@ -750,6 +758,18 @@ class DownloadOrchestrator:
                     # ── Move file into Plex library (fatal: no file = no point) ─
                     try:
                         final_path = self._organiser.organise(path, track, session)
+
+                        # §W3 T19/V10: downgrade to QUALITY_CUTOFF after the
+                        # lossless source is safely filed. Non-fatal on failure.
+                        try:
+                            from src.services.transcode import apply_quality_cutoff
+                            final_path, _ = apply_quality_cutoff(final_path, track, session)
+                        except Exception as tc_exc:
+                            logger.warning(
+                                "Quality-cutoff step failed for track %d (non-fatal): %s",
+                                track.id, tc_exc,
+                            )
+
                         _clear_download_claim(track)
                         session.flush()
                         logger.info(
@@ -800,10 +820,13 @@ class DownloadOrchestrator:
                     exc,
                 )
 
+        from src.core.tasks import auto_block_if_exhausted  # §W3 T14
+
         # All tiers exhausted
         if self._should_give_up(session, track.id):
             track.status = TrackStatus.FAILED.value
             _clear_download_claim(track)
+            auto_block_if_exhausted(session, track)  # §W3 T14/V7
             session.flush()
             errors_logger.error(
                 "[DOWNLOAD_FAIL] %s | %s | attempts=%d | last_error=all tiers exhausted",
@@ -818,9 +841,11 @@ class DownloadOrchestrator:
                 track.artist,
             )
         else:
-            # Leave as pending for the next run
+            # Leave as pending for the next run — unless it has now burned
+            # through enough distinct failed passes to be auto-blocked (§W3 T14).
             track.status = TrackStatus.PENDING.value
             _clear_download_claim(track)
+            auto_block_if_exhausted(session, track)
             session.flush()
             logger.info(
                 "Track id=%d '%s' — all tiers failed this run; will retry next run.",

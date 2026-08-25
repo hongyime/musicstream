@@ -30,7 +30,9 @@ from src.models import Base
 if "DATABASE_URL" not in os.environ:
     env_path = Path(__file__).resolve().parent.parent / ".env"
     if env_path.exists():
-        with open(env_path) as f:
+        # encoding="utf-8": Windows hosts default to cp1252 and .env may contain
+        # non-ASCII comments; decode failures here abort every alembic command.
+        with open(env_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:

@@ -63,7 +63,10 @@ class PlexPlaylistSync:
         plex_token: Optional[str] = None,
         library_section_id: Optional[str] = None,
     ) -> None:
-        self._plex_url          = (plex_url or os.environ.get("PLEX_URL", DEFAULT_PLEX_URL)).rstrip("/")
+        # §W3 T16/V8: Plex is an OPTIONAL push target. Unset PLEX_URL ⇒ disabled.
+        raw_plex_url = (plex_url or os.environ.get("PLEX_URL", "")).strip()
+        self.enabled = bool(raw_plex_url)
+        self._plex_url = (raw_plex_url or DEFAULT_PLEX_URL).rstrip("/")
         self._plex_token        = plex_token or os.environ.get("PLEX_TOKEN", "")
         self._section_id        = library_section_id or os.environ.get("PLEX_LIBRARY_SECTION_ID", "")
 
@@ -96,6 +99,12 @@ class PlexPlaylistSync:
             Month/year parameters maintained for backward compatibility but ignored
             in favor of weekly-based naming. Playlist now follows format: "Discovered: Y{year} W{week}"
         """
+        if not getattr(self, "enabled", True):
+            logger.info(
+                "PLEX_URL not configured — skipping Plex push "
+                "(portability handled by m3u export; §W3 T16/V8)"
+            )
+            return
         from datetime import datetime as dt
         # ListenBrainz runs daily, so weekly playlists make sense
         week_num = dt.now().isocalendar()[1]  # ISO week number (1-53)

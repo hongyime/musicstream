@@ -370,6 +370,26 @@ def cmd_validate(_args: argparse.Namespace) -> None:
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
+
+def cmd_export_playlists(_args: argparse.Namespace) -> None:
+    """SPEC.md §W3 T15: one-time backfill exporting every source playlist
+    (incl. existing Spotify playlists) as .m3u into PLAYLISTS_EXPORT_DIR."""
+    from src.db import get_session, init_db
+    from src.discovery.m3u_export import backfill_all_playlists
+
+    init_db()
+
+    with get_session() as session:
+        exported = backfill_all_playlists(session)
+        session.commit()
+
+    if not exported:
+        print("No playlists exported (PLAYLISTS_EXPORT_DIR unset or no downloaded tracks).")
+        return
+
+    print(f"Exported {len(exported)} playlist file(s):")
+    for p in exported:
+        print(f"  {p}")
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="musicstream",
@@ -396,6 +416,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Start the long-running daemon (APScheduler + Flask control plane on :9079)",
     )
     sub.add_parser("validate", help="Run project lint and type checks")
+    sub.add_parser(
+        "export-playlists",
+        help="§W3 T15: backfill-export all source playlists as .m3u files",
+    )
 
     return parser
 
@@ -404,6 +428,12 @@ def main() -> None:
     _configure_logging()
     load_dotenv()
 
+    # Windows consoles default to cp1252 and crash printing CJK playlist
+    # names; force UTF-8 with replacement so CLI output never explodes.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     parser = build_parser()
     args = parser.parse_args()
 
@@ -418,9 +448,11 @@ def main() -> None:
         "integrity": cmd_integrity,
         "daemon":    cmd_daemon,
         "validate":  cmd_validate,
+        "export-playlists": cmd_export_playlists,
     }
     commands[args.command](args)
 
 
 if __name__ == "__main__":
     main()
+

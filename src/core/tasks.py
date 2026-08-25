@@ -244,6 +244,7 @@ def reset_failed_tracks(session) -> int:
     return (
         session.query(Track)
         .filter(Track.status.in_(["failed", "failed_validation", "timed_out"]))
+        .filter(Track.blocked.is_(False))  # §W3 V7: blocked tracks are inert
         .update(
             {
                 "status": TrackStatus.PENDING.value,
@@ -257,6 +258,91 @@ def reset_failed_tracks(session) -> int:
             synchronize_session=False,
         )
     )
+
+
+def block_track(session, track_id: int, reason: str | None = None) -> bool:
+    """Manually quarantine a track (§W3 T13/V7). Idempotent."""
+    from src.models import Track
+    track = session.get(Track, track_id)
+    if track is None:
+        return False
+    track.blocked = True
+    track.blocked_reason = reason or "manual"
+    track.blocked_at = datetime.now(timezone.utc)
+    session.flush()
+    return True
+
+
+def unblock_track(session, track_id: int) -> bool:
+    """Release a quarantined track back into the pipeline (§W3 T13/V7).
+
+    Gives the track a fresh start: status -> PENDING and download accounting
+    cleared, mirroring reset_failed_tracks semantics for a single row.
+    """
+    from src.models import Track, TrackStatus
+    track = session.get(Track, track_id)
+    if track is None:
+        return False
+    track.blocked = False
+    track.blocked_reason = None
+    track.blocked_at = None
+    track.status = TrackStatus.PENDING.value
+    track.attempt_count = 0
+    track.last_attempt_at = None
+    track.claimed_at = None
+    track.heartbeat_at = None
+    track.claim_owner = None
+    track.daemon_run_id = None
+    session.flush()
+    return True
+
+
+def auto_block_if_exhausted(session, track) -> bool:
+    """Quarantine a track once it has failed on >= AUTO_BLOCK_THRESHOLD distinct
+    days (§W3 T14/V7). Distinct-day counting approximates 'consecutive full-chain
+    passes' without new schema: multiple tier failures within one day collapse to
+    one pass. Only non-downloaded tracks are eligible. Returns True if blocked now.
+    """
+    from sqlalchemy import func
+    from sqlalchemy import func
+    from src.core import config
+    from src.models import DownloadAttempt, TrackStatus
+
+    if track.blocked or track.status == TrackStatus.DOWNLOADED.value:
+        return False
+
+    threshold = config.AUTO_BLOCK_THRESHOLD
+    rows = (
+        session.query(func.date(DownloadAttempt.attempted_at))
+        .filter(
+            DownloadAttempt.track_id == track.id,
+            DownloadAttempt.success.is_(False),
+        )
+        .distinct()
+        .all()
+    )
+    # func.date() is ISO 'YYYY-MM-DD' on both SQLite and PostgreSQL.
+    pass_days = len({row[0] for row in rows})
+    if pass_days < threshold:
+        return False
+
+    track.blocked = True
+    track.blocked_reason = f"auto: {pass_days} consecutive failed passes"
+    track.blocked_at = datetime.now(timezone.utc)
+    session.flush()
+    logger.warning(
+        "[AUTO_BLOCK] track id=%d '%s' by '%s' — %d distinct failed-pass days >= threshold %d",
+        track.id, track.title, track.artist, pass_days, threshold,
+    )
+    try:
+        from src.services.notify import notify_failure
+        notify_failure(
+            f"Track auto-blocked after {pass_days} failed passes",
+            detail=f"{track.title} — {track.artist} (id={track.id})",
+        )
+    except Exception as exc:
+        logger.debug("auto-block webhook skipped: %s", exc)
+    return True
 
 
 def _log_burn_rate() -> None:
@@ -370,12 +456,19 @@ def listenbrainz_discovery() -> None:
             except Exception as exc:
                 logger.warning("LB artist-discography expansion failed (non-fatal): %s", exc)
 
-        # Sync Plex playlist for current month
+        # §W3 T15/V8: export portable .m3u FIRST, then optional Plex push (T16).
         now = datetime.now(timezone.utc)
         month_name = now.strftime("%B")
         year = now.year
-        plex_sync = PlexPlaylistSync()
         with get_session() as session:
+            try:
+                from src.discovery.m3u_export import export_weekly_discovery
+                out_path = export_weekly_discovery(session)
+                if out_path:
+                    logger.info("Weekly discovery m3u exported: %s", out_path)
+            except Exception as exc:
+                logger.warning("m3u weekly export failed (non-fatal, V8): %s", exc)
+            plex_sync = PlexPlaylistSync()
             plex_sync.sync_discovery_playlist(session, month=month_name, year=year)
     except Exception as exc:
         logger.error("ListenBrainz discovery failed: %s", exc, exc_info=True)
@@ -515,6 +608,208 @@ def full_download_pipeline() -> None:
 def full_integrity_check() -> None:
     integrity_check()
 
+
+# ── Upgrade pass (§W3 T20/V11) ────────────────────────────────────────────
+
+_PREMIUM_METHOD_PREFIXES = ("spotiflac_", "librespot")
+
+
+def upgrade_pass(session) -> int:
+    """Requeue downloaded MP3s that came from lossy tiers so the next download
+    pass can try to upgrade them to cutoff quality (§W3 T20/V11).
+
+    Single bulk UPDATE — must stay fast at 100k+ row scale. Premium sources
+    (SpotiFLAC/librespot) are already at/above cutoff. Noop when
+    QUALITY_CUTOFF=flac. Caller owns the transaction.
+    """
+    from sqlalchemy import and_, or_, select
+
+    from src.core import config
+
+    from src.models import Track, TrackStatus
+
+    if config.QUALITY_CUTOFF != "mp3_320":
+        return 0
+
+    # Trickle, don't stampede: cap requeues per run (§W3 T20).
+    limit = int(getattr(config, "UPGRADE_PASS_LIMIT", 500))
+
+    not_premium = or_(
+        Track.download_method.is_(None),
+        Track.download_method == "",
+        and_(
+            ~Track.download_method.startswith("spotiflac_"),
+            ~Track.download_method.startswith("librespot"),
+        ),
+    )
+    ids = (
+        session.query(Track.id)
+        .filter(
+            Track.status == TrackStatus.DOWNLOADED.value,
+            Track.format == "mp3",
+            Track.blocked.is_(False),
+            not_premium,
+        )
+        .limit(limit)
+        .subquery()
+    )
+    count = (
+        session.query(Track)
+        .filter(Track.id.in_(select(ids)))
+        .update(
+            {
+                "status": TrackStatus.PENDING.value,
+                "attempt_count": 0,
+                "last_attempt_at": None,
+                "claimed_at": None,
+                "heartbeat_at": None,
+                "claim_owner": None,
+                "daemon_run_id": None,
+            },
+            synchronize_session=False,
+        )
+    )
+    if count:
+        logger.info("[UPGRADE_PASS] requeued %d sub-cutoff track(s)", count)
+    return count
+
+def upgrade_pass_scheduled() -> None:
+    """§W3 T20 cron wrapper: requeue + let the nightly pipeline do the work."""
+    try:
+        from src.db import get_session
+        with get_session() as session:
+            count = upgrade_pass(session)
+            session.commit()
+        logger.info("Scheduled upgrade pass: %d track(s) requeued", count)
+    except Exception as exc:
+        logger.error("Scheduled upgrade pass failed: %s", exc, exc_info=True)
+
+
+def discover_weekly_task() -> None:
+    """§W3 T21–T23 cron wrapper: fetch → resolve → queue → export m3u."""
+    try:
+        from src.db import get_session
+        from src.discovery.discover_weekly import DiscoverWeekly
+        engine = DiscoverWeekly()
+        with get_session() as session:
+            summary = engine.run(session)
+            session.commit()
+        for pl in summary.get("playlists", []):
+            logger.info(
+                "[DISCOVER_WEEKLY] %s — entries=%d resolved=%d queued=%d",
+                pl["name"], pl["entries"], pl["resolved_local"], pl["queued_missing"],
+            )
+    except Exception as exc:
+        logger.error("Discover-weekly task failed: %s", exc, exc_info=True)
+
+
+def probe_spotify_token() -> None:
+    """§W3 T18/V13 hourly early-warning: refresh-or-alert on near-expiry.
+
+    Scheduled hourly in the daemon; also safe to call manually.
+    """
+    try:
+        from src.ingestion.spotify_auth import probe_token
+        result = probe_token(refresher=_default_token_refresher)
+        if result.get("degraded"):
+            from src.services.notify import notify_failure
+            notify_failure(
+                "Spotify token needs attention",
+                detail=(
+                    f"present={result.get('present')} "
+                    f"hours_left={result.get('hours_left')} "
+                    f"refreshed={result.get('refreshed')}"
+                ),
+            )
+            logger.warning("[TOKEN_WARN] degraded token state: %s", result)
+        else:
+            logger.debug("Token probe healthy: %s", result)
+    except Exception as exc:
+        logger.warning("Spotify token probe failed: %s", exc)
+
+
+def _default_token_refresher() -> bool:
+    """Silent Spotify token refresh via the token endpoint.
+
+    The cached token may originate from EITHER a PKCE (public) or an
+    authorization-code (confidential) app: Spotify rejects a secretless
+    refresh for confidential clients with invalid_request/400. Send
+    client_secret whenever one is configured. Rewrites the cache
+    atomically and honors Spotify's optional refresh-token rotation.
+    """
+    import json
+    import os
+    import tempfile
+    import time
+
+    import requests
+
+    client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "").strip()
+
+    client_id = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
+    if not client_id:
+        return False
+    cache_path = os.environ.get("SPOTIFY_TOKEN_CACHE", "./spotify_token.json")
+    if cache_path == "/app/spotify_token.json":
+        cache_path = "./spotify_token.json"
+
+    try:
+        with open(cache_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+    refresh_token = data.get("refresh_token")
+    if not refresh_token:
+        return False
+
+    try:
+        payload = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+        }
+        if client_secret:  # confidential-client tokens REQUIRE the secret on refresh
+            payload["client_secret"] = client_secret
+        resp = requests.post(
+            "https://accounts.spotify.com/api/token",
+            data=payload,
+            timeout=15,
+        )
+    except requests.RequestException:
+        return False
+    if resp.status_code != 200:
+        logger.warning("Spotify token refresh HTTP %d", resp.status_code)
+        return False
+
+    tok = resp.json()
+    data["access_token"] = tok.get("access_token")
+    data["expires_at"] = int(time.time()) + int(tok.get("expires_in", 3600))
+    if tok.get("scope"):
+        data["scope"] = tok["scope"]
+    if tok.get("refresh_token"):  # rotation - always keep the newest
+        data["refresh_token"] = tok["refresh_token"]
+
+    # Write to tmp first, then COPY IN PLACE. os.replace/atomic-rename would
+    # swap the inode, which silently desynchronises single-file Docker bind
+    # mounts (container keeps reading the stale pre-rename file). copyfile
+    # truncates+writes the SAME inode, so host and container stay in lockstep
+    # and concurrent readers never see a half-file (worst case: one partial
+    # read between truncate and flush — same risk profile as spotipy's own
+    # CacheFileHandler, which writes in-place too).
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(cache_path) or ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        import shutil
+        shutil.copyfile(tmp_path, cache_path)
+    except OSError:
+        return False
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    return True
 # ── Run Recording ─────────────────────────────────────────────────────────────
 
 def _record_run_start(run_type: str) -> Optional[int]:
@@ -582,5 +877,20 @@ def _record_run_complete(run_id: Optional[int] = None, downloaded: int = 0, fail
                 if notes:
                     run.notes = notes
                 session.commit()
+
+                # §W3 T17/V12: run summary webhook (NOTIFY_ON=all only).
+                try:
+                    from src.services.notify import notify_run_summary
+                    notify_run_summary(
+                        run_type=run.run_type,
+                        downloaded=downloaded, failed=failed,
+                        scraped=scraped, requeued=requeued, notes=notes,
+                    )
+                except Exception as exc:
+                    logger.debug("run-summary webhook skipped: %s", exc)
     except Exception as exc:
         logger.warning("Could not record run completion: %s", exc)
+
+
+
+

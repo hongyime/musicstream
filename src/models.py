@@ -140,6 +140,11 @@ class Track(Base):
     # Plex
     plex_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
+    # Wave 3 blocklist (SPEC §W3 T12, invariant V7): blocked tracks are inert —
+    # skipped by downloader, reset-failed, integrity auto-requeue and discovery ingest.
+    blocked:        Mapped[bool]                = mapped_column(Boolean, nullable=False, default=False)
+    blocked_reason: Mapped[Optional[str]]       = mapped_column(String, nullable=True)
+    blocked_at:     Mapped[Optional[datetime]]  = mapped_column(DateTime(timezone=True), nullable=True)
     # Timestamps (timezone-aware)
     created_at:      Mapped[datetime]           = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
     updated_at:      Mapped[datetime]           = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow)
@@ -208,6 +213,8 @@ class LbRecommendation(Base):
     # Stored as plain String; expected values: pending | ingested | failed | skipped
     status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
 
+    # §W3 T22: origin of this recommendation — 'cf' | 'weekly_jams' | 'weekly_exploration'
+    kind: Mapped[str] = mapped_column(String, nullable=False, default="cf")
     def __repr__(self) -> str:
         return (
             f"<LbRecommendation(id={self.id}, recording_mbid={self.recording_mbid!r}, "

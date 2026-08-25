@@ -83,5 +83,68 @@ def main() -> None:
     print("    production machine's musicstream folder, then run startup.bat")
 
 
+# ── Wave 3 token freshness probe (§W3 T18/V13) ──────────────────────────────
+
+def token_freshness(cache_path: str | None = None) -> dict:
+    """Read the cached Spotify token and report how stale it is.
+
+    Returns {'present': bool, 'hours_left': float|None}. Never raises —
+    a missing/corrupt cache simply reports present=False.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    path = cache_path or os.environ.get("SPOTIFY_TOKEN_CACHE", "./spotify_token.json")
+    if path == "/app/spotify_token.json":
+        path = "./spotify_token.json"
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        expires_at = float(data.get("expires_at", 0))
+    except Exception:
+        return {"present": False, "hours_left": None}
+
+    hours_left = (expires_at - datetime.now(timezone.utc).timestamp()) / 3600.0
+    return {"present": True, "hours_left": round(hours_left, 2)}
+
+
+def probe_token(cache_path: str | None = None, refresher=None, max_age_hours=None) -> dict:
+    """Early-warning probe (§W3 T18/V13).
+
+    Semantics note: Spotify ACCESS tokens live ~1h by design, so comparing
+    hours_left against TOKEN_WARN_HOURS would flag a healthy setup forever.
+    The real health signal is whether a silent REFRESH succeeds:
+
+      degraded = cache unreadable/missing, OR the token sat inside the warn
+                 window and the refresh attempt FAILED.
+
+    A successful self-healing refresh is healthy (degraded=False) even
+    though the new access token again has only ~1h to live. With no
+    refresher supplied (display-only callers), degraded simply means the
+    cache is missing/unreadable — staleness alone is normal.
+    """
+    from src.core import config as _config
+
+    warn_hours = max_age_hours if max_age_hours is not None else _config.TOKEN_WARN_HOURS
+    info = token_freshness(cache_path=cache_path)
+
+    stale = (not info["present"]) or (info["hours_left"] < warn_hours)
+    refreshed = False
+    if stale and refresher is not None:
+        try:
+            refreshed = bool(refresher())
+        except Exception:
+            refreshed = False
+        if refreshed:
+            info = token_freshness(cache_path=cache_path)
+
+    if refresher is None:
+        # Display-only: only a missing/unreadable cache needs human action.
+        degraded = not info["present"]
+    else:
+        degraded = (not info["present"]) or (stale and not refreshed)
+
+    return {**info, "degraded": degraded, "refreshed": refreshed}
+
 if __name__ == "__main__":
     main()
