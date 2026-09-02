@@ -208,6 +208,19 @@ function Convert-ToPort {
     return $null
 }
 
+function Test-TruthyFlag {
+    param([string]$Value)
+
+    return $Value -match "^(1|true|yes|on)$"
+}
+
+function Test-PlexHostPortAutoFallbackEnabled {
+    if (Test-TruthyFlag -Value $env:PLEX_HOST_PORT_AUTO_FALLBACK) {
+        return $true
+    }
+    return Test-TruthyFlag -Value (Get-EnvFileValue -Name "PLEX_HOST_PORT_AUTO_FALLBACK" -Default "false")
+}
+
 function Get-PreferredPlexPort {
     $fromProcess = Convert-ToPort $env:PLEX_HOST_PORT
     if ($null -ne $fromProcess) {
@@ -237,10 +250,10 @@ function Get-CurrentPlexPublishedPort {
     return $null
 }
 
-function Get-PortOwners {
+function Get-PortOwnerDetails {
     param([int]$Port)
 
-    $connections = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue
+    $connections = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
     if ($null -eq $connections) {
         return @()
     }
@@ -248,36 +261,85 @@ function Get-PortOwners {
     $owners = @()
     foreach ($connection in $connections) {
         $processName = ""
+        $processPath = ""
         $process = Get-Process -Id $connection.OwningProcess -ErrorAction SilentlyContinue
         if ($null -ne $process) {
             $processName = $process.ProcessName
+            try {
+                $processPath = [string]$process.Path
+            } catch {
+                $processPath = ""
+            }
         }
-        $owners += ("{0}/{1}/{2}" -f $connection.OwningProcess, $processName, $connection.State)
+        $owners += [pscustomobject]@{
+            port = $Port
+            pid = [int]$connection.OwningProcess
+            process_name = $processName
+            path = $processPath
+            state = [string]$connection.State
+        }
     }
-    return $owners | Sort-Object -Unique
+    return $owners | Sort-Object -Property pid, process_name -Unique
 }
 
-function Test-PortAvailableForPlex {
+function Format-PortOwnerDetails {
+    param($Owners)
+
+    $items = @()
+    foreach ($owner in @($Owners)) {
+        $items += ("{0}/{1}/{2}" -f $owner.pid, $owner.process_name, $owner.state)
+    }
+    return ($items -join ", ")
+}
+
+function Test-PlexHostPortPreflight {
     param([int]$Port)
 
     $currentPlexPort = Get-CurrentPlexPublishedPort
+    $owners = @(Get-PortOwnerDetails -Port $Port)
     if ($null -ne $currentPlexPort -and $currentPlexPort -eq $Port) {
-        return $true
+        return [pscustomobject]@{
+            port = $Port
+            usable = $true
+            reason = "current-musicstream-plex"
+            owners = $owners
+            message = "Port $Port is already published by musicstream-plex."
+        }
     }
 
-    $owners = @(Get-PortOwners -Port $Port)
     if ($owners.Count -eq 0) {
-        return $true
+        return [pscustomobject]@{
+            port = $Port
+            usable = $true
+            reason = "free"
+            owners = @()
+            message = "Port $Port is free."
+        }
     }
 
-    Write-Log "warn" ("Port {0} is already held by {1}; skipping it for Plex." -f $Port, ($owners -join ", "))
-    return $false
+    $names = @($owners | ForEach-Object { ([string]$_.process_name).ToLowerInvariant() })
+    $reason = "other-process"
+    if ($names | Where-Object { $_ -in @("com.docker.backend", "wslrelay") }) {
+        $reason = "docker-backend-ghost"
+    } elseif ($names | Where-Object { $_ -match "plex" }) {
+        $reason = "host-plex"
+    }
+
+    $ownerText = Format-PortOwnerDetails -Owners $owners
+    return [pscustomobject]@{
+        port = $Port
+        usable = $false
+        reason = $reason
+        owners = $owners
+        message = "Port $Port is blocked by $reason owners: $ownerText"
+    }
 }
 
 function Select-PlexHostPort {
     param([int[]]$Exclude = @())
 
     $preferred = Get-PreferredPlexPort
+    $autoFallback = Test-PlexHostPortAutoFallbackEnabled
     $candidates = New-Object System.Collections.Generic.List[int]
     [void]$candidates.Add($preferred)
     foreach ($port in 32401..32410) {
@@ -287,10 +349,22 @@ function Select-PlexHostPort {
 
     foreach ($port in ($candidates | Select-Object -Unique)) {
         if ($Exclude -contains $port) {
+            if ($port -eq $preferred -and -not $autoFallback) {
+                throw "Plex host port $port failed a compose bind and automatic fallback is disabled. Set PLEX_HOST_PORT manually or set PLEX_HOST_PORT_AUTO_FALLBACK=true."
+            }
             continue
         }
-        if (Test-PortAvailableForPlex -Port $port) {
+        $decision = Test-PlexHostPortPreflight -Port $port
+        if ($decision.usable) {
+            if ($port -ne $preferred) {
+                Write-Log "warn" ("Using fallback Plex host port {0}; preferred port {1} was unavailable." -f $port, $preferred)
+            }
             return $port
+        }
+
+        Write-Log "warn" $decision.message
+        if ($port -eq $preferred -and -not $autoFallback) {
+            throw ("Plex host port {0} is unavailable ({1}) and automatic fallback is disabled. Set PLEX_HOST_PORT manually or set PLEX_HOST_PORT_AUTO_FALLBACK=true." -f $port, $decision.reason)
         }
     }
 
@@ -303,8 +377,12 @@ function Ensure-PlexHostPort {
     $port = Select-PlexHostPort -Exclude $Exclude
     $currentValue = Get-EnvFileValue -Name "PLEX_HOST_PORT" -Default ""
     if ($currentValue -ne "$port") {
-        Set-EnvFileValue -Name "PLEX_HOST_PORT" -Value "$port"
-        Write-Log "info" "Persisted PLEX_HOST_PORT=$port in .env."
+        if (Test-PlexHostPortAutoFallbackEnabled) {
+            Set-EnvFileValue -Name "PLEX_HOST_PORT" -Value "$port"
+            Write-Log "info" "Persisted PLEX_HOST_PORT=$port in .env."
+        } else {
+            Write-Log "info" "Using PLEX_HOST_PORT=$port for this run without rewriting .env."
+        }
     }
     $env:PLEX_HOST_PORT = "$port"
     return $port
@@ -324,6 +402,9 @@ function Start-ComposeStack {
         $bindFailure = $result.Output -match "ports are not available|Only one usage|bind|port is already allocated"
         if ($bindFailure) {
             Write-Log "warn" ("Compose bind failed on Plex host port {0}: {1}" -f $port, ($result.Output -replace "\s+", " ").Trim())
+            if (-not (Test-PlexHostPortAutoFallbackEnabled)) {
+                throw "Compose bind failed on Plex host port $port and automatic fallback is disabled. Set PLEX_HOST_PORT manually or set PLEX_HOST_PORT_AUTO_FALLBACK=true."
+            }
             $excluded += $port
             continue
         }

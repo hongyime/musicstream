@@ -10,10 +10,11 @@ import logging.handlers
 import os
 import secrets as _secrets
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends, Header
 from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
@@ -183,6 +184,7 @@ async def _log_handler_watchdog() -> None:
 scheduler = BackgroundScheduler(timezone=TIMEZONE)
 _start_time = time.time()
 _background_tasks: set = set()  # Strong refs to fire-and-forget tasks; asyncio only holds weakrefs and will GC unsupervised tasks mid-flight.
+_manual_jobs: dict[str, dict[str, Any]] = {}
 
 # ── Credential permission audit ───────────────────────────────────────────────
 
@@ -308,6 +310,10 @@ async def _background_startup():
         _background_tasks.add(_hb_task)
         _hb_task.add_done_callback(_background_tasks.discard)
 
+        _snapshot_task = asyncio.create_task(_health_snapshot_loop())
+        _background_tasks.add(_snapshot_task)
+        _snapshot_task.add_done_callback(_background_tasks.discard)
+
         logger.info("Scheduler running; startup maintenance continues in background.")
 
         # Wait for internet before doing anything that might require it (sync, backfill, discovery).
@@ -409,6 +415,236 @@ def require_auth(authorization: Optional[str] = Header(default=None)) -> None:
     if not _secrets.compare_digest(presented, DAEMON_API_TOKEN):
         raise HTTPException(status_code=403, detail="Invalid token")
 
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
+def _manual_job_limit() -> int:
+    try:
+        return max(10, int(os.environ.get("MANUAL_JOB_HISTORY_LIMIT", "50")))
+    except ValueError:
+        return 50
+
+
+def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _job_view(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "job_id": record["job_id"],
+        "kind": record["kind"],
+        "status": record["status"],
+        "queued_at": record["queued_at"],
+        "started_at": record.get("started_at"),
+        "completed_at": record.get("completed_at"),
+        "error": record.get("error"),
+        "result": record.get("result"),
+    }
+
+
+def _prune_manual_jobs() -> None:
+    limit = _manual_job_limit()
+    if len(_manual_jobs) <= limit:
+        return
+    ordered = sorted(_manual_jobs.values(), key=lambda r: r.get("queued_at") or "")
+    for record in ordered[: max(0, len(ordered) - limit)]:
+        task = record.get("task")
+        if task is not None and not task.done():
+            continue
+        _manual_jobs.pop(record["job_id"], None)
+
+
+def _start_background_job(kind: str, func: Callable[..., Any], *args: Any, **kwargs: Any) -> dict[str, Any]:
+    job_id = f"{kind}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    record: dict[str, Any] = {
+        "job_id": job_id,
+        "kind": kind,
+        "status": "queued",
+        "queued_at": _utc_iso(),
+        "started_at": None,
+        "completed_at": None,
+        "error": None,
+        "result": None,
+    }
+    _manual_jobs[job_id] = record
+
+    async def _runner() -> None:
+        record["status"] = "running"
+        record["started_at"] = _utc_iso()
+        try:
+            result = await asyncio.to_thread(func, *args, **kwargs)
+            record["result"] = _json_safe(result)
+            record["status"] = "completed"
+        except Exception as exc:
+            logger.error("Background job %s failed: %s", job_id, exc, exc_info=True)
+            record["error"] = f"{type(exc).__name__}: {exc}"[:500]
+            record["status"] = "failed"
+        finally:
+            record["completed_at"] = _utc_iso()
+            _prune_manual_jobs()
+
+    task = asyncio.create_task(_runner(), name=f"musicstream:{kind}")
+    record["task"] = task
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    _prune_manual_jobs()
+    return _job_view(record)
+
+
+def _health_snapshot_paths() -> tuple[Path, Path]:
+    base = Path(os.environ.get("HEALTH_SNAPSHOT_PATH", str(LOG_DIR / "health_snapshots.jsonl")))
+    latest = Path(os.environ.get("HEALTH_LATEST_PATH", str(LOG_DIR / "health_latest.json")))
+    return base, latest
+
+
+def _write_health_snapshot(payload: dict[str, Any]) -> None:
+    snapshot_path, latest_path = _health_snapshot_paths()
+    max_bytes = _int_env("HEALTH_SNAPSHOT_MAX_BYTES", 1024 * 1024, minimum=1024)
+    snapshot = {
+        **payload,
+        "snapshot_at": _utc_iso(),
+        "manual_jobs": {
+            "total": len(_manual_jobs),
+            "active": sum(1 for job in _manual_jobs.values() if job.get("status") in ("queued", "running")),
+        },
+    }
+
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    latest_path.parent.mkdir(parents=True, exist_ok=True)
+    if snapshot_path.exists() and snapshot_path.stat().st_size > max_bytes:
+        rotated = snapshot_path.with_suffix(snapshot_path.suffix + ".1")
+        try:
+            if rotated.exists():
+                rotated.unlink()
+            snapshot_path.replace(rotated)
+        except OSError as exc:
+            logger.warning("Could not rotate health snapshot timeline: %s", exc)
+
+    line = json.dumps(snapshot, sort_keys=True, default=str)
+    with snapshot_path.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    latest_path.write_text(line + "\n", encoding="utf-8")
+
+
+def _read_health_snapshots(limit: int = 50) -> list[dict[str, Any]]:
+    from collections import deque
+
+    snapshot_path, _ = _health_snapshot_paths()
+    if not snapshot_path.exists():
+        return []
+    rows = deque(maxlen=max(1, min(limit, 500)))
+    with snapshot_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(line)
+    snapshots = []
+    for line in rows:
+        try:
+            snapshots.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return snapshots
+
+
+def _build_deep_health_payload() -> dict[str, Any]:
+    import sqlalchemy as _sa
+    from src.db import get_session
+    from src.models import DaemonRun
+
+    reasons = []
+    db_ok = False
+    try:
+        with get_session() as s:
+            s.execute(_sa.text("SELECT 1"))
+            db_ok = True
+    except Exception as exc:
+        reasons.append("db-unreachable")
+        logger.debug("Deep health DB probe failed: %s", exc)
+
+    sched_ok = bool(scheduler.running)
+    if not sched_ok:
+        reasons.append("scheduler-not-running")
+
+    last_started = None
+    if db_ok:
+        try:
+            with get_session() as s:
+                last_started = s.query(_sa.func.max(DaemonRun.started_at)).scalar()
+        except Exception as exc:
+            logger.debug("Deep health daemon-run probe failed: %s", exc)
+
+    max_age = _int_env("DEEP_HEALTH_MAX_RUN_AGE_S", 26 * 3600, minimum=60)
+    run_age_s = None
+    run_fresh = False
+    if last_started is not None:
+        last_started = _as_utc(last_started)
+        run_age_s = (datetime.now(timezone.utc) - last_started).total_seconds()
+        run_fresh = run_age_s <= max_age
+    if db_ok and not run_fresh:
+        reasons.append("last-run-stale")
+
+    download_liveness = None
+    if db_ok:
+        try:
+            download_liveness = tasks.get_download_liveness(
+                daemon_uptime_seconds=time.time() - _start_time
+            )
+            if download_liveness.get("stale_downloading", 0) > 0:
+                reasons.append("stale-downloading")
+            if not download_liveness.get("progress_fresh", True):
+                reasons.append("download-progress-stale")
+        except Exception as exc:
+            download_liveness = {"error": str(exc)[:500], "progress_fresh": False}
+            reasons.append("download-liveness-error")
+
+    spotify_token = None
+    try:
+        from src.ingestion.spotify_auth import token_freshness
+        fresh = token_freshness()
+        hours_left = fresh.get("hours_left")
+        spotify_token = {
+            "present": bool(fresh.get("present")),
+            "hours_left": hours_left,
+            "expired": bool(hours_left is not None and hours_left < 0),
+        }
+    except Exception as exc:
+        spotify_token = {"present": False, "hours_left": None, "expired": True, "error": str(exc)[:500]}
+
+    degraded = bool(reasons)
+    return {
+        "status": "degraded" if degraded else "ok",
+        "db": db_ok,
+        "scheduler_running": sched_ok,
+        "last_run_started_at": last_started.isoformat() if last_started else None,
+        "last_run_age_seconds": int(run_age_s) if run_age_s is not None else None,
+        "last_run_fresh": run_fresh,
+        "download_liveness": download_liveness,
+        "spotify_token": spotify_token,
+        "reasons": reasons,
+    }
+
 # ── Background Tasks ──────────────────────────────────────────────────────────
 
 async def _broadcast_health():
@@ -437,6 +673,21 @@ async def _broadcast_health():
             logger.error("Health broadcast error: %s", e)
         await asyncio.sleep(5)
 
+
+async def _health_snapshot_loop():
+    try:
+        interval = max(30, int(os.environ.get("HEALTH_SNAPSHOT_INTERVAL_S", "300")))
+    except ValueError:
+        interval = 300
+    while True:
+        try:
+            payload = await asyncio.to_thread(_build_deep_health_payload)
+            await asyncio.to_thread(_write_health_snapshot, payload)
+        except Exception as exc:
+            logger.warning("Health snapshot write failed: %s", exc)
+        await asyncio.sleep(interval)
+
+
 def _register_scheduler_jobs():
     # misfire_grace_time=3600 — if the daemon was down at the scheduled
     # tick (e.g. we recreated the container past 04:00 SGT), APScheduler
@@ -449,6 +700,7 @@ def _register_scheduler_jobs():
     scheduler.add_job(tasks.spotify_followed_artists_sync, "cron", day_of_week="sun", hour=6, id="followed_artists_sync", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.spotify_liked_artists_expand, "cron", hour=2, id="liked_artists_expand", replace_existing=True, misfire_grace_time=GRACE)  # LIKED_ARTISTS_EXPAND_V1
     scheduler.add_job(tasks.full_download_pipeline, "cron", hour=3, id="download_pipeline", replace_existing=True, misfire_grace_time=GRACE)
+    scheduler.add_job(tasks.requeue_stale_downloads, "interval", minutes=15, id="stale_download_requeue", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.listenbrainz_discovery, "cron", hour=4, id="lb_discovery", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.full_integrity_check, "cron", day_of_week="wed,sun", hour=5, id="integrity_check", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.db_backup, "cron", day_of_week="sun", hour=5, id="db_backup", replace_existing=True, misfire_grace_time=GRACE)
@@ -532,54 +784,24 @@ async def health():
 async def health_deep():
     """P1-6: deep liveness probe for external monitoring (NOT Docker's healthcheck).
 
-    Extends /health with scheduler liveness and the age of the most recent daemon
-    run. Returns 503 'degraded' if the DB is unreachable, the scheduler is not
-    running, or no daemon run has started within DEEP_HEALTH_MAX_RUN_AGE_S (default
-    26h — the download pipeline runs daily plus a boot run). Kept separate from the
-    shallow /health so a wedged scheduler surfaces to monitors without making
-    Docker restart the container on a transient hiccup.
+    Extends /health with scheduler liveness, daemon-run freshness, and DB-backed
+    download progress liveness. Kept separate from the shallow /health so a
+    wedged scheduler or stalled queue surfaces to monitors without making Docker
+    restart the container on every transient hiccup.
     """
-    import sqlalchemy as _sa
-    from src.db import get_session
-    from src.models import DaemonRun
-
-    db_ok = False
-    try:
-        with get_session() as s:
-            s.execute(_sa.text("SELECT 1"))
-            db_ok = True
-    except Exception:
-        db_ok = False
-
-    sched_ok = bool(scheduler.running)
-
-    last_started = None
-    try:
-        with get_session() as s:
-            last_started = s.query(_sa.func.max(DaemonRun.started_at)).scalar()
-    except Exception:
-        last_started = None
-
-    max_age = int(os.environ.get("DEEP_HEALTH_MAX_RUN_AGE_S", str(26 * 3600)))
-    run_age_s = None
-    run_fresh = False
-    if last_started is not None:
-        run_age_s = (datetime.now(timezone.utc) - last_started).total_seconds()
-        run_fresh = run_age_s <= max_age
-
-    degraded = (not db_ok) or (not sched_ok) or (not run_fresh)
-    payload = {
-        "status": "degraded" if degraded else "ok",
-        "db": db_ok,
-        "scheduler_running": sched_ok,
-        "last_run_started_at": last_started.isoformat() if last_started else None,
-        "last_run_age_seconds": int(run_age_s) if run_age_s is not None else None,
-        "last_run_fresh": run_fresh,
-    }
-    if degraded:
+    payload = await asyncio.to_thread(_build_deep_health_payload)
+    if payload["status"] != "ok":
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=503, content=payload)
     return payload
+
+
+@app.get("/api/musicstream/health/timeline")
+async def health_timeline(limit: int = 50):
+    try:
+        return ApiResponse(data={"items": await asyncio.to_thread(_read_health_snapshots, limit)})
+    except Exception as e:
+        return ApiResponse(error=str(e))
 
 
 @app.get("/api/musicstream/stats", response_model=ApiResponse[TrackStats])
@@ -745,39 +967,52 @@ async def artwork_refresh(mode: str = "missing", limit: int = 10, dry_run: int =
 
 @app.post("/api/musicstream/sync", dependencies=[Depends(require_auth)])
 async def trigger_sync():
-    await asyncio.to_thread(tasks.spotify_incremental_sync)
-    return ApiResponse(data={"queued": True})
+    job = _start_background_job("spotify_sync", tasks.spotify_incremental_sync)
+    return ApiResponse(data={**job, "queued": True, "status_url": f"/api/musicstream/jobs/{job['job_id']}"})
+
+
+@app.get("/api/musicstream/jobs")
+async def list_musicstream_jobs(limit: int = 20):
+    limit = max(1, min(limit, 100))
+    jobs = sorted(_manual_jobs.values(), key=lambda r: r.get("queued_at") or "", reverse=True)
+    return ApiResponse(data={"items": [_job_view(job) for job in jobs[:limit]]})
+
+
+@app.get("/api/musicstream/jobs/{job_id}")
+async def get_musicstream_job(job_id: str):
+    job = _manual_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return ApiResponse(data=_job_view(job))
 
 @app.post("/api/musicstream/full-backfill", dependencies=[Depends(require_auth)])
 async def trigger_full_backfill():
     """Run the one-time catch-up: saved albums + followed artists' discographies.
     Heavy. Returns immediately; check /api/musicstream/stats for progress."""
-    _bg = asyncio.create_task(asyncio.to_thread(tasks.maybe_run_full_backfill))
-    _background_tasks.add(_bg)
-    _bg.add_done_callback(_background_tasks.discard)
-    return ApiResponse(data={"queued": True, "watch": "/api/musicstream/stats"})
+    job = _start_background_job("spotify_full_backfill", tasks.maybe_run_full_backfill)
+    return ApiResponse(data={**job, "queued": True, "status_url": f"/api/musicstream/jobs/{job['job_id']}", "watch": "/api/musicstream/stats"})
 
 @app.post("/api/musicstream/saved-albums-sync", dependencies=[Depends(require_auth)])
 async def trigger_saved_albums():
-    _bg = asyncio.create_task(asyncio.to_thread(tasks.spotify_saved_albums_sync))
-    _background_tasks.add(_bg)
-    _bg.add_done_callback(_background_tasks.discard)
-    return ApiResponse(data={"queued": True})
+    job = _start_background_job("spotify_saved_albums_sync", tasks.spotify_saved_albums_sync)
+    return ApiResponse(data={**job, "queued": True, "status_url": f"/api/musicstream/jobs/{job['job_id']}"})
 
 @app.post("/api/musicstream/followed-artists-sync", dependencies=[Depends(require_auth)])
 async def trigger_followed_artists():
-    _bg = asyncio.create_task(asyncio.to_thread(tasks.spotify_followed_artists_sync))
-    _background_tasks.add(_bg)
-    _bg.add_done_callback(_background_tasks.discard)
-    return ApiResponse(data={"queued": True})
+    job = _start_background_job("spotify_followed_artists_sync", tasks.spotify_followed_artists_sync)
+    return ApiResponse(data={**job, "queued": True, "status_url": f"/api/musicstream/jobs/{job['job_id']}"})
 
 @app.post("/api/musicstream/liked-artists-expand", dependencies=[Depends(require_auth)])
 async def trigger_liked_artists_expand(batch: int = 50):
     """LIKED_ARTISTS_EXPAND_V1: manual trigger. ?batch=N to override default 50."""
-    _bg = asyncio.create_task(asyncio.to_thread(tasks.spotify_liked_artists_expand, batch))
-    _background_tasks.add(_bg)
-    _bg.add_done_callback(_background_tasks.discard)
-    return ApiResponse(data={"queued": True, "batch": batch})
+    job = _start_background_job("spotify_liked_artists_expand", tasks.spotify_liked_artists_expand, batch)
+    return ApiResponse(data={**job, "queued": True, "status_url": f"/api/musicstream/jobs/{job['job_id']}", "batch": batch})
+
+
+@app.post("/api/musicstream/tracks/requeue-stale", dependencies=[Depends(require_auth)])
+async def requeue_stale_tracks(stale_after_minutes: Optional[int] = None):
+    count = await asyncio.to_thread(tasks.requeue_stale_downloads, stale_after_minutes)
+    return ApiResponse(data={"requeued": count, "stale_after_minutes": stale_after_minutes or tasks.stale_download_minutes()})
 
 @app.post("/api/musicstream/integrity", dependencies=[Depends(require_auth)])
 async def trigger_integrity():

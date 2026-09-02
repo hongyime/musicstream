@@ -1,5 +1,12 @@
 # STATE
 
+## 2026-09-02 - robustness sweep implemented and verified
+- Implemented async manual Spotify jobs with `/api/musicstream/jobs/{job_id}` status, stale DOWNLOADING requeue, DB-backed download liveness in `/health/deep`, periodic JSONL/latest health snapshots, one-shot Spotify refresh-token failure alerts, and guarded Plex port fallback.
+- Live config: local `.env` has `PLEX_HOST_PORT_AUTO_FALLBACK=true`; Plex is currently published on host port 32402. The sample env defaults this flag to false for conservative installs.
+- Verification: PowerShell self-heal syntax parse passed; `docker compose config --quiet` passed; full pytest passed 341 tests, 1 skipped, with 3 existing return-not-None warnings in `tests/test_artwork_report.py`.
+- Live proof: daemon/plex/postgres/scrobbler are healthy; `/health/deep` is OK with scheduler running, stale_downloading=0, progress_fresh=true, Spotify token_degraded=false. DB snapshot at 2026-09-02 21:53 SGT: 132642 downloaded, 64076 pending, 3 successful downloads in the last hour.
+- Operational note: Docker Desktop briefly left the recreated daemon under a temporary name after `removal ... already in progress`; it was renamed back to `musicstream-daemon`. Existing untracked `docker_ports.txt` was preserved.
+
 ## 2026-08-24 — Wave 3 spec drafted
 - SPEC.md §W3 added: Discovery Parity (LB weekly playlists -> MBID resolve -> auto-download), QUALITY_CUTOFF (default mp3_320, FLAC opt-in), blocklist, m3u export, webhook alerts + token early-warning, library browse/search tab.
 - Constraints: $0 spend; Plex demoted to optional push; download-chain focus.

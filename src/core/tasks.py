@@ -22,6 +22,36 @@ def _spotify_task_min_token_hours() -> float:
         return 0.5
 
 
+def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+def stale_download_minutes() -> int:
+    return _int_env("STALE_DOWNLOAD_MINUTES", 30, minimum=1)
+
+
+def download_progress_max_stale_hours() -> float:
+    try:
+        return max(0.0, float(os.environ.get("DOWNLOAD_PROGRESS_MAX_STALE_HOURS", "6")))
+    except ValueError:
+        return 6.0
+
+
+def download_progress_startup_grace_seconds() -> int:
+    return _int_env("DOWNLOAD_PROGRESS_STARTUP_GRACE_S", 1800, minimum=0)
+
+
+def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def _run_spotify_task(task_name: str, work: Callable[[], Any]) -> Any:
     """Run one Spotify task at a time and refresh a stale cache first."""
     if not _SPOTIFY_TASK_LOCK.acquire(blocking=False):
@@ -274,6 +304,112 @@ def reset_orphaned_downloads(all_rows: bool = False, stale_after_minutes: int = 
     except Exception as exc:
         logger.error("reset_orphaned_downloads failed: %s", exc, exc_info=True)
         return 0
+
+
+def requeue_stale_downloads(stale_after_minutes: Optional[int] = None) -> int:
+    """Runtime watchdog for stuck DOWNLOADING rows.
+
+    Unlike the boot-time all-row reset, this only requeues rows whose heartbeat
+    or updated_at timestamp has gone stale, so an active worker keeps its claim.
+    """
+    minutes = stale_after_minutes if stale_after_minutes is not None else stale_download_minutes()
+    count = reset_orphaned_downloads(all_rows=False, stale_after_minutes=minutes)
+    if count:
+        logger.warning("Stale download watchdog requeued %d stuck track(s).", count)
+        try:
+            from src.services.notify import notify_failure
+            notify_failure(
+                "Stale downloads requeued",
+                detail=f"{count} downloading track(s) had no heartbeat for {minutes}+ minutes.",
+            )
+        except Exception as exc:
+            logger.debug("stale-download webhook skipped: %s", exc)
+    return count
+
+
+def get_download_liveness(
+    *,
+    stale_after_minutes: Optional[int] = None,
+    max_stale_hours: Optional[float] = None,
+    startup_grace_seconds: Optional[int] = None,
+    daemon_uptime_seconds: Optional[float] = None,
+) -> dict:
+    """Return download progress liveness from PostgreSQL state.
+
+    Degraded means: downloads are enabled, there is pending work, the daemon is
+    past its startup grace period, and no successful download has happened
+    inside the configured freshness window. Stale DOWNLOADING claims are also
+    reported independently so callers can requeue or restart.
+    """
+    from datetime import timedelta
+    from sqlalchemy import func, or_
+    from src.db import get_session
+    from src.models import DownloadAttempt, Track, TrackStatus
+
+    minutes = stale_after_minutes if stale_after_minutes is not None else stale_download_minutes()
+    hours = max_stale_hours if max_stale_hours is not None else download_progress_max_stale_hours()
+    grace = (
+        startup_grace_seconds
+        if startup_grace_seconds is not None
+        else download_progress_startup_grace_seconds()
+    )
+    uptime = daemon_uptime_seconds if daemon_uptime_seconds is not None else grace + 1
+
+    now = datetime.now(timezone.utc)
+    stale_cutoff = now - timedelta(minutes=minutes)
+    success_cutoff = now - timedelta(hours=hours)
+
+    with get_session() as session:
+        pending = session.query(func.count(Track.id)).filter(
+            Track.status == TrackStatus.PENDING.value
+        ).scalar() or 0
+        downloading = session.query(func.count(Track.id)).filter(
+            Track.status == TrackStatus.DOWNLOADING.value
+        ).scalar() or 0
+        stale_downloading = session.query(func.count(Track.id)).filter(
+            Track.status == TrackStatus.DOWNLOADING.value,
+            or_(
+                Track.heartbeat_at < stale_cutoff,
+                (Track.heartbeat_at.is_(None)) & (Track.updated_at < stale_cutoff),
+            ),
+        ).scalar() or 0
+        success_1h = session.query(func.count(DownloadAttempt.id)).filter(
+            DownloadAttempt.success.is_(True),
+            DownloadAttempt.attempted_at > now - timedelta(hours=1),
+        ).scalar() or 0
+        success_24h = session.query(func.count(DownloadAttempt.id)).filter(
+            DownloadAttempt.success.is_(True),
+            DownloadAttempt.attempted_at > now - timedelta(hours=24),
+        ).scalar() or 0
+        last_success_at = session.query(func.max(DownloadAttempt.attempted_at)).filter(
+            DownloadAttempt.success.is_(True)
+        ).scalar()
+
+    last_success_at = _as_utc(last_success_at)
+    last_success_age_seconds = None
+    if last_success_at is not None:
+        last_success_age_seconds = max(0, int((now - last_success_at).total_seconds()))
+
+    past_startup_grace = uptime >= grace
+    progress_fresh = True
+    if not DISABLE_DOWNLOADS and pending > 0 and past_startup_grace:
+        progress_fresh = last_success_at is not None and last_success_at >= success_cutoff
+
+    return {
+        "downloads_disabled": bool(DISABLE_DOWNLOADS),
+        "pending": int(pending),
+        "downloading": int(downloading),
+        "stale_downloading": int(stale_downloading),
+        "stale_download_minutes": int(minutes),
+        "success_1h": int(success_1h),
+        "success_24h": int(success_24h),
+        "last_success_at": last_success_at.isoformat() if last_success_at else None,
+        "last_success_age_seconds": last_success_age_seconds,
+        "progress_fresh": bool(progress_fresh),
+        "progress_max_stale_hours": float(hours),
+        "startup_grace_seconds": int(grace),
+        "past_startup_grace": bool(past_startup_grace),
+    }
 
 
 def reset_failed_tracks(session) -> int:
@@ -778,6 +914,78 @@ def update_ytdlp() -> None:
         logger.warning("[YTDLP] auto-update error: %s", exc)
 
 
+def _spotify_token_alert_state_path():
+    from pathlib import Path
+
+    return Path(os.environ.get("SPOTIFY_TOKEN_ALERT_STATE_PATH", str(LOG_DIR / "spotify_token_alert_state.json")))
+
+
+def _read_spotify_token_alert_state() -> dict:
+    import json
+
+    path = _spotify_token_alert_state_path()
+    try:
+        if not path.exists():
+            return {}
+        with path.open(encoding="utf-8") as f:
+            state = json.load(f)
+        return state if isinstance(state, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_spotify_token_alert_state(state: dict) -> None:
+    import json
+    import tempfile
+
+    path = _spotify_token_alert_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, sort_keys=True)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _handle_spotify_token_probe_result(result: dict, *, context: str) -> None:
+    """Alert once per degraded Spotify refresh-token episode."""
+    degraded = bool(result.get("degraded"))
+    state = _read_spotify_token_alert_state()
+    active = bool(state.get("active"))
+
+    if degraded:
+        if active:
+            return
+        detail = (
+            f"context={context}; present={result.get('present')}; "
+            f"hours_left={result.get('hours_left')}; refreshed={result.get('refreshed')}"
+        )
+        try:
+            from src.services.notify import notify_failure
+            notify_failure("Spotify refresh token needs login", detail=detail)
+        except Exception as exc:
+            logger.debug("spotify-token webhook skipped: %s", exc)
+        _write_spotify_token_alert_state(
+            {
+                "active": True,
+                "first_seen_at": datetime.now(timezone.utc).isoformat(),
+                "last_context": context,
+            }
+        )
+        return
+
+    if active:
+        state["active"] = False
+        state["resolved_at"] = datetime.now(timezone.utc).isoformat()
+        state["last_context"] = context
+        _write_spotify_token_alert_state(state)
+
+
 def probe_spotify_token() -> None:
     """§W3 T18/V13 hourly early-warning: refresh-or-alert on near-expiry.
 
@@ -786,16 +994,8 @@ def probe_spotify_token() -> None:
     try:
         from src.ingestion.spotify_auth import probe_token
         result = probe_token(refresher=_default_token_refresher)
+        _handle_spotify_token_probe_result(result, context="hourly_probe")
         if result.get("degraded"):
-            from src.services.notify import notify_failure
-            notify_failure(
-                "Spotify token needs attention",
-                detail=(
-                    f"present={result.get('present')} "
-                    f"hours_left={result.get('hours_left')} "
-                    f"refreshed={result.get('refreshed')}"
-                ),
-            )
             logger.warning("[TOKEN_WARN] degraded token state: %s", result)
         else:
             logger.debug("Token probe healthy: %s", result)
@@ -813,6 +1013,7 @@ def refresh_spotify_token_if_expired(max_age_hours: float = 0) -> dict:
     try:
         from src.ingestion.spotify_auth import probe_token
         result = probe_token(refresher=_default_token_refresher, max_age_hours=max_age_hours)
+        _handle_spotify_token_probe_result(result, context="freshness_probe")
         if result.get("refreshed"):
             logger.info("Spotify token cache refreshed by freshness probe.")
         elif result.get("degraded"):
@@ -820,7 +1021,9 @@ def refresh_spotify_token_if_expired(max_age_hours: float = 0) -> dict:
         return result
     except Exception as exc:
         logger.warning("Spotify token freshness-refresh probe failed: %s", exc)
-        return {"present": False, "hours_left": None, "degraded": True, "refreshed": False}
+        result = {"present": False, "hours_left": None, "degraded": True, "refreshed": False}
+        _handle_spotify_token_probe_result(result, context="freshness_probe_exception")
+        return result
 
 
 def _default_token_refresher() -> bool:

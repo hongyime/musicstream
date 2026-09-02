@@ -5,16 +5,12 @@ import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# Mock heavy optional deps so importing tasks (which can pull in the pipeline)
-# never fails in a bare environment. No-op where the deps are installed.
-for _mod in ("yt_dlp", "spotipy", "spotipy.oauth2", "ytmusicapi", "spotdl"):
-    sys.modules.setdefault(_mod, MagicMock())
-
 from src.models import Track, TrackStatus  # noqa: E402
+from src.core import tasks  # noqa: E402
 from src.core.tasks import reset_failed_tracks, reset_orphaned_downloads  # noqa: E402
 
 
@@ -129,3 +125,110 @@ class TestResetOrphanedDownloads:
         assert n == 1
         assert old.status == TrackStatus.PENDING.value
         assert old.claim_owner is None
+
+    def test_all_rows_resets_fresh_active_claims_on_boot(self, session):
+        active = _track(session, "spotify:track:orphan4", "downloading", attempt_count=1)
+        active.heartbeat_at = datetime.now(timezone.utc)
+        active.claim_owner = "worker:active"
+        session.flush()
+
+        @contextmanager
+        def fake_get_session():
+            yield session
+
+        with patch("src.db.get_session", fake_get_session):
+            n = reset_orphaned_downloads(all_rows=True)
+
+        session.expire_all()
+        active = session.get(Track, active.id)
+        assert n == 1
+        assert active.status == TrackStatus.PENDING.value
+        assert active.heartbeat_at is None
+        assert active.claim_owner is None
+
+
+class TestDownloadLiveness:
+    def _bind_session(self, session):
+        @contextmanager
+        def fake_get_session():
+            yield session
+
+        return patch("src.db.get_session", fake_get_session)
+
+    def test_degrades_when_pending_and_no_success_after_threshold(self, session):
+        from src.models import DownloadAttempt
+
+        _track(session, "spotify:track:live1", "pending", attempt_count=0)
+        attempt = DownloadAttempt(
+            track_id=_track(session, "spotify:track:live2", "downloaded", attempt_count=0).id,
+            attempted_at=datetime.now(timezone.utc) - timedelta(hours=8),
+            method="unit",
+            success=True,
+        )
+        session.add(attempt)
+        session.flush()
+
+        with self._bind_session(session), patch.object(tasks, "DISABLE_DOWNLOADS", False):
+            info = tasks.get_download_liveness(
+                max_stale_hours=6,
+                startup_grace_seconds=60,
+                daemon_uptime_seconds=120,
+            )
+
+        assert info["pending"] == 1
+        assert info["progress_fresh"] is False
+        assert info["last_success_age_seconds"] >= 6 * 3600
+
+    def test_ok_during_startup_grace(self, session):
+        _track(session, "spotify:track:live3", "pending", attempt_count=0)
+
+        with self._bind_session(session), patch.object(tasks, "DISABLE_DOWNLOADS", False):
+            info = tasks.get_download_liveness(
+                max_stale_hours=6,
+                startup_grace_seconds=300,
+                daemon_uptime_seconds=30,
+            )
+
+        assert info["pending"] == 1
+        assert info["past_startup_grace"] is False
+        assert info["progress_fresh"] is True
+
+    def test_ok_when_no_pending_backlog(self, session):
+        _track(session, "spotify:track:live4", "downloaded", attempt_count=0)
+
+        with self._bind_session(session), patch.object(tasks, "DISABLE_DOWNLOADS", False):
+            info = tasks.get_download_liveness(
+                max_stale_hours=6,
+                startup_grace_seconds=60,
+                daemon_uptime_seconds=120,
+            )
+
+        assert info["pending"] == 0
+        assert info["progress_fresh"] is True
+
+    def test_reports_stale_downloading_count(self, session):
+        stale = _track(session, "spotify:track:live5", "downloading", attempt_count=1)
+        stale.heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=45)
+        fresh = _track(session, "spotify:track:live6", "downloading", attempt_count=1)
+        fresh.heartbeat_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        session.flush()
+
+        with self._bind_session(session), patch.object(tasks, "DISABLE_DOWNLOADS", False):
+            info = tasks.get_download_liveness(stale_after_minutes=30)
+
+        assert info["downloading"] == 2
+        assert info["stale_downloading"] == 1
+
+
+def test_requeue_stale_downloads_uses_configured_threshold(monkeypatch):
+    calls = []
+
+    def fake_reset_orphaned_downloads(*, all_rows=False, stale_after_minutes=30):
+        calls.append((all_rows, stale_after_minutes))
+        return 3
+
+    monkeypatch.setenv("STALE_DOWNLOAD_MINUTES", "12")
+    monkeypatch.setattr(tasks, "reset_orphaned_downloads", fake_reset_orphaned_downloads)
+
+    assert tasks.requeue_stale_downloads() == 3
+    assert calls == [(False, 12)]
