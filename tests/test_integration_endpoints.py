@@ -18,6 +18,7 @@ def daemon_process() -> Generator[subprocess.Popen, None, None]:
     env["DAEMON_API_TOKEN"] = TEST_TOKEN
     env["PORT"] = str(TEST_PORT)
     env["PYTHONPATH"] = str(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+    env["SKIP_BACKGROUND_STARTUP"] = "true"
 
     # Load .env into the child env (same pattern as migrations/env.py). Without
     # this the spawned daemon dies immediately with KeyError: DATABASE_URL on

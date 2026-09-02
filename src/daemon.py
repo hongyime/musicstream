@@ -243,10 +243,13 @@ async def lifespan(app: FastAPI):
         logger.error("DB initialization failed: %s", e)
         raise SystemExit(1) from e
     
-    # Start background startup sequence
-    _bg_task = asyncio.create_task(_background_startup())
-    _background_tasks.add(_bg_task)
-    _bg_task.add_done_callback(_background_tasks.discard)
+    if os.environ.get("SKIP_BACKGROUND_STARTUP", "false").lower() in ("1", "true", "yes", "on"):
+        logger.info("Background startup sequence skipped via SKIP_BACKGROUND_STARTUP.")
+    else:
+        # Start background startup sequence
+        _bg_task = asyncio.create_task(_background_startup())
+        _background_tasks.add(_bg_task)
+        _bg_task.add_done_callback(_background_tasks.discard)
     
     yield
     
@@ -272,10 +275,6 @@ async def lifespan(app: FastAPI):
 async def _background_startup():
     """Run the 9-step startup sequence in the background."""
     try:
-        # Wait for internet before doing anything that might require it (sync, backfill, discovery).
-        from src.utils import wait_for_internet
-        await asyncio.to_thread(wait_for_internet)
-
         # Permission audit on credential files. Bind-mounted secrets often
         # come over from the host with permissive mode bits because Docker
         # inherits the host's umask. We don't *enforce* a tight mode (many
@@ -299,40 +298,9 @@ async def _background_startup():
         reset_n = await asyncio.to_thread(tasks.reset_orphaned_downloads, True)
         logger.info("Boot orphan-reset: %d stranded DOWNLOADING row(s) -> PENDING", reset_n)
 
-        logger.info("Step 3/9: Skipping legacy banner (UI-only now)")
-
-        if os.environ.get("SKIP_STARTUP_INTEGRITY", "true").lower() in ("1", "true", "yes", "on"):
-            logger.info("Step 4/9: Integrity check SKIPPED on startup (runs Sun 05:00 via cron). Set SKIP_STARTUP_INTEGRITY=false to re-enable.")
-        else:
-            logger.info("Step 4/9: Running integrity check…")
-            await asyncio.to_thread(tasks.integrity_check)
-
-        logger.info("Step 5/9: Running Spotify incremental sync…")
-        await asyncio.to_thread(tasks.spotify_incremental_sync)
-
-        logger.info("Step 5b/9: One-time full backfill (saved albums + followed artists) if needed…")
-        await asyncio.to_thread(tasks.maybe_run_full_backfill)
-
-        logger.info("Step 6/9: Running download pipeline…")
         run_id = await asyncio.to_thread(tasks._record_run_start, "startup")
 
-        # Step 7 fires-and-forgets in parallel so a long download_pipeline()
-        # (can be hours when there's a backlog) doesn't starve discovery.
-        # Previously step 7 awaited step 6 in series; a single multi-hour
-        # download backlog would skip discovery for that whole boot, which
-        # is how lb_discovery silently fell 7 days behind.
-        logger.info("Step 7/9: Scheduling ListenBrainz discovery (parallel, fires immediately)…")
-        _lb_task = asyncio.create_task(asyncio.to_thread(tasks.listenbrainz_discovery))
-        _background_tasks.add(_lb_task)
-        _lb_task.add_done_callback(_background_tasks.discard)
-
-        dl, fail = await asyncio.to_thread(tasks.download_pipeline, run_id=run_id)
-        await asyncio.to_thread(tasks._record_run_complete, run_id=run_id, downloaded=dl, failed=fail)
-
-        logger.info("Step 8/9: Running DB backup…")
-        await asyncio.to_thread(tasks.db_backup)
-
-        logger.info("Step 9/9: Starting APScheduler…")
+        logger.info("Step 3/9: Starting APScheduler...")
         _register_scheduler_jobs()
         scheduler.start()
 
@@ -340,9 +308,63 @@ async def _background_startup():
         _background_tasks.add(_hb_task)
         _hb_task.add_done_callback(_background_tasks.discard)
 
+        logger.info("Scheduler running; startup maintenance continues in background.")
+
+        # Wait for internet before doing anything that might require it (sync, backfill, discovery).
+        from src.utils import wait_for_internet
+        await asyncio.to_thread(wait_for_internet)
+
+        logger.info("Step 4/9: Skipping legacy banner (UI-only now)")
+
+        if os.environ.get("SKIP_STARTUP_INTEGRITY", "true").lower() in ("1", "true", "yes", "on"):
+            logger.info("Step 5/9: Integrity check SKIPPED on startup (runs Sun 05:00 via cron). Set SKIP_STARTUP_INTEGRITY=false to re-enable.")
+        else:
+            logger.info("Step 5/9: Running integrity check…")
+            await asyncio.to_thread(tasks.integrity_check)
+
+        logger.info("Step 6/9: Scheduling Spotify startup sync/backfill (parallel)…")
+        _spotify_task = asyncio.create_task(_spotify_startup_maintenance())
+        _background_tasks.add(_spotify_task)
+        _spotify_task.add_done_callback(_background_tasks.discard)
+
+        logger.info("Step 7/9: Running download pipeline…")
+
+        # Step 8 fires-and-forgets in parallel so a long download_pipeline()
+        # (can be hours when there's a backlog) doesn't starve discovery.
+        # Previously step 7 awaited step 6 in series; a single multi-hour
+        # download backlog would skip discovery for that whole boot, which
+        # is how lb_discovery silently fell 7 days behind.
+        logger.info("Step 8/9: Scheduling ListenBrainz discovery (parallel, fires immediately)…")
+        _lb_task = asyncio.create_task(asyncio.to_thread(tasks.listenbrainz_discovery))
+        _background_tasks.add(_lb_task)
+        _lb_task.add_done_callback(_background_tasks.discard)
+
+        dl, fail = await asyncio.to_thread(tasks.download_pipeline, run_id=run_id)
+        await asyncio.to_thread(tasks._record_run_complete, run_id=run_id, downloaded=dl, failed=fail)
+
+        logger.info("Step 9/9: Running DB backup…")
+        await asyncio.to_thread(tasks.db_backup)
+
         logger.info("Daemon fully initialised. Scheduler running.")
     except Exception as exc:
         logger.error("Background startup failed: %s", exc, exc_info=True)
+
+
+async def _spotify_startup_maintenance():
+    """Run Spotify boot maintenance without blocking the download drain."""
+    try:
+        logger.info("Startup Spotify maintenance: refreshing token if expired...")
+        await asyncio.to_thread(tasks.refresh_spotify_token_if_expired)
+
+        logger.info("Startup Spotify maintenance: running incremental sync...")
+        await asyncio.to_thread(tasks.spotify_incremental_sync)
+
+        logger.info("Startup Spotify maintenance: running full backfill check...")
+        await asyncio.to_thread(tasks.maybe_run_full_backfill)
+
+        logger.info("Startup Spotify maintenance complete.")
+    except Exception as exc:
+        logger.error("Startup Spotify maintenance failed: %s", exc, exc_info=True)
 
 app = FastAPI(title="Musicstream API", lifespan=lifespan)
 
@@ -987,26 +1009,43 @@ async def spotify_callback(code: str = None, error: str = None):
 
 @app.get("/api/musicstream/auth/status")
 async def get_auth_status(request: Request):
+    global _active_auth_manager
+
     if not SPOTIFY_CLIENT_ID:
         return ApiResponse(data={"status": "missing_config", "client_id": None})
-    from src.core import config as _w3_cfg
     from src.ingestion.spotify_auth import token_freshness
+
+    token_refreshed = False
+    fresh = token_freshness()
+    hours_left = fresh.get("hours_left")
+    expired_or_missing = (not fresh.get("present")) or (hours_left is not None and hours_left < 0)
+    if expired_or_missing:
+        result = await asyncio.to_thread(tasks.refresh_spotify_token_if_expired)
+        token_refreshed = bool(result.get("refreshed"))
+        if token_refreshed:
+            _active_auth_manager = None
+        fresh = token_freshness()
+        hours_left = fresh.get("hours_left")
 
     auth_manager = _get_auth_manager()
     is_valid = auth_manager.validate_token(auth_manager.get_cached_token()) is not None
-    fresh = token_freshness()
-    hours_left = fresh.get("hours_left")
+    if not is_valid and fresh.get("present") and hours_left is not None and hours_left >= 0:
+        _active_auth_manager = None
+        auth_manager = _get_auth_manager()
+        is_valid = auth_manager.validate_token(auth_manager.get_cached_token()) is not None
+
     # degraded = needs human action: invalid token or EXPIRED cache entry.
     # A low-but-positive hours_left is normal (access tokens live ~1h); the
     # hourly probe + refresher handle rolling it forward automatically.
     expired = hours_left is not None and hours_left < 0
-    degraded = (not is_valid) or expired
+    degraded = (not is_valid) or expired or (not fresh.get("present"))
     return ApiResponse(data={
         "status": "authenticated" if is_valid else "needs_auth",
         "client_id": SPOTIFY_CLIENT_ID,
         "redirect_uri": _REDIRECT_URI,
         "token_hours_left": hours_left,
         "token_degraded": degraded,
+        "token_refreshed": token_refreshed,
     })
 
 # ── WebSockets ────────────────────────────────────────────────────────────────

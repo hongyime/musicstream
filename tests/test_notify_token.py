@@ -164,3 +164,86 @@ def test_probe_healthy_when_far_from_expiry(tmp_path):
 
     result = probe_token(cache_path=path, refresher=never)
     assert result["degraded"] is False
+
+
+def test_refresh_spotify_token_if_expired_uses_expired_threshold(monkeypatch):
+    calls = []
+
+    def fake_probe_token(refresher=None, max_age_hours=None):
+        calls.append({"refresher": refresher, "max_age_hours": max_age_hours})
+        assert refresher() is True
+        return {"present": True, "hours_left": 1.0, "degraded": False, "refreshed": True}
+
+    monkeypatch.setattr("src.ingestion.spotify_auth.probe_token", fake_probe_token)
+    monkeypatch.setattr("src.core.tasks._default_token_refresher", lambda: True)
+    from src.core.tasks import refresh_spotify_token_if_expired
+
+    result = refresh_spotify_token_if_expired()
+
+    assert result["refreshed"] is True
+    assert calls[0]["max_age_hours"] == 0
+    assert callable(calls[0]["refresher"])
+
+
+def test_refresh_spotify_token_if_expired_returns_degraded_on_probe_error(monkeypatch):
+    def broken_probe_token(refresher=None, max_age_hours=None):
+        raise RuntimeError("cache unreadable")
+
+    monkeypatch.setattr("src.ingestion.spotify_auth.probe_token", broken_probe_token)
+    from src.core.tasks import refresh_spotify_token_if_expired
+
+    result = refresh_spotify_token_if_expired()
+
+    assert result == {"present": False, "hours_left": None, "degraded": True, "refreshed": False}
+
+
+def test_spotify_incremental_sync_refreshes_before_client_init(monkeypatch):
+    events = []
+
+    class _Session:
+        def __enter__(self):
+            events.append("session")
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _Scraper:
+        def __init__(self, client_id):
+            events.append("scraper")
+
+        def incremental_sync(self, session):
+            events.append("sync")
+            return 0
+
+    monkeypatch.setattr("src.utils.wait_for_internet", lambda: events.append("internet"))
+    monkeypatch.setattr(
+        "src.core.tasks.refresh_spotify_token_if_expired",
+        lambda max_age_hours=0: events.append(("refresh", max_age_hours)) or {"degraded": False, "refreshed": False},
+    )
+    monkeypatch.setattr("src.db.get_session", lambda: _Session())
+    monkeypatch.setattr("src.ingestion.scraper.SpotifyScraper", _Scraper)
+    from src.core.tasks import spotify_incremental_sync
+
+    spotify_incremental_sync()
+
+    assert events == ["internet", ("refresh", 0.5), "scraper", "session", "sync"]
+
+
+def test_spotify_incremental_sync_skips_when_another_spotify_task_is_active(monkeypatch):
+    from src.core import tasks
+
+    events = []
+    assert tasks._SPOTIFY_TASK_LOCK.acquire(blocking=False) is True
+    try:
+        monkeypatch.setattr("src.utils.wait_for_internet", lambda: events.append("internet"))
+        monkeypatch.setattr(
+            "src.core.tasks.refresh_spotify_token_if_expired",
+            lambda max_age_hours=0: events.append(("refresh", max_age_hours)),
+        )
+
+        tasks.spotify_incremental_sync()
+    finally:
+        tasks._SPOTIFY_TASK_LOCK.release()
+
+    assert events == ["internet"]

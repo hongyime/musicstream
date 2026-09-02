@@ -480,6 +480,118 @@ function Test-HttpOk {
     }
 }
 
+function Get-JsonPropertyValue {
+    param(
+        $Object,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $null
+    }
+    return $property.Value
+}
+
+function Convert-ToNullableBool {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+    return [bool]$Value
+}
+
+function Get-DeepHealthSnapshot {
+    $uri = "http://127.0.0.1:9079/health/deep"
+    $statusCode = 0
+    $content = ""
+
+    try {
+        $response = Invoke-WebRequest -Uri $uri -TimeoutSec 10 -UseBasicParsing
+        $statusCode = [int]$response.StatusCode
+        $content = [string]$response.Content
+    } catch {
+        $response = $_.Exception.Response
+        if (-not [string]::IsNullOrWhiteSpace($_.ErrorDetails.Message)) {
+            $content = [string]$_.ErrorDetails.Message
+        }
+        if ($null -eq $response) {
+            Write-Log "warn" ("Deep health request failed: {0}" -f $_.Exception.Message)
+            return [pscustomobject]@{
+                reachable = $false
+                status_code = 0
+                status = "unreachable"
+                db = $null
+                scheduler_running = $null
+                last_run_started_at = $null
+                last_run_age_seconds = $null
+                last_run_fresh = $null
+                error = $_.Exception.Message
+            }
+        }
+
+        try {
+            $statusCode = [int]$response.StatusCode
+            $stream = $response.GetResponseStream()
+            if ([string]::IsNullOrWhiteSpace($content) -and $null -ne $stream) {
+                $reader = New-Object System.IO.StreamReader($stream)
+                try {
+                    $content = $reader.ReadToEnd()
+                } finally {
+                    $reader.Dispose()
+                }
+            }
+        } catch {
+            Write-Log "warn" ("Could not read deep health error body: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    $payload = $null
+    if (-not [string]::IsNullOrWhiteSpace($content)) {
+        try {
+            $payload = ConvertFrom-Json -InputObject $content
+        } catch {
+            Write-Log "warn" ("Deep health returned non-JSON response: {0}" -f ($content -replace "\s+", " ").Trim())
+        }
+    }
+
+    if ($null -eq $payload) {
+        return [pscustomobject]@{
+            reachable = $true
+            status_code = $statusCode
+            status = "unknown"
+            db = $null
+            scheduler_running = $null
+            last_run_started_at = $null
+            last_run_age_seconds = $null
+            last_run_fresh = $null
+            error = "unparseable deep health response"
+        }
+    }
+
+    $ageValue = Get-JsonPropertyValue -Object $payload -Name "last_run_age_seconds"
+    $age = $null
+    if ($null -ne $ageValue) {
+        $age = [int64]$ageValue
+    }
+
+    [pscustomobject]@{
+        reachable = $true
+        status_code = $statusCode
+        status = [string](Get-JsonPropertyValue -Object $payload -Name "status")
+        db = Convert-ToNullableBool (Get-JsonPropertyValue -Object $payload -Name "db")
+        scheduler_running = Convert-ToNullableBool (Get-JsonPropertyValue -Object $payload -Name "scheduler_running")
+        last_run_started_at = Get-JsonPropertyValue -Object $payload -Name "last_run_started_at"
+        last_run_age_seconds = $age
+        last_run_fresh = Convert-ToNullableBool (Get-JsonPropertyValue -Object $payload -Name "last_run_fresh")
+        error = ""
+    }
+}
+
 function Wait-ServiceHealth {
     param([int]$PlexPort, [int]$TimeoutSeconds)
 
@@ -588,11 +700,45 @@ function Repair-StaleDownloads {
     }
 }
 
+function Repair-DaemonDeepHealth {
+    param($DeepHealth)
+
+    if ($null -eq $DeepHealth) {
+        return
+    }
+
+    $reasons = @()
+    if (-not $DeepHealth.reachable) {
+        $reasons += "deep-health-unreachable"
+    } else {
+        if ($DeepHealth.scheduler_running -eq $false) {
+            $reasons += "scheduler-not-running"
+        }
+        if ($DeepHealth.last_run_fresh -eq $false) {
+            $reasons += "last-run-stale"
+        }
+    }
+
+    if ($reasons.Count -eq 0) {
+        if ($DeepHealth.status -eq "ok") {
+            Write-Log "info" "Deep health: scheduler running and latest daemon run is fresh."
+        } else {
+            Write-Log "warn" ("Deep health degraded without daemon-restart signal: status={0} db={1}" -f $DeepHealth.status, $DeepHealth.db)
+        }
+        return
+    }
+
+    Write-Log "warn" ("Deep health degraded: status={0} scheduler_running={1} last_run_fresh={2} last_run_age_seconds={3}; repair={4}" -f `
+        $DeepHealth.status, $DeepHealth.scheduler_running, $DeepHealth.last_run_fresh, $DeepHealth.last_run_age_seconds, ($reasons -join "+"))
+    Restart-ContainerWithCooldown -Container "musicstream-daemon" -Reason ($reasons -join "+")
+}
+
 function Write-LastSummary {
     param(
         [string]$Status,
         [int]$PlexPort,
         $Snapshot,
+        $DeepHealth,
         [string]$ErrorMessage = ""
     )
 
@@ -602,6 +748,7 @@ function Write-LastSummary {
         status = $Status
         plex_host_port = $PlexPort
         snapshot = $Snapshot
+        deep_health = $DeepHealth
         error = $ErrorMessage
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Script:LastPath -Encoding UTF8
 }
@@ -609,6 +756,7 @@ function Write-LastSummary {
 function Invoke-SelfHeal {
     $plexPort = 0
     $snapshot = $null
+    $deepHealth = $null
 
     try {
         Write-Log "info" "Self-heal pass started."
@@ -616,21 +764,23 @@ function Invoke-SelfHeal {
         $plexPort = Start-ComposeStack
         Repair-Containers
         $healthy = Wait-ServiceHealth -PlexPort $plexPort -TimeoutSeconds $HealthWaitSeconds
+        $deepHealth = Get-DeepHealthSnapshot
+        Repair-DaemonDeepHealth -DeepHealth $deepHealth
         $snapshot = Get-ProgressSnapshot
         if ($null -ne $snapshot) {
             Repair-StaleDownloads -Snapshot $snapshot
         }
         $status = "degraded"
-        if ($healthy) {
+        if ($healthy -and $null -ne $deepHealth -and $deepHealth.status -eq "ok") {
             $status = "ok"
         }
-        Write-LastSummary -Status $status -PlexPort $plexPort -Snapshot $snapshot
+        Write-LastSummary -Status $status -PlexPort $plexPort -Snapshot $snapshot -DeepHealth $deepHealth
         Write-Log "info" "Self-heal pass completed."
         return 0
     } catch {
         $message = $_.Exception.Message
         Write-Log "error" $message
-        Write-LastSummary -Status "error" -PlexPort $plexPort -Snapshot $snapshot -ErrorMessage $message
+        Write-LastSummary -Status "error" -PlexPort $plexPort -Snapshot $snapshot -DeepHealth $deepHealth -ErrorMessage $message
         return 1
     }
 }

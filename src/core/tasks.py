@@ -1,6 +1,7 @@
 import logging
 import os
 import subprocess
+import threading
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Optional, Callable, Any
@@ -10,6 +11,28 @@ from src.core.config import LOG_DIR, BACKUP_DIR, MAX_BACKUPS, DISABLE_DOWNLOADS,
 logger = logging.getLogger("musicstream.daemon")
 
 # ── Resilience Helpers ────────────────────────────────────────────────────────
+
+_SPOTIFY_TASK_LOCK = threading.Lock()
+
+
+def _spotify_task_min_token_hours() -> float:
+    try:
+        return max(0.0, float(os.environ.get("SPOTIFY_TASK_MIN_TOKEN_HOURS", "0.5")))
+    except ValueError:
+        return 0.5
+
+
+def _run_spotify_task(task_name: str, work: Callable[[], Any]) -> Any:
+    """Run one Spotify task at a time and refresh a stale cache first."""
+    if not _SPOTIFY_TASK_LOCK.acquire(blocking=False):
+        logger.warning("%s skipped: another Spotify task is already running.", task_name)
+        return None
+    try:
+        refresh_spotify_token_if_expired(max_age_hours=_spotify_task_min_token_hours())
+        return work()
+    finally:
+        _SPOTIFY_TASK_LOCK.release()
+
 
 def pause_on_no_internet(func: Callable) -> Callable:
     """Decorator that blocks execution until internet is available."""
@@ -80,12 +103,16 @@ def spotify_incremental_sync() -> None:
     """Run Spotify incremental sync and log new track count."""
     logger.info("Running Spotify incremental sync.")
     try:
-        from src.db import get_session
-        from src.ingestion.scraper import SpotifyScraper
-        scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
-        with get_session() as session:
-            new_tracks = scraper.incremental_sync(session)
-        logger.info("Spotify incremental sync complete: %d new tracks", new_tracks)
+        def _work():
+            from src.db import get_session
+            from src.ingestion.scraper import SpotifyScraper
+            scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
+            with get_session() as session:
+                return scraper.incremental_sync(session)
+
+        new_tracks = _run_spotify_task("Spotify incremental sync", _work)
+        if new_tracks is not None:
+            logger.info("Spotify incremental sync complete: %d new tracks", new_tracks)
     except Exception as exc:
         logger.error("Spotify incremental sync failed: %s", exc, exc_info=True)
 
@@ -95,12 +122,16 @@ def spotify_saved_albums_sync() -> None:
     """Pull every Spotify Saved Album and upsert all its tracks."""
     logger.info("Running Spotify saved-albums sync.")
     try:
-        from src.db import get_session
-        from src.ingestion.scraper import SpotifyScraper
-        scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
-        with get_session() as session:
-            new_tracks = scraper.saved_albums_sync(session)
-        logger.info("Spotify saved-albums sync complete: %d new tracks", new_tracks)
+        def _work():
+            from src.db import get_session
+            from src.ingestion.scraper import SpotifyScraper
+            scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
+            with get_session() as session:
+                return scraper.saved_albums_sync(session)
+
+        new_tracks = _run_spotify_task("Spotify saved-albums sync", _work)
+        if new_tracks is not None:
+            logger.info("Spotify saved-albums sync complete: %d new tracks", new_tracks)
     except Exception as exc:
         logger.error("Spotify saved-albums sync failed: %s", exc, exc_info=True)
 
@@ -110,12 +141,16 @@ def spotify_followed_artists_sync() -> None:
     """Pull every followed artist's full discography (heavy weekly sweep)."""
     logger.info("Running Spotify followed-artists sync.")
     try:
-        from src.db import get_session
-        from src.ingestion.scraper import SpotifyScraper
-        scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
-        with get_session() as session:
-            new_tracks = scraper.followed_artists_sync(session)
-        logger.info("Spotify followed-artists sync complete: %d new tracks", new_tracks)
+        def _work():
+            from src.db import get_session
+            from src.ingestion.scraper import SpotifyScraper
+            scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
+            with get_session() as session:
+                return scraper.followed_artists_sync(session)
+
+        new_tracks = _run_spotify_task("Spotify followed-artists sync", _work)
+        if new_tracks is not None:
+            logger.info("Spotify followed-artists sync complete: %d new tracks", new_tracks)
     except Exception as exc:
         logger.error("Spotify followed-artists sync failed: %s", exc, exc_info=True)
 
@@ -127,17 +162,21 @@ def spotify_liked_artists_expand(batch_size: int = 50) -> None:
     chips away at the long tail without bursting the Spotify rate limiter."""
     logger.info("Running Spotify liked-artists expand (batch=%d).", batch_size)
     try:
-        from src.db import get_session
-        from src.ingestion.scraper import SpotifyScraper
-        scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
-        with get_session() as session:
-            result = scraper.liked_artists_expand(session, batch_size=batch_size)
-        logger.info(
-            "Spotify liked-artists expand complete: %d artists, %d new tracks, %d remaining",
-            result.get("artists_expanded", 0),
-            result.get("new_tracks", 0),
-            result.get("remaining", 0),
-        )
+        def _work():
+            from src.db import get_session
+            from src.ingestion.scraper import SpotifyScraper
+            scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
+            with get_session() as session:
+                return scraper.liked_artists_expand(session, batch_size=batch_size)
+
+        result = _run_spotify_task("Spotify liked-artists expand", _work)
+        if result is not None:
+            logger.info(
+                "Spotify liked-artists expand complete: %d artists, %d new tracks, %d remaining",
+                result.get("artists_expanded", 0),
+                result.get("new_tracks", 0),
+                result.get("remaining", 0),
+            )
     except Exception as exc:
         logger.error("Spotify liked-artists expand failed: %s", exc, exc_info=True)
 
@@ -153,7 +192,6 @@ def maybe_run_full_backfill() -> int:
     try:
         from src.db import get_session
         from src.models import Source, SourceType
-        from src.ingestion.scraper import SpotifyScraper
 
         with get_session() as session:
             existing = (
@@ -166,9 +204,16 @@ def maybe_run_full_backfill() -> int:
             return 0
 
         logger.info("Full backfill: no album/artist sources yet — running one-time catch-up")
-        scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
-        with get_session() as session:
-            new_tracks = scraper.full_backfill(session)
+
+        def _work():
+            from src.ingestion.scraper import SpotifyScraper
+            scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
+            with get_session() as session:
+                return scraper.full_backfill(session)
+
+        new_tracks = _run_spotify_task("Spotify full backfill", _work)
+        if new_tracks is None:
+            return 0
         logger.info("Full backfill complete: %d new tracks", new_tracks)
         return new_tracks
     except Exception as exc:
@@ -484,7 +529,6 @@ def _expand_lb_track_artists(lookback_hours: int = 24, max_artists: int = 50) ->
     from datetime import timedelta
     from src.db import get_session
     from src.models import Track, Source, SourceType
-    from src.ingestion.scraper import SpotifyScraper
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
     with get_session() as session:
@@ -510,42 +554,47 @@ def _expand_lb_track_artists(lookback_hours: int = 24, max_artists: int = 50) ->
 
     logger.info("LB artist expansion: resolving %d new artists via Spotify", len(new_artist_names))
 
-    try:
-        scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
-        sp = scraper.sp
-    except Exception as exc:
-        logger.warning("LB artist expansion: cannot init Spotify client: %s", exc)
-        return
+    def _work() -> None:
+        from src.ingestion.scraper import SpotifyScraper
 
-    total_new_tracks = 0
-    expanded = 0
-    for name in new_artist_names:
         try:
-            search_resp = sp.search(q=f'artist:"{name}"', type="artist", limit=1)
+            scraper = SpotifyScraper(client_id=SPOTIFY_CLIENT_ID)
+            sp = scraper.sp
         except Exception as exc:
-            logger.debug("LB artist expansion: search failed for %r: %s", name, exc)
-            continue
-        items = ((search_resp or {}).get("artists") or {}).get("items") or []
-        if not items:
-            logger.debug("LB artist expansion: no Spotify match for %r", name)
-            continue
-        artist = items[0]
-        artist_id = artist.get("id")
-        artist_name = artist.get("name") or name
-        if not artist_id:
-            continue
-        try:
-            with get_session() as session:
-                added = scraper.expand_artist_discography(session, artist_id, artist_name)
-            total_new_tracks += added
-            expanded += 1
-        except Exception as exc:
-            logger.warning("LB artist expansion: expand_artist_discography(%r) failed: %s", artist_name, exc)
+            logger.warning("LB artist expansion: cannot init Spotify client: %s", exc)
+            return
 
-    logger.info(
-        "LB artist expansion complete: expanded %d/%d artists, %d new tracks queued",
-        expanded, len(new_artist_names), total_new_tracks,
-    )
+        total_new_tracks = 0
+        expanded = 0
+        for name in new_artist_names:
+            try:
+                search_resp = sp.search(q=f'artist:"{name}"', type="artist", limit=1)
+            except Exception as exc:
+                logger.debug("LB artist expansion: search failed for %r: %s", name, exc)
+                continue
+            items = ((search_resp or {}).get("artists") or {}).get("items") or []
+            if not items:
+                logger.debug("LB artist expansion: no Spotify match for %r", name)
+                continue
+            artist = items[0]
+            artist_id = artist.get("id")
+            artist_name = artist.get("name") or name
+            if not artist_id:
+                continue
+            try:
+                with get_session() as session:
+                    added = scraper.expand_artist_discography(session, artist_id, artist_name)
+                total_new_tracks += added
+                expanded += 1
+            except Exception as exc:
+                logger.warning("LB artist expansion: expand_artist_discography(%r) failed: %s", artist_name, exc)
+
+        logger.info(
+            "LB artist expansion complete: expanded %d/%d artists, %d new tracks queued",
+            expanded, len(new_artist_names), total_new_tracks,
+        )
+
+    _run_spotify_task("ListenBrainz artist expansion", _work)
 
 def db_backup() -> Optional[str]:
     """Run pg_dump and prune old backups."""
@@ -754,6 +803,26 @@ def probe_spotify_token() -> None:
         logger.warning("Spotify token probe failed: %s", exc)
 
 
+def refresh_spotify_token_if_expired(max_age_hours: float = 0) -> dict:
+    """Refresh the Spotify cache when missing, expired, or below a caller threshold.
+
+    This is the startup/request-path companion to the hourly early-warning
+    probe. It prevents a reboot from running Spotify sync against an expired
+    cache, without refreshing on every dashboard status poll.
+    """
+    try:
+        from src.ingestion.spotify_auth import probe_token
+        result = probe_token(refresher=_default_token_refresher, max_age_hours=max_age_hours)
+        if result.get("refreshed"):
+            logger.info("Spotify token cache refreshed by freshness probe.")
+        elif result.get("degraded"):
+            logger.warning("[TOKEN_WARN] Spotify token refresh failed during freshness probe: %s", result)
+        return result
+    except Exception as exc:
+        logger.warning("Spotify token freshness-refresh probe failed: %s", exc)
+        return {"present": False, "hours_left": None, "degraded": True, "refreshed": False}
+
+
 def _default_token_refresher() -> bool:
     """Silent Spotify token refresh via the token endpoint.
 
@@ -916,7 +985,3 @@ def _record_run_complete(run_id: Optional[int] = None, downloaded: int = 0, fail
                     logger.debug("run-summary webhook skipped: %s", exc)
     except Exception as exc:
         logger.warning("Could not record run completion: %s", exc)
-
-
-
-
