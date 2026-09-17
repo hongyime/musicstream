@@ -13,3 +13,5 @@
 2026-09-02: Added robustness sweep for daemon operations. Decision: manual Spotify controls return job IDs/status instead of blocking, stale DOWNLOADING rows are requeued on a scheduler, deep health includes DB-backed download liveness, and health snapshots are written to JSONL/latest files.
 2026-09-02: Hardened Plex self-heal port selection. Decision: automatic PLEX_HOST_PORT rewrites are gated by PLEX_HOST_PORT_AUTO_FALLBACK so conservative installs fail loudly, while the live host can opt into hands-off fallback.
 - 2026-09-10: Portfolio review preserves the existing self-hosted pipeline. Recheck runtime placement and measured load before tuning UI polling or connection pools; no provider jobs or backup pruning were triggered.
+
+- 2026-09-16: Baseline review batch-a. No open issues/PRs. Mature codebase (341+ tests), self-hosted, no Vercel/Supabase surface. Deps pinned appropriately. No fixes required — routine heartbeat only.
