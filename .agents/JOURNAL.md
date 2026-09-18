@@ -15,3 +15,9 @@
 - 2026-09-10: Portfolio review preserves the existing self-hosted pipeline. Recheck runtime placement and measured load before tuning UI polling or connection pools; no provider jobs or backup pruning were triggered.
 
 - 2026-09-16: Baseline review batch-a. No open issues/PRs. Mature codebase (341+ tests), self-hosted, no Vercel/Supabase surface. Deps pinned appropriately. No fixes required — routine heartbeat only.
+
+
+2026-09-18 — Applied A/B/C/D to musicstream daemon after diagnosing 16h-uptime FastAPI socket stall (RSS 502/512 MiB, endpoint hung, Docker healthcheck too loose to detect). A: Windows scheduled task nightly `docker restart musicstream-daemon` at 04:00. B: compose healthcheck 60s/3→20s/2 with curl -m 5. C: .env MAX_CONCURRENT_WORKERS 8→4 (reverting the 2026-08-25 speed push that wasn't paying off — 17 successes/24h anyway). D: tracemalloc opt-in via TRACEMALLOC_ENABLED=1, hourly dump to logs/tracemalloc.jsonl, gated because Python 3.14 + 10 frames + heavy imports hung the daemon in first attempt. All verified: daemon healthy, endpoint 200, MAX_CONCURRENT=4 in downloader logs.
+
+
+2026-09-18 (2) — Throughput + memory + leak-hunt second pass. DB shows 45/50 last-24h attempts were tier0_librespot rate_limited; Phase 1 was starving Phase 2. Fixes: LIBRESPOT_SWEEP_CONCURRENT=true (parallel Phase 1/2), LIBRESPOT_SWEEP_MAX_SECONDS=1800 (env-configurable via downloader.py change), download_pipeline cron daily→every 4h. Memory limit 512M→1024M — 4 yt-dlp workers + concurrent Phase 1 blew past 512 MiB in 13 min. Baseline tracemalloc dump moved to asyncio.to_thread (was blocking the health endpoint). Ephemeral pytest run: 329 pass / 3 fail / 4 error — all failures are pre-existing pytest-asyncio plugin loss (not caused by this pass). Neighbours: nebula-sync healthy now, pihole logs report host load 47-60 on 8 vCPU (WSL2 systemic, not musicstream). Committed to main.

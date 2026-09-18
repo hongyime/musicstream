@@ -186,19 +186,33 @@ services:
     # Audit #31: cap memory so a runaway tagger / ffmpeg loop OOMs the
     # daemon container without taking the whole host with it.  Tune to
     # taste — 2G is generous given typical ingestion working sets.
+    # 2026-09-18: bumped 512M -> 1G.  With 257k pending tracks + 4 yt-dlp
+    # workers + ffmpeg subprocesses + LIBRESPOT_SWEEP_CONCURRENT running
+    # Phase 1 in parallel with Phase 2, RSS reached 503/512 MiB (98%) in
+    # 13 min from cold boot and starved the FastAPI /health endpoint.
+    # 1 GiB gives real headroom for the yt-dlp + ffmpeg working set while
+    # still capping the runaway blast radius.  Watch tracemalloc.jsonl for
+    # the actual leak (this bump is a workaround, not the root cause).
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 1024M
     depends_on:
       postgres:
         condition: service_healthy
+    # 2026-09-18: tightened from interval=60s/retries=3/timeout=10s.  A 16h
+    # uptime run had the FastAPI socket hung while APScheduler jobs kept
+    # running; Docker didn't mark unhealthy for over an hour because 60s x 3
+    # retries is too loose.  20s interval + 2 retries = unhealthy within ~40s.
+    # start_period bumped 30s -> 60s to cover DB init + migrations on cold boot.
+    # -m 5 caps curl at 5s so a hung socket fails the probe instead of stalling
+    # inside the 5s timeout window.
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:9079/health"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
+      test: ["CMD", "curl", "-sf", "-m", "5", "http://localhost:9079/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 2
+      start_period: 60s
 
 volumes:
   postgres_data:

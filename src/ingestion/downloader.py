@@ -454,7 +454,7 @@ class DownloadOrchestrator:
         self,
         session: Session,
         per_track_timeout: float = 90.0,
-        max_seconds: float = 7200.0,
+        max_seconds: float = 0.0,
     ) -> tuple[int, int]:
         """
         Single-worker librespot pre-sweep: every pending track gets a genuine
@@ -466,10 +466,16 @@ class DownloadOrchestrator:
             join with this timeout.  Prevents one hung connection blocking the sweep.
           max_seconds — total budget for the whole sweep.  Stops early so the
             12-worker batch + spotdl sweep still run in the same cycle.
+            Default 0 means: read LIBRESPOT_SWEEP_MAX_SECONDS env (default 7200s).
+            2026-09-18: made env-configurable so a rate-limited librespot phase
+            can be capped short (30 min) instead of eating the whole 2h window
+            while the yt-dlp batch waits.
 
         Returns:
             (downloaded, failed) counts.
         """
+        if max_seconds <= 0:
+            max_seconds = float(os.environ.get("LIBRESPOT_SWEEP_MAX_SECONDS", "7200"))
         if not LIBRESPOT_AVAILABLE:
             logger.info("librespot not available; skipping pre-sweep.")
             return 0, 0

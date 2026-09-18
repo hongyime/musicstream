@@ -234,6 +234,33 @@ async def lifespan(app: FastAPI):
     # lifetime, not just the brief window between import and uvicorn boot.
     _configure_logging()
 
+    # D (2026-09-18): tracemalloc leak instrumentation, post-import so the
+    # heavy FastAPI/SQLAlchemy/spotipy import graph isn't traced (it thrashes
+    # for 6+ min with any non-trivial frame depth on Python 3.14).  Default
+    # off; flip TRACEMALLOC_ENABLED=1 in .env to hunt a leak.  3 frames is
+    # cheap and still enough to attribute an allocation to its call site.
+    if os.environ.get("TRACEMALLOC_ENABLED", "0").lower() in ("1", "true", "yes", "on"):
+        import tracemalloc
+        if not tracemalloc.is_tracing():
+            tracemalloc.start(int(os.environ.get("TRACEMALLOC_FRAMES", "3")))
+            logger.info("tracemalloc: started with %d frames", int(os.environ.get("TRACEMALLOC_FRAMES", "3")))
+        # Baseline snapshot right after startup so we have a t=0 point to diff
+        # subsequent hourly snapshots against.  Deferred to a background task
+        # so lifespan doesn't block on it (dump does file I/O + iteration).
+        # 2026-09-18 fix: dump runs in a thread — tracemalloc.take_snapshot()
+        # iterates every traced allocation and can take multi-second CPU under
+        # load; keeping it in the asyncio event loop starves the FastAPI
+        # /health endpoint and marks the daemon unhealthy under heavy startup.
+        async def _initial_tracemalloc_baseline() -> None:
+            await asyncio.sleep(3)  # let scheduler come up first
+            try:
+                await asyncio.to_thread(_tracemalloc_dump)
+            except Exception:
+                pass
+        _tm_base = asyncio.create_task(_initial_tracemalloc_baseline())
+        _background_tasks.add(_tm_base)
+        _tm_base.add_done_callback(_background_tasks.discard)
+
     # Step 1 & 2: DB + migrations
     logger.info("Initializing DB and running migrations...")
     try:
@@ -272,6 +299,12 @@ async def lifespan(app: FastAPI):
             logger.info("Shutdown drain: reset %d in-flight DOWNLOADING row(s) -> PENDING", drained)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Shutdown drain reset failed: %s", exc)
+    # D (2026-09-18): one final tracemalloc dump so we capture the peak
+    # state right before restart clears it.  Cheap; ~10ms.
+    try:
+        _tracemalloc_dump()
+    except Exception:
+        pass
     scheduler.shutdown()
 
 async def _background_startup():
@@ -688,6 +721,62 @@ async def _health_snapshot_loop():
         await asyncio.sleep(interval)
 
 
+def _tracemalloc_dump() -> None:
+    """
+    Append one JSON entry to /app/logs/tracemalloc.jsonl with the current
+    top-15 memory allocators (grouped by lineno) plus the process RSS.
+
+    D (2026-09-18): added to investigate the 16h daemon uptime bloat where
+    RSS grew from ~126 MiB to ~502 MiB (98% of the 512 MiB limit) and
+    starved the FastAPI HTTP server.  Reads /proc/self/status for RSS so
+    we don't shell out.  No-op if tracemalloc isn't tracing (env var
+    TRACEMALLOC_ENABLED=0 at process launch).
+    """
+    import tracemalloc
+    if not tracemalloc.is_tracing():
+        return
+    try:
+        snap = tracemalloc.take_snapshot().filter_traces((
+            tracemalloc.Filter(False, tracemalloc.__file__),
+            tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
+            tracemalloc.Filter(False, "<frozen importlib._bootstrap_external>"),
+        ))
+        top = snap.statistics("lineno")[:15]
+        rss_kb = 0
+        try:
+            with open("/proc/self/status") as _fh:
+                for _line in _fh:
+                    if _line.startswith("VmRSS:"):
+                        rss_kb = int(_line.split()[1])
+                        break
+        except Exception:
+            pass  # Non-Linux container — RSS just stays 0.
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "rss_mib": round(rss_kb / 1024, 1),
+            "top": [
+                {
+                    "size_mib": round(s.size / 1024 / 1024, 3),
+                    "count": s.count,
+                    "loc": str(s.traceback[0]),
+                }
+                for s in top
+            ],
+        }
+        dump_path = Path("/app/logs/tracemalloc.jsonl")
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        with dump_path.open("a") as _fh:
+            _fh.write(json.dumps(entry) + "\n")
+        logger.info(
+            "tracemalloc dump: RSS=%.1f MiB, top1=%s (%.2f MiB)",
+            entry["rss_mib"],
+            entry["top"][0]["loc"] if entry["top"] else "n/a",
+            entry["top"][0]["size_mib"] if entry["top"] else 0.0,
+        )
+    except Exception as exc:  # noqa: BLE001 — instrumentation must never crash the daemon
+        logger.warning("tracemalloc dump failed: %s", exc)
+
+
 def _register_scheduler_jobs():
     # misfire_grace_time=3600 — if the daemon was down at the scheduled
     # tick (e.g. we recreated the container past 04:00 SGT), APScheduler
@@ -699,7 +788,12 @@ def _register_scheduler_jobs():
     scheduler.add_job(tasks.spotify_saved_albums_sync, "cron", hour="*/6", id="saved_albums_sync", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.spotify_followed_artists_sync, "cron", day_of_week="sun", hour=6, id="followed_artists_sync", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.spotify_liked_artists_expand, "cron", hour=2, id="liked_artists_expand", replace_existing=True, misfire_grace_time=GRACE)  # LIKED_ARTISTS_EXPAND_V1
-    scheduler.add_job(tasks.full_download_pipeline, "cron", hour=3, id="download_pipeline", replace_existing=True, misfire_grace_time=GRACE)
+    # 2026-09-18: pipeline runs 4x/day (03:00, 07:00, 11:00, 15:00, 19:00, 23:00 SGT)
+    # instead of once daily.  DB shows only ~60 attempts/24h with the daily
+    # schedule because Phase 1 (librespot serial + 10s pace) burns most of the
+    # cycle rate-limited.  With LIBRESPOT_SWEEP_CONCURRENT=true + shorter
+    # librespot budget, 4-hourly runs let the yt-dlp batch process real volume.
+    scheduler.add_job(tasks.full_download_pipeline, "cron", hour="*/4", id="download_pipeline", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.requeue_stale_downloads, "interval", minutes=15, id="stale_download_requeue", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.listenbrainz_discovery, "cron", hour=4, id="lb_discovery", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.full_integrity_check, "cron", day_of_week="wed,sun", hour=5, id="integrity_check", replace_existing=True, misfire_grace_time=GRACE)
@@ -713,6 +807,10 @@ def _register_scheduler_jobs():
     scheduler.add_job(tasks.discover_weekly_task, "cron", day_of_week="mon", hour=6, id="discover_weekly", replace_existing=True, misfire_grace_time=GRACE)
     # Self-heal: keep yt-dlp fresh so YouTube tiers never rot again (§W3 ops).
     scheduler.add_job(tasks.update_ytdlp, "cron", hour=7, id="ytdlp_update", replace_existing=True, misfire_grace_time=GRACE)
+    # D (2026-09-18): hourly tracemalloc dump to logs/tracemalloc.jsonl so we
+    # can attribute the 16h RSS bloat to specific call sites.  No-op if
+    # tracemalloc wasn't started (env var TRACEMALLOC_ENABLED=0).
+    scheduler.add_job(_tracemalloc_dump, "interval", hours=1, id="tracemalloc_dump", replace_existing=True, misfire_grace_time=GRACE)
 
 def _lb_discovery_overdue() -> bool:
     """
