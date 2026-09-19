@@ -47,3 +47,8 @@ mypy==2.1.0
 pytest==9.1.0
 hypothesis==6.155.2
 pytest-cov==7.1.0
+# 2026-09-18: reinstate pytest-asyncio.  Was silently lost from the image
+# in some rebuild; STATE 2026-09-02 shows 341 tests passing, now 7 tests
+# fail/error with 'Unknown pytest.mark.asyncio' (3 in test_daemon_robustness,
+# 4 in test_integration_endpoints).  pytest 9 needs pytest-asyncio >=0.24.
+pytest-asyncio==0.26.0

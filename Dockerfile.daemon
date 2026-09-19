@@ -115,7 +115,12 @@ EXPOSE 9079
 # tini reaps zombies (yt-dlp / spotdl spawn many short-lived children)
 # and forwards SIGTERM so lifespan shutdown actually runs.  Our wrapper
 # script then drops to non-root before exec'ing uvicorn.
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
+# -g forwards signals to the child's whole process GROUP, not just the
+# direct child.  Needed so `docker kill --signal=SIGUSR1` (on-demand
+# tracemalloc dump) reaches the uvicorn Python process through the
+# entrypoint-script -> gosu -> uvicorn exec chain; without -g the signal
+# stops at the intermediate shell/gosu layer and the dump never fires.
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/docker-entrypoint.sh"]
 
 # --workers 1 is REQUIRED — see header comment.
 CMD ["uvicorn", "src.daemon:app", "--host", "0.0.0.0", "--port", "9079", "--workers", "1"]

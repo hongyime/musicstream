@@ -9,6 +9,7 @@ import logging
 import logging.handlers
 import os
 import secrets as _secrets
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -260,6 +261,35 @@ async def lifespan(app: FastAPI):
         _tm_base = asyncio.create_task(_initial_tracemalloc_baseline())
         _background_tasks.add(_tm_base)
         _tm_base.add_done_callback(_background_tasks.discard)
+
+        # 2026-09-18: on-demand tracemalloc snapshot via SIGUSR1.  Hourly cron
+        # is too slow when hunting a leak that grows in 10-15 min.  Trigger
+        # from host with:
+        #     docker kill --signal=SIGUSR1 musicstream-daemon
+        # tini as PID 1 forwards SIGUSR1 to the Python process.  We spawn a
+        # dedicated daemon thread per signal rather than routing through
+        # loop.run_in_executor — under heavy host load the shared default
+        # executor (used by every asyncio.to_thread call) can be saturated by
+        # the 11 worker threads, so an executor-queued dump may never run.  A
+        # fresh thread always fires.  threading is already imported at module
+        # top.
+        try:
+            import signal
+            _loop = asyncio.get_running_loop()
+            def _on_sigusr1() -> None:
+                try:
+                    threading.Thread(
+                        target=_tracemalloc_dump,
+                        name="tracemalloc-sigusr1",
+                        daemon=True,
+                    ).start()
+                except Exception:  # noqa: BLE001 — signal handler must never crash
+                    pass
+            _loop.add_signal_handler(signal.SIGUSR1, _on_sigusr1)
+            logger.info("SIGUSR1 handler registered for tracemalloc dumps")
+        except (NotImplementedError, ValueError, AttributeError) as exc:
+            # add_signal_handler is Unix-only; on Windows dev boxes just skip.
+            logger.info("SIGUSR1 tracemalloc handler unavailable: %s", exc)
 
     # Step 1 & 2: DB + migrations
     logger.info("Initializing DB and running migrations...")
