@@ -186,6 +186,7 @@ scheduler = BackgroundScheduler(timezone=TIMEZONE)
 _start_time = time.time()
 _background_tasks: set = set()  # Strong refs to fire-and-forget tasks; asyncio only holds weakrefs and will GC unsupervised tasks mid-flight.
 _manual_jobs: dict[str, dict[str, Any]] = {}
+_tracemalloc_dump_lock = threading.Lock()
 
 # ── Credential permission audit ───────────────────────────────────────────────
 
@@ -262,34 +263,28 @@ async def lifespan(app: FastAPI):
         _background_tasks.add(_tm_base)
         _tm_base.add_done_callback(_background_tasks.discard)
 
-        # 2026-09-18: on-demand tracemalloc snapshot via SIGUSR1.  Hourly cron
-        # is too slow when hunting a leak that grows in 10-15 min.  Trigger
-        # from host with:
-        #     docker kill --signal=SIGUSR1 musicstream-daemon
-        # tini as PID 1 forwards SIGUSR1 to the Python process.  We spawn a
-        # dedicated daemon thread per signal rather than routing through
-        # loop.run_in_executor — under heavy host load the shared default
-        # executor (used by every asyncio.to_thread call) can be saturated by
-        # the 11 worker threads, so an executor-queued dump may never run.  A
-        # fresh thread always fires.  threading is already imported at module
-        # top.
-        try:
-            import signal
-            _loop = asyncio.get_running_loop()
-            def _on_sigusr1() -> None:
-                try:
-                    threading.Thread(
-                        target=_tracemalloc_dump,
-                        name="tracemalloc-sigusr1",
-                        daemon=True,
-                    ).start()
-                except Exception:  # noqa: BLE001 — signal handler must never crash
-                    pass
-            _loop.add_signal_handler(signal.SIGUSR1, _on_sigusr1)
-            logger.info("SIGUSR1 handler registered for tracemalloc dumps")
-        except (NotImplementedError, ValueError, AttributeError) as exc:
-            # add_signal_handler is Unix-only; on Windows dev boxes just skip.
-            logger.info("SIGUSR1 tracemalloc handler unavailable: %s", exc)
+    # The loop callback can safely start a thread; a raw signal handler cannot.
+    # Keep RSS diagnostics available without enabling expensive heap tracing.
+    try:
+        import signal
+        _loop = asyncio.get_running_loop()
+        def _on_sigusr1() -> None:
+            logger.info("SIGUSR1 received for memory dump")
+            if _tracemalloc_dump_lock.locked():
+                logger.info("Memory dump already in progress; signal coalesced")
+                return
+            try:
+                threading.Thread(
+                    target=_tracemalloc_dump,
+                    name="tracemalloc-sigusr1",
+                    daemon=True,
+                ).start()
+            except RuntimeError as exc:
+                logger.warning("Cannot start memory dump thread: %s", exc)
+        _loop.add_signal_handler(signal.SIGUSR1, _on_sigusr1)
+        logger.info("SIGUSR1 handler registered for memory dumps")
+    except (NotImplementedError, ValueError, AttributeError, OSError) as exc:
+        logger.info("SIGUSR1 memory handler unavailable: %s", exc)
 
     # Step 1 & 2: DB + migrations
     logger.info("Initializing DB and running migrations...")
@@ -759,19 +754,19 @@ def _tracemalloc_dump() -> None:
     D (2026-09-18): added to investigate the 16h daemon uptime bloat where
     RSS grew from ~126 MiB to ~502 MiB (98% of the 512 MiB limit) and
     starved the FastAPI HTTP server.  Reads /proc/self/status for RSS so
-    we don't shell out.  No-op if tracemalloc isn't tracing (env var
-    TRACEMALLOC_ENABLED=0 at process launch).
+    we don't shell out. With tracing disabled, write only RSS and process
+    identity; null heap totals explicitly indicate that no heap was traced.
     """
     import tracemalloc
-    if not tracemalloc.is_tracing():
+    if not _tracemalloc_dump_lock.acquire(blocking=False):
         return
     try:
-        snap = tracemalloc.take_snapshot().filter_traces((
-            tracemalloc.Filter(False, tracemalloc.__file__),
-            tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
-            tracemalloc.Filter(False, "<frozen importlib._bootstrap_external>"),
-        ))
-        top = snap.statistics("lineno")[:15]
+        started = time.monotonic()
+        sampled_at = datetime.now(timezone.utc).isoformat()
+        sampled_uptime = round(time.time() - _start_time, 1)
+        tracing = tracemalloc.is_tracing()
+        traced, traced_peak = tracemalloc.get_traced_memory() if tracing else (None, None)
+        tracer = tracemalloc.get_tracemalloc_memory() if tracing else None
         rss_kb = 0
         try:
             with open("/proc/self/status") as _fh:
@@ -779,11 +774,28 @@ def _tracemalloc_dump() -> None:
                     if _line.startswith("VmRSS:"):
                         rss_kb = int(_line.split()[1])
                         break
-        except Exception:
+        except (OSError, ValueError):
             pass  # Non-Linux container — RSS just stays 0.
+
+        # Filtering every trace copies the snapshot and can thrash a full cgroup.
+        # Group first, then exclude the same leaf filenames from the small stats list.
+        top = []
+        if tracing:
+            excluded = {tracemalloc.__file__, "<frozen importlib._bootstrap>", "<frozen importlib._bootstrap_external>"}
+            snap = tracemalloc.take_snapshot()
+            stats = snap.statistics("lineno")
+            del snap
+            top = [stat for stat in stats if stat.traceback[0].filename not in excluded][:15]
         entry = {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": sampled_at,
+            "pid": os.getpid(),
+            "uptime_s": sampled_uptime,
             "rss_mib": round(rss_kb / 1024, 1),
+            "tracing_enabled": tracing,
+            "traced_mib": round(traced / 1024 / 1024, 1) if traced is not None else None,
+            "traced_peak_mib": round(traced_peak / 1024 / 1024, 1) if traced_peak is not None else None,
+            "tracer_mib": round(tracer / 1024 / 1024, 1) if tracer is not None else None,
+            "duration_ms": round((time.monotonic() - started) * 1000, 1),
             "top": [
                 {
                     "size_mib": round(s.size / 1024 / 1024, 3),
@@ -793,18 +805,24 @@ def _tracemalloc_dump() -> None:
                 for s in top
             ],
         }
-        dump_path = Path("/app/logs/tracemalloc.jsonl")
+        dump_path = Path(LOG_DIR / "tracemalloc.jsonl")
         dump_path.parent.mkdir(parents=True, exist_ok=True)
         with dump_path.open("a") as _fh:
             _fh.write(json.dumps(entry) + "\n")
         logger.info(
-            "tracemalloc dump: RSS=%.1f MiB, top1=%s (%.2f MiB)",
+            "Memory dump: pid=%d RSS=%.1f MiB traced=%s MiB tracer=%s MiB duration=%.1f ms, top1=%s (%.2f MiB)",
+            entry["pid"],
             entry["rss_mib"],
+            entry["traced_mib"],
+            entry["tracer_mib"],
+            entry["duration_ms"],
             entry["top"][0]["loc"] if entry["top"] else "n/a",
             entry["top"][0]["size_mib"] if entry["top"] else 0.0,
         )
     except Exception as exc:  # noqa: BLE001 — instrumentation must never crash the daemon
         logger.warning("tracemalloc dump failed: %s", exc)
+    finally:
+        _tracemalloc_dump_lock.release()
 
 
 def _register_scheduler_jobs():
@@ -837,9 +855,7 @@ def _register_scheduler_jobs():
     scheduler.add_job(tasks.discover_weekly_task, "cron", day_of_week="mon", hour=6, id="discover_weekly", replace_existing=True, misfire_grace_time=GRACE)
     # Self-heal: keep yt-dlp fresh so YouTube tiers never rot again (§W3 ops).
     scheduler.add_job(tasks.update_ytdlp, "cron", hour=7, id="ytdlp_update", replace_existing=True, misfire_grace_time=GRACE)
-    # D (2026-09-18): hourly tracemalloc dump to logs/tracemalloc.jsonl so we
-    # can attribute the 16h RSS bloat to specific call sites.  No-op if
-    # tracemalloc wasn't started (env var TRACEMALLOC_ENABLED=0).
+    # Hourly RSS history is cheap; allocation details require opt-in heap tracing.
     scheduler.add_job(_tracemalloc_dump, "interval", hours=1, id="tracemalloc_dump", replace_existing=True, misfire_grace_time=GRACE)
 
 def _lb_discovery_overdue() -> bool:
@@ -880,7 +896,7 @@ def _self_heal_lb_discovery_if_overdue():
 # ── API Routes ────────────────────────────────────────────────────────────────
 
 @app.get("/health", include_in_schema=False)
-async def health():
+def health():
     """Audit #32: liveness probe used by Docker healthcheck + uptime checks.
 
     Intentionally unauthenticated — Docker's HEALTHCHECK and external

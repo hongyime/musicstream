@@ -1,6 +1,9 @@
+import asyncio
 import subprocess
 from collections.abc import AsyncIterator
+from contextlib import contextmanager
 from pathlib import Path
+from threading import Event
 from unittest.mock import Mock
 
 import pytest
@@ -104,3 +107,27 @@ async def test_mutation_requires_auth(
     headers = {"Authorization": authorization} if authorization else {}
     response = await api_client.post("/admin/cleanup-invalid-tracks", headers=headers)
     assert response.status_code == status
+
+
+async def test_slow_health_probe_does_not_block_other_routes(
+    api_client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = Event()
+    release = Event()
+
+    @contextmanager
+    def slow_session():
+        entered.set()
+        release.wait(5)
+        yield Mock()
+
+    monkeypatch.setattr("src.db.get_session", slow_session)
+    health_request = asyncio.create_task(api_client.get("/health"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        response = await api_client.get("/api/artwork-report")
+        assert response.status_code == 200
+        assert not health_request.done(), "DB probe must not stall the ASGI loop"
+    finally:
+        release.set()
+        await health_request
