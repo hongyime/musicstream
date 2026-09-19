@@ -215,3 +215,23 @@ A-lib   : q='bohem' returns matching page; artist/format/status filters compose;
 ## §W3.E Env
 
 Update `.env.example` in the same PR as T15/T17/T19 (new vars listed in §W3.I). No new third-party API keys required — WEBHOOK_URL is a self-created Discord/ntfy URL.
+
+## §V Operational regression guards
+
+- V14: Automated endpoint integration tests use isolated test storage and the real ASGI routes without launching the production daemon, running migrations, loading live credentials, or reserving a fixed port.
+- V15: At most one tracemalloc snapshot is processed at a time across baseline, scheduled and signal triggers; exclusions operate on aggregated statistics, not a duplicate per-allocation snapshot.
+- V16: A blocked database health probe must leave the ASGI event loop available for other routes and signal callbacks; synchronous DB work runs in a worker thread.
+- V17: Running Alembic in the daemon process must not disable its diagnostic logger.
+- V18: RSS history and SIGUSR1 dumps remain available with heap tracing disabled, without allocating a tracemalloc snapshot.
+
+Diagnostic JSONL contract: `ts` and `rss_mib` describe the sample before snapshot processing; `pid` and `uptime_s` identify its process lifetime; `traced_mib`, `traced_peak_mib` and `tracer_mib` distinguish the total tracked heap from profiler overhead. `top` contains up to 15 non-profiler leaf locations and is never a total-heap measurement. With `tracing_enabled=false`, heap totals are null and `top` is empty; RSS monitoring continues. Heap tracing remains opt-in via `TRACEMALLOC_ENABLED`.
+
+## §B Bugs (backprop)
+
+| ID | Bug | Root cause | Guard |
+|---|---|---|---|
+| B1 | Four endpoint tests fail waiting for daemon startup | Route tests inherited live DB/migrations, fixed-port startup and undrained child pipes; increasing retries retained the dependency. | V14; `test_endpoint_fixture_avoids_external_startup` plus HTTP/auth/validation checks |
+| B2 | Diagnostic dumps stall and memory attribution is misleading | Per-trace filtering copies/scans snapshots under memory pressure, triggers may overlap, and flat top-15 values were mistaken for total heap stability. | V15; `tests/test_memory_diagnostics.py` and process/heap telemetry contract |
+| B3 | Slow health probes also delay SIGUSR1 dispatch | An async health route performed blocking SQLAlchemy calls on the event-loop thread. | V16; `test_slow_health_probe_does_not_block_other_routes` |
+| B4 | Signal receipts and dump progress disappear from logs | Alembic fileConfig disabled existing loggers, including musicstream.daemon. | V17; `test_migrations_preserve_daemon_diagnostic_logging` |
+| B5 | Monitoring RSS requires a high-overhead profiler | Both signal registration and dump output were gated on heap tracing. | V18; untraced RSS/dispatch tests in `tests/test_memory_diagnostics.py` |
