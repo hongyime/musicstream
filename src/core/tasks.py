@@ -13,6 +13,7 @@ logger = logging.getLogger("musicstream.daemon")
 # ── Resilience Helpers ────────────────────────────────────────────────────────
 
 _SPOTIFY_TASK_LOCK = threading.Lock()
+_DOWNLOAD_PIPELINE_LOCK = threading.Lock()
 
 
 def _spotify_task_min_token_hours() -> float:
@@ -360,13 +361,13 @@ def get_download_liveness(
     success_cutoff = now - timedelta(hours=hours)
 
     with get_session() as session:
-        pending = session.query(func.count(Track.id)).filter(
+        pending = session.query(func.count()).select_from(Track).filter(
             Track.status == TrackStatus.PENDING.value
         ).scalar() or 0
-        downloading = session.query(func.count(Track.id)).filter(
+        downloading = session.query(func.count()).select_from(Track).filter(
             Track.status == TrackStatus.DOWNLOADING.value
         ).scalar() or 0
-        stale_downloading = session.query(func.count(Track.id)).filter(
+        stale_downloading = session.query(func.count()).select_from(Track).filter(
             Track.status == TrackStatus.DOWNLOADING.value,
             or_(
                 Track.heartbeat_at < stale_cutoff,
@@ -554,8 +555,12 @@ def _log_burn_rate() -> None:
 
 def download_pipeline(run_id: Optional[int] = None) -> tuple[int, int]:
     """Run the download pipeline for all pending tracks. Returns (downloaded, failed)."""
-    logger.info("Running download pipeline…")
+    # Startup runs outside APScheduler's per-job max_instances protection.
+    if not _DOWNLOAD_PIPELINE_LOCK.acquire(blocking=False):
+        logger.info("Download pipeline skipped: another pipeline is already running.")
+        return 0, 0
     try:
+        logger.info("Running download pipeline…")
         # P0-1 (defense-in-depth): clear rows stranded in DOWNLOADING by a
         # crashed prior run before claiming new work. 30-min cutoff
         # (all_rows=False) so a scheduled run overlapping a still-running
@@ -618,6 +623,8 @@ def download_pipeline(run_id: Optional[int] = None) -> tuple[int, int]:
     except Exception as exc:
         logger.error("Download pipeline failed: %s", exc, exc_info=True)
         return 0, 0
+    finally:
+        _DOWNLOAD_PIPELINE_LOCK.release()
 
 def listenbrainz_discovery() -> None:
     """Run ListenBrainz discovery and Plex playlist sync."""
