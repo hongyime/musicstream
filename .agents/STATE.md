@@ -1,5 +1,14 @@
 # STATE
 
+## 2026-09-22 — restore outage and resolve health timeouts (in progress)
+- User requested resolution of remaining operational failures; all work is text-only (no images or screenshots sent to models/agents).
+- Daemon and Plex are stopped with exit 137, not OOM. Docker refuses restart because `/run/desktop/mnt/host/c` is stale; daemon logs show `OSError: [Errno 5] Input/output error` on log files. Nightly restart at 04:00 failed (task result 1).
+- Confirmed filesystem boundary: Docker Desktop's `/mnt/host/c` returns I/O error, while Ubuntu WSL's `/mnt/c/musicstream/logs` is readable and Windows C: has ample free space. Docker Desktop engine remains running; PostgreSQL and scrobbler are healthy. Investigating a targeted drive-share repair before considering a disruptive engine restart.
+- Mount repaired without engine restart: mounted a fresh DrvFS C: connection, detached the stale share, rebound the healthy share with shared propagation, and removed the temporary mountpoint. Docker's C: aliases now resolve. Daemon and Plex start; idle `/health` returned 200 in 0.29s and downloads resumed.
+- Remaining latency reproduced under concurrent dashboard reads: statistics timed out at 10s, deep health at 15s, and concurrent shallow health at 5s; burn-rate returned 200 in 3.98s. Pure synchronous SQLAlchemy route bodies declared `async def` still block the loop; statistics also performs five separate counts. Fix contract: blocking DB routes leave health responsive, stats performs one aggregate query with identical counts (including empty/other statuses), then rerun concurrent live requests.
+- Regression proof: 11 failures before patch (10 blocking routes and 5-vs-1 stats queries), then 23/23 endpoint tests pass in the pinned Linux image; lint/compile/LSP checks pass. Code now lets FastAPI run pure blocking DB routes in its worker pool and groups status counts once. Deploying via the existing nightly restart task, then full-suite/concurrent-live verification.
+- Preserve existing auto-state/journal edits and untracked `docker_ports.txt`. Background exploration remains unavailable because its configured model is missing; proceeding with direct text diagnostics.
+
 ## 2026-09-19 — endpoint/dump fixes; memory diagnosis corrected
 - Read Kiro's full session and completed its interrupted changes. Code commits: `2ef08ae` endpoint isolation, `47dbe80` migration logging, `32ee72e` reliable memory diagnostics/health threading; these are pushed to main. Preserve untracked `docker_ports.txt`.
 - Endpoint tests use the real ASGI routes with temporary SQLite and HTTPX ASGITransport. No live DB, migrations, fixed port, daemon subprocess or credential loading. Includes auth/validation checks and a held-DB regression proving other routes remain responsive. Production migrations remain unconditional.
@@ -26,12 +35,12 @@
 <!-- MOLT_AUTO_START -->
 ## Auto State
 
-- Updated: 2026-08-25 12:05:19 +08:00
+- Updated: 2026-09-19 23:08:24 +08:00
 - Machine: PRAWN-L390
 - Harness: claude
 - Event: stop
 - Branch: main
-- HEAD: b6d031c
+- HEAD: 0dde9eb
 - Dirty files: 1
 - Resume hint: Read .agents/STATE.md, then the latest file in .agents/handoffs/ if present.
 <!-- MOLT_AUTO_END -->

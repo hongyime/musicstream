@@ -223,6 +223,10 @@ Update `.env.example` in the same PR as T15/T17/T19 (new vars listed in §W3.I).
 - V16: A blocked database health probe must leave the ASGI event loop available for other routes and signal callbacks; synchronous DB work runs in a worker thread.
 - V17: Running Alembic in the daemon process must not disable its diagnostic logger.
 - V18: RSS history and SIGUSR1 dumps remain available with heap tracing disabled, without allocating a tracemalloc snapshot.
+- V19: Blocking SQLAlchemy route bodies run off the ASGI event loop; a held database call on any such route must leave `/health` responsive.
+- V20: Dashboard track statistics use one grouped row-count query, preserving empty-library and all-status totals; row counts must permit the existing status index to serve them.
+- V21: Startup and scheduled download passes share one process-wide nonblocking guard; an overlapping pass creates no additional downloader, and completion or failure releases the guard.
+- V22: Successful-attempt time lookups used by deep health and burn rate have a partial timestamp index; queries must avoid scanning the full attempt history.
 
 Diagnostic JSONL contract: `ts` and `rss_mib` describe the sample before snapshot processing; `pid` and `uptime_s` identify its process lifetime; `traced_mib`, `traced_peak_mib` and `tracer_mib` distinguish the total tracked heap from profiler overhead. `top` contains up to 15 non-profiler leaf locations and is never a total-heap measurement. With `tracing_enabled=false`, heap totals are null and `top` is empty; RSS monitoring continues. Heap tracing remains opt-in via `TRACEMALLOC_ENABLED`.
 
@@ -235,3 +239,6 @@ Diagnostic JSONL contract: `ts` and `rss_mib` describe the sample before snapsho
 | B3 | Slow health probes also delay SIGUSR1 dispatch | An async health route performed blocking SQLAlchemy calls on the event-loop thread. | V16; `test_slow_health_probe_does_not_block_other_routes` |
 | B4 | Signal receipts and dump progress disappear from logs | Alembic fileConfig disabled existing loggers, including musicstream.daemon. | V17; `test_migrations_preserve_daemon_diagnostic_logging` |
 | B5 | Monitoring RSS requires a high-overhead profiler | Both signal registration and dump output were gated on heap tracing. | V18; untraced RSS/dispatch tests in `tests/test_memory_diagnostics.py` |
+| B6 | Dashboard reads freeze health requests | Ten synchronous-I/O handlers were declared async, and statistics executed five separate counts. | V19/V20; held-DB route cases and mixed/empty statistics tests |
+| B7 | Scheduled passes multiply download workers | APScheduler's per-job limit did not cover the independently launched startup pipeline. | V21; serial/concurrent overlap and failure-release tests |
+| B8 | Deep health scans historical attempts on every probe | Successful-attempt timestamps lacked an index for range counts and latest-success lookup. | V22; query-plan tests and migration 0007 |
