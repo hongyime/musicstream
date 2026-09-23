@@ -18,9 +18,11 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Table,
+    text,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -228,6 +230,13 @@ class DownloadAttempt(Base):
     """Audit record for every individual tier attempt made for a track download."""
 
     __tablename__ = "download_attempts"
+    __table_args__ = (
+        Index(
+            "idx_download_attempts_success_at", "attempted_at",
+            postgresql_where=text("success IS TRUE"),
+            sqlite_where=text("success IS TRUE"),
+        ),
+    )
 
     id:           Mapped[int]      = mapped_column(Integer, primary_key=True)
     track_id:     Mapped[int]      = mapped_column(Integer, ForeignKey("tracks.id", ondelete="CASCADE"), nullable=False)
