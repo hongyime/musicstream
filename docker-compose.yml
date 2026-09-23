@@ -7,6 +7,8 @@ services:
     # server's own client (16.4 psql errored: "invalid command \restrict").
     image: postgres:16.13-alpine
     container_name: musicstream-postgres
+    # Favor the control-plane DB under contention from background stacks.
+    cpu_shares: 4096
     environment:
       POSTGRES_DB: musicstream
       POSTGRES_USER: musicstream
@@ -106,6 +108,7 @@ services:
       context: .
       dockerfile: Dockerfile.daemon
     container_name: musicstream-daemon
+    cpu_shares: 4096
     env_file:
       - .env
     volumes:
@@ -125,17 +128,8 @@ services:
     environment:
       - TZ=Asia/Singapore
       - PYTHONUNBUFFERED=1
-      # 2026-09-18 LEAK FIX: cap glibc malloc arenas.  tracemalloc showed RSS
-      # grew +802 MiB (187 -> 989 MiB) over 13h while the Python-tracked heap
-      # stayed flat at ~2.5 MiB — proof the growth is native/glibc, not Python
-      # objects.  glibc defaults to 8*nCPU arenas (up to 64 on this 8-vCPU
-      # host); with 11 daemon threads churning yt-dlp/ffmpeg/librespot work,
-      # freed memory gets stranded across dozens of per-arena free lists and
-      # never returned to the OS.  MALLOC_ARENA_MAX=2 forces contention onto a
-      # couple of arenas (throughput cost is negligible for our I/O-bound
-      # workload), and MALLOC_TRIM_THRESHOLD_=100000 makes glibc madvise-return
-      # freed chunks >100 KB instead of hoarding them.  Standard remedy for
-      # Python-in-container RSS creep.
+      # Bound native allocator retention; total heap and profiler overhead
+      # must be measured separately (top-15 allocations are not total heap).
       - MALLOC_ARENA_MAX=2
       - MALLOC_TRIM_THRESHOLD_=100000
       - DATABASE_URL=postgresql://musicstream:${POSTGRES_PASSWORD}@postgres:5432/musicstream
@@ -218,12 +212,12 @@ services:
     # running; Docker didn't mark unhealthy for over an hour because 60s x 3
     # retries is too loose.  20s interval + 2 retries = unhealthy within ~40s.
     # start_period bumped 30s -> 60s to cover DB init + migrations on cold boot.
-    # -m 5 caps curl at 5s so a hung socket fails the probe instead of stalling
-    # inside the 5s timeout window.
+    # The HTTP request remains bounded independently of Docker exec startup.
     healthcheck:
       test: ["CMD", "curl", "-sf", "-m", "5", "http://localhost:9079/health"]
       interval: 20s
-      timeout: 5s
+      # Keep the HTTP deadline at 5s while allowing Docker exec startup overhead.
+      timeout: 15s
       retries: 2
       start_period: 60s
 
