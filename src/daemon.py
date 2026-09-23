@@ -949,16 +949,24 @@ async def health_timeline(limit: int = 50):
 
 
 @app.get("/api/musicstream/stats", response_model=ApiResponse[TrackStats])
-async def get_stats():
+def get_stats():
     from src.db import get_session
     from src.models import Track
+    from sqlalchemy import func
     try:
         with get_session() as session:
-            total = session.query(Track).count()
-            dl = session.query(Track).filter(Track.status == "downloaded").count()
-            pend = session.query(Track).filter(Track.status == "pending").count()
-            fail = session.query(Track).filter(Track.status.in_(["failed", "failed_validation", "timed_out"])).count()
-            active = session.query(Track).filter(Track.status == "downloading").count()
+            counts: dict[str, int] = dict(
+                session.query(Track.status, func.count())
+                .group_by(Track.status)
+                .all()
+            )
+            total = sum(counts.values())
+            dl = counts.get("downloaded", 0)
+            pend = counts.get("pending", 0)
+            fail = sum(counts.get(status, 0) for status in (
+                "failed", "failed_validation", "timed_out",
+            ))
+            active = counts.get("downloading", 0)
             
             stats = TrackStats(
                 total_tracks=total,
@@ -973,7 +981,7 @@ async def get_stats():
         return ApiResponse(error=str(e))
 
 @app.get("/api/musicstream/burn-rate")
-async def get_burn_rate():
+def get_burn_rate():
     """P2-7: download throughput + ETA. Surfaces downloads/hr (from successful
     attempts) and projected completion for the pending backlog so the operator
     can see whether the queue is converging and judge whether throughput is the
@@ -1014,7 +1022,7 @@ async def get_burn_rate():
         return ApiResponse(error=str(e))
 
 @app.get("/api/musicstream/tracks")
-async def get_tracks(status: str = "pending", limit: int = 100):
+def get_tracks(status: str = "pending", limit: int = 100):
     from src.db import get_session
     from src.models import Track
     try:
@@ -1039,7 +1047,7 @@ async def get_tracks(status: str = "pending", limit: int = 100):
         return ApiResponse(error=str(e))
 
 @app.get("/api/musicstream/metrics")
-async def get_metrics():
+def get_metrics():
     from src.db import get_session
     from src.models import DownloadAttempt
     from sqlalchemy import func
@@ -1164,7 +1172,7 @@ async def trigger_integrity():
     return ApiResponse(data={"queued": True})
 
 @app.post("/api/musicstream/tracks/reset-failed", dependencies=[Depends(require_auth)])
-async def reset_failed():
+def reset_failed():
     from src.db import get_session
     try:
         with get_session() as session:
@@ -1175,7 +1183,7 @@ async def reset_failed():
         return ApiResponse(error=str(e))
 
 @app.post("/api/musicstream/tracks/{track_id}/block", dependencies=[Depends(require_auth)])
-async def block_track_endpoint(track_id: int):
+def block_track_endpoint(track_id: int):
     """§W3 T13: quarantine a track (inert everywhere until unblocked)."""
     from src.db import get_session
     try:
@@ -1189,7 +1197,7 @@ async def block_track_endpoint(track_id: int):
         return ApiResponse(error=str(e))
 
 @app.post("/api/musicstream/tracks/{track_id}/unblock", dependencies=[Depends(require_auth)])
-async def unblock_track_endpoint(track_id: int):
+def unblock_track_endpoint(track_id: int):
     """§W3 T13: release a quarantined track back to PENDING."""
     from src.db import get_session
     try:
@@ -1203,7 +1211,7 @@ async def unblock_track_endpoint(track_id: int):
         return ApiResponse(error=str(e))
 
 @app.post("/api/musicstream/upgrade-pass", dependencies=[Depends(require_auth)])
-async def upgrade_pass_endpoint():
+def upgrade_pass_endpoint():
     """§W3 T20: requeue sub-cutoff MP3s so the next download pass upgrades them."""
     from src.db import get_session
     try:
@@ -1215,7 +1223,7 @@ async def upgrade_pass_endpoint():
         return ApiResponse(error=str(e))
 
 @app.post("/api/musicstream/discover-weekly", dependencies=[Depends(require_auth)])
-async def discover_weekly_endpoint():
+def discover_weekly_endpoint():
     """§W3 T21–T23: fetch LB weekly playlists, resolve, queue missing, export m3u."""
     from src.db import get_session
     try:
@@ -1230,7 +1238,7 @@ async def discover_weekly_endpoint():
         return ApiResponse(error=str(e))
 
 @app.get("/api/musicstream/library")
-async def library(
+def library(
     q: str | None = None,
     artist: str | None = None,
     album: str | None = None,

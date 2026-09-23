@@ -1,6 +1,6 @@
 import asyncio
 import subprocess
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Event
@@ -9,10 +9,10 @@ from unittest.mock import Mock
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import Session, sessionmaker
 
-from src.models import Base
+from src.models import Base, Track
 
 TEST_TOKEN = "test_token_123"
 pytestmark = pytest.mark.asyncio
@@ -109,25 +109,89 @@ async def test_mutation_requires_auth(
     assert response.status_code == status
 
 
+@pytest.mark.parametrize("route", [
+    ("GET", "/health"),
+    ("GET", "/api/musicstream/stats"),
+    ("GET", "/api/musicstream/burn-rate"),
+    ("GET", "/api/musicstream/tracks"),
+    ("GET", "/api/musicstream/metrics"),
+    ("GET", "/api/musicstream/library"),
+    ("POST", "/api/musicstream/tracks/reset-failed"),
+    ("POST", "/api/musicstream/tracks/1/block"),
+    ("POST", "/api/musicstream/tracks/1/unblock"),
+    ("POST", "/api/musicstream/upgrade-pass"),
+    ("POST", "/api/musicstream/discover-weekly"),
+])
 async def test_slow_health_probe_does_not_block_other_routes(
-    api_client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
+    api_client: AsyncClient, monkeypatch: pytest.MonkeyPatch, route: tuple[str, str],
 ) -> None:
+    from src.db import get_session
+
     entered = Event()
     release = Event()
 
     @contextmanager
-    def slow_session():
-        entered.set()
-        release.wait(5)
-        yield Mock()
+    def slow_session() -> Iterator[Session]:
+        if not entered.is_set():
+            entered.set()
+            release.wait(5)
+        with get_session() as session:
+            yield session
 
     monkeypatch.setattr("src.db.get_session", slow_session)
-    health_request = asyncio.create_task(api_client.get("/health"))
+    monkeypatch.setattr(
+        "src.discovery.discover_weekly.DiscoverWeekly",
+        Mock(return_value=Mock(run=Mock(return_value={}))),
+    )
+    method, path = route
+    blocked_request = asyncio.create_task(
+        api_client.request(method, path, headers=get_headers()),
+    )
     try:
         assert await asyncio.to_thread(entered.wait, 10)
-        response = await api_client.get("/api/artwork-report")
+        response = await api_client.get("/health")
         assert response.status_code == 200
-        assert not health_request.done(), "DB probe must not stall the ASGI loop"
+        assert not blocked_request.done(), f"{path} blocked health on the ASGI loop"
     finally:
         release.set()
-        await health_request
+        await blocked_request
+
+
+async def test_stats_counts_mixed_statuses_in_one_query(
+    api_client: AsyncClient,
+) -> None:
+    import src.db as db
+
+    statuses = [
+        "downloaded", "downloaded", "pending", "failed",
+        "failed_validation", "timed_out", "downloading", "not_found",
+    ]
+    with db.get_session() as session:
+        session.add_all([
+            Track(spotify_uri=f"test:stats:{index}", title="Test", artist="Test",
+                  status=status)
+            for index, status in enumerate(statuses)
+        ])
+    assert db._engine is not None
+    query_observer = Mock()
+    event.listen(db._engine, "before_cursor_execute", query_observer)
+    try:
+        response = await api_client.get("/api/musicstream/stats")
+    finally:
+        event.remove(db._engine, "before_cursor_execute", query_observer)
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "total_tracks": 8, "downloaded": 2, "pending": 1,
+        "failed": 3, "active": 1, "progress_pct": 25.0,
+    }
+    assert query_observer.call_count == 1, "Dashboard stats must use one DB round trip"
+
+
+async def test_stats_handles_empty_library(api_client: AsyncClient) -> None:
+    response = await api_client.get("/api/musicstream/stats")
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "total_tracks": 0, "downloaded": 0, "pending": 0,
+        "failed": 0, "active": 0, "progress_pct": 0.0,
+    }
