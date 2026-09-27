@@ -43,3 +43,5 @@ Machine-specific values in this document use privacy placeholders.
 2026-09-27: Added explicit standalone development Compose configuration with mounted backend reload and frontend development services, isolated development data, and GHCR publishing with guarded retention. Local configuration and static checks passed. Image builds, full-stack runtime, and live CI publication remain unverified; no commit/push.
 
 2026-09-27: User authorized maintenance publication, bounded runtime tests and database migration after backup. Current upstream state was retained while resolving documentation-only merge conflicts.
+
+- 2026-09-27: Separate existing development requirement group from production; validate the published image dependency inventory and package visibility in CI.

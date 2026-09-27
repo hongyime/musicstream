@@ -173,3 +173,8 @@ Machine-specific values in this document use privacy placeholders.
 2026-09-27: Added explicit standalone development Compose configuration with mounted backend reload and frontend development services, isolated development data, and GHCR publishing with guarded retention. Local configuration and static checks passed. Image builds, full-stack runtime, and live CI publication remain unverified; no commit/push.
 
 2026-09-27: Publication is being prepared from the current remote main. Reviewed development, portability and privacy changes are isolated from the original checkout; runtime smoke and initial image CI verification are in progress.
+
+
+## 2026-09-27: Production dependency isolation
+
+The first publisher and cleanup run succeeded. Follow-up separates the existing Dev tools section during dependency installation: production omits test/type/lint tools while development installs them explicitly. CI pulls and inspects the exact production image in a disposable container to verify package exclusion. Source-mounted development commands are unchanged. Package visibility is verified separately because new GHCR packages default to private.
