@@ -19,8 +19,6 @@ logs/
 downloads/
 data/
 temp/
-plex/
-scrobbler/
 
 # Frontend build artifacts (we build these in the Dockerfile)
 frontend/dist/
