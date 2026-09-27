@@ -80,7 +80,7 @@ RUN groupadd --gid 1000 musicstream \
 # Install Python dependencies as root (needed for system site-packages),
 # then transfer ownership of /app to the runtime user.
 COPY requirements.txt .
-RUN sed '/^[Pp][Yy][Tt][Ee][Ss][Tt]/d' requirements.txt > /tmp/runtime-requirements.txt \
+RUN sed '/^# Dev tools/,$d' requirements.txt > /tmp/runtime-requirements.txt \
     && pip install --no-cache-dir -r /tmp/runtime-requirements.txt \
     && pip install --no-cache-dir yt-dlp-ejs==0.8.0 \
     # yt-dlp breaks against YouTube changes every few weeks — always build
@@ -88,7 +88,8 @@ RUN sed '/^[Pp][Yy][Tt][Ee][Ss][Tt]/d' requirements.txt > /tmp/runtime-requireme
     && pip install --no-cache-dir --upgrade yt-dlp
 
 FROM dependencies AS dev
-RUN pip install --no-cache-dir watchfiles==1.3.0 \
+RUN sed -n '/^# Dev tools/,$p' requirements.txt > /tmp/dev-requirements.txt \
+    && pip install --no-cache-dir -r /tmp/dev-requirements.txt watchfiles==1.3.0 \
     && mkdir -p /app/data /app/logs /app/backups /app/temp /media \
     && chown -R musicstream:musicstream /app /media
 USER musicstream
