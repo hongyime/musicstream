@@ -13,22 +13,11 @@ echo   MUSICSTREAM SETUP - One-time initialisation
 echo ============================================================
 echo.
 
-:: Elevation check
-net session >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [WARN] Not running as Administrator.
-    echo        Firewall configuration will be skipped.
-    echo        Re-run as Administrator to configure firewall rules.
-    echo.
-    set ADMIN=0
-) else (
-    set ADMIN=1
-)
 
 :: ============================================================
-:: STEP 1/10 - Check prerequisites
+:: STEP 1/8 - Check prerequisites
 :: ============================================================
-echo [STEP 1/10] Checking prerequisites...
+echo [STEP 1/8] Checking prerequisites...
 echo.
 
 :: Python 3.12+
@@ -59,17 +48,6 @@ if %errorlevel% neq 0 (
 )
 echo [OK]   Docker Desktop is running.
 
-:: Tailscale
-tailscale ip -4 >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [WARN] Tailscale not found or not connected.
-    echo        Install from https://tailscale.com/download/windows
-    echo        TAILSCALE_IP will need to be set manually in .env
-    set TAILSCALE_IP=127.0.0.1
-) else (
-    for /f %%i in ('tailscale ip -4 2^>nul') do set TAILSCALE_IP=%%i
-    echo [OK]   Tailscale connected. IP: !TAILSCALE_IP!
-)
 
 :: FFmpeg
 ffmpeg -version >nul 2>&1
@@ -92,7 +70,7 @@ if %errorlevel% neq 0 (
 )
 
 echo.
-echo [STEP 1/10] Prerequisites check complete.
+echo [STEP 1/8] Prerequisites check complete.
 echo.
 
 :: ============================================================
@@ -110,9 +88,9 @@ echo [OK]   Python dependencies installed.
 echo.
 
 :: ============================================================
-:: STEP 2/10 - Configure .env
+:: STEP 2/8 - Configure .env
 :: ============================================================
-echo [STEP 2/10] Configuring .env...
+echo [STEP 2/8] Configuring .env...
 echo.
 
 if exist ".env" (
@@ -126,10 +104,6 @@ call :read_env LISTENBRAINZ_TOKEN
 call :read_env LISTENBRAINZ_USERNAME
 call :read_env POSTGRES_PASSWORD
 call :read_env EXTERNAL_MEDIA_DRIVE
-call :read_env PLEX_CLAIM_TOKEN
-call :read_env PLEX_USERNAME
-call :read_env PLEX_TOKEN
-call :read_env PLEX_LIBRARY_SECTION_ID
 call :read_env ACOUSTID_API_KEY
 
 echo SPOTIFY_CLIENT_ID
@@ -181,39 +155,6 @@ if not "!INPUT!"=="" set EXTERNAL_MEDIA_DRIVE=!INPUT!
 set INPUT=
 echo.
 
-echo PLEX_CLAIM_TOKEN
-echo   Get from: https://www.plex.tv/claim/ (valid for 4 minutes)
-if defined PLEX_CLAIM_TOKEN echo   Current: !PLEX_CLAIM_TOKEN!
-set /p "INPUT=  Enter value (Enter to keep): "
-if not "!INPUT!"=="" set PLEX_CLAIM_TOKEN=!INPUT!
-set INPUT=
-echo.
-
-echo PLEX_USERNAME
-echo   Your Plex account username or email
-if defined PLEX_USERNAME echo   Current: !PLEX_USERNAME!
-set /p "INPUT=  Enter value (Enter to keep): "
-if not "!INPUT!"=="" set PLEX_USERNAME=!INPUT!
-set INPUT=
-echo.
-
-echo PLEX_TOKEN
-echo   Get from: https://support.plex.tv/articles/204059436
-echo   Leave blank if Plex is not yet set up
-if defined PLEX_TOKEN echo   Current: [set]
-set /p "INPUT=  Enter value (Enter to keep): "
-if not "!INPUT!"=="" set PLEX_TOKEN=!INPUT!
-set INPUT=
-echo.
-
-echo PLEX_LIBRARY_SECTION_ID
-echo   Numeric ID of your Plex music library section (usually 1)
-if defined PLEX_LIBRARY_SECTION_ID echo   Current: !PLEX_LIBRARY_SECTION_ID!
-set /p "INPUT=  Enter value (Enter to keep): "
-if not "!INPUT!"=="" set PLEX_LIBRARY_SECTION_ID=!INPUT!
-set INPUT=
-echo.
-
 echo ACOUSTID_API_KEY
 echo   Get from: https://acoustid.org/api-key
 if defined ACOUSTID_API_KEY echo   Current: !ACOUSTID_API_KEY!
@@ -235,13 +176,6 @@ if not exist ".env" (
         echo POSTGRES_PASSWORD=!POSTGRES_PASSWORD!
         echo DATABASE_URL=postgresql://musicstream:!POSTGRES_PASSWORD!@localhost:5432/musicstream
         echo EXTERNAL_MEDIA_DRIVE=!EXTERNAL_MEDIA_DRIVE!
-        echo PLEX_CLAIM_TOKEN=!PLEX_CLAIM_TOKEN!
-        echo PLEX_USERNAME=!PLEX_USERNAME!
-        echo PLEX_TOKEN=!PLEX_TOKEN!
-        echo PLEX_LIBRARY_SECTION_ID=!PLEX_LIBRARY_SECTION_ID!
-        echo TAILSCALE_IP=!TAILSCALE_IP!
-        echo PLEX_HOST_PORT=32401
-        echo PLEX_URL=http://musicstream-plex:32400
         echo SPOTIFY_TOKEN_CACHE=/app/spotify_token.json
         echo ACOUSTID_API_KEY=!ACOUSTID_API_KEY!
     ) > .env
@@ -255,28 +189,18 @@ if not exist ".env" (
     call :patch_env POSTGRES_PASSWORD "!POSTGRES_PASSWORD!"
     call :patch_env DATABASE_URL "postgresql://musicstream:!POSTGRES_PASSWORD!@localhost:5432/musicstream"
     call :patch_env EXTERNAL_MEDIA_DRIVE "!EXTERNAL_MEDIA_DRIVE!"
-    call :patch_env PLEX_CLAIM_TOKEN "!PLEX_CLAIM_TOKEN!"
-    call :patch_env PLEX_USERNAME "!PLEX_USERNAME!"
-    call :patch_env PLEX_TOKEN "!PLEX_TOKEN!"
-    call :patch_env PLEX_LIBRARY_SECTION_ID "!PLEX_LIBRARY_SECTION_ID!"
-    call :patch_env TAILSCALE_IP "!TAILSCALE_IP!"
-    findstr /i /b /c:"PLEX_HOST_PORT=" ".env" >nul 2>&1
-    if errorlevel 1 echo PLEX_HOST_PORT=32401>> .env
-    call :patch_env PLEX_URL "http://musicstream-plex:32400"
     call :patch_env SPOTIFY_TOKEN_CACHE "/app/spotify_token.json"
     call :patch_env ACOUSTID_API_KEY "!ACOUSTID_API_KEY!"
     echo [OK]   .env patched.
 )
 echo.
-call :read_env PLEX_HOST_PORT
-if "!PLEX_HOST_PORT!"=="" set "PLEX_HOST_PORT=32401"
 
 :: ============================================================
-:: STEP 3/10 - Create directories
+:: STEP 3/8 - Create directories
 :: ============================================================
-echo [STEP 3/10] Creating directories...
+echo [STEP 3/8] Creating directories...
 
-for %%d in (backups logs "plex\config" "plex\transcode" "scrobbler\config" downloads temp) do (
+for %%d in (backups logs downloads temp) do (
     if not exist %%d (
         mkdir %%d >nul 2>&1
         echo [OK]   Created %%d
@@ -297,9 +221,9 @@ if not exist "spotify_token.json" (
 echo.
 
 :: ============================================================
-:: STEP 4/10 - Spotify OAuth (generate spotify_token.json)
+:: STEP 4/8 - Spotify OAuth (generate spotify_token.json)
 :: ============================================================
-echo [STEP 4/10] Spotify OAuth authentication...
+echo [STEP 4/8] Spotify OAuth authentication...
 echo.
 
 :: Check if token file has real content (not empty placeholder)
@@ -331,64 +255,9 @@ if !TOKEN_SIZE! gtr 10 (
 echo.
 
 :: ============================================================
-:: STEP 5/10 - Generate scrobbler config
+:: STEP 5/8 - docker-compose pull
 :: ============================================================
-echo [STEP 5/10] Generating scrobbler/config/config.yaml...
-
-(
-    echo sources:
-    echo   - name: musicstream-plex
-    echo     type: plex
-    echo     polling:
-    echo       interval: 10
-    echo     data:
-    echo       user: !PLEX_USERNAME!
-    echo       token: !PLEX_TOKEN!
-    echo.
-    echo scrobbles:
-    echo   - name: musicstream-lb
-    echo     type: listenbrainz
-    echo     data:
-    echo       token: !LISTENBRAINZ_TOKEN!
-) > scrobbler\config\config.yaml
-
-echo [OK]   scrobbler/config/config.yaml generated.
-echo.
-
-:: ============================================================
-:: STEP 6/10 - Configure Windows Defender Firewall
-:: ============================================================
-echo [STEP 6/10] Configuring Windows Defender Firewall...
-
-if "%ADMIN%"=="0" (
-    echo [SKIP] Not running as Administrator - firewall rules skipped.
-    echo        Re-run setup.bat as Administrator to configure firewall.
-    echo.
-    goto :step7
-)
-
-for /f "tokens=*" %%i in ('powershell -NoProfile -Command "Get-NetAdapter | Where-Object {$_.InterfaceDescription -like '*Tailscale*'} | Select-Object -ExpandProperty Name" 2^>nul') do set TAILSCALE_IF=%%i
-
-call :read_env PLEX_HOST_PORT
-if "!PLEX_HOST_PORT!"=="" set "PLEX_HOST_PORT=32401"
-
-if "!TAILSCALE_IF!"=="" (
-    echo [WARN] Could not detect Tailscale adapter. Allowing TCP !PLEX_HOST_PORT! on all interfaces.
-    powershell -NoProfile -Command "New-NetFirewallRule -DisplayName 'Plex TCP !PLEX_HOST_PORT!' -Direction Inbound -Protocol TCP -LocalPort !PLEX_HOST_PORT! -Action Allow -Profile Any -ErrorAction SilentlyContinue" >nul 2>&1
-) else (
-    echo [INFO] Tailscale adapter: !TAILSCALE_IF!
-    powershell -NoProfile -Command "Remove-NetFirewallRule -DisplayName 'Plex TCP 32400*' -ErrorAction SilentlyContinue; Remove-NetFirewallRule -DisplayName 'Plex TCP !PLEX_HOST_PORT!*' -ErrorAction SilentlyContinue" >nul 2>&1
-    powershell -NoProfile -Command "New-NetFirewallRule -DisplayName 'Plex TCP !PLEX_HOST_PORT! Tailscale Allow' -Direction Inbound -Protocol TCP -LocalPort !PLEX_HOST_PORT! -Action Allow -InterfaceAlias '!TAILSCALE_IF!' -Profile Any" >nul 2>&1
-    powershell -NoProfile -Command "New-NetFirewallRule -DisplayName 'Plex TCP !PLEX_HOST_PORT! Block Others' -Direction Inbound -Protocol TCP -LocalPort !PLEX_HOST_PORT! -Action Block -Profile Any" >nul 2>&1
-    echo [OK]   Firewall: TCP !PLEX_HOST_PORT! allowed on Tailscale, blocked elsewhere.
-)
-echo.
-
-:step7
-:: ============================================================
-:: STEP 7/10 - docker-compose pull
-:: ============================================================
-echo [STEP 7/10] Pulling Docker images...
+echo [STEP 5/8] Pulling Docker images...
 docker-compose pull
 if %errorlevel% neq 0 (
     echo [WARN] docker-compose pull reported errors. Check your internet connection.
@@ -398,9 +267,9 @@ if %errorlevel% neq 0 (
 echo.
 
 :: ============================================================
-:: STEP 8/10 - Start postgres and run migrations
+:: STEP 6/8 - Start postgres and run migrations
 :: ============================================================
-echo [STEP 8/10] Starting PostgreSQL and running Alembic migrations...
+echo [STEP 6/8] Starting PostgreSQL and running Alembic migrations...
 
 docker-compose up -d postgres
 if %errorlevel% neq 0 (
@@ -438,9 +307,9 @@ echo [OK]   Alembic migrations complete.
 echo.
 
 :: ============================================================
-:: STEP 9/10 - Validate .gitignore
+:: STEP 7/8 - Validate .gitignore
 :: ============================================================
-echo [STEP 9/10] Validating .gitignore...
+echo [STEP 7/8] Validating .gitignore...
 
 set GITIGNORE_OK=1
 for %%e in (.env backups/ logs/ downloads/ temp/ *.sql cookies.txt spotify_token.json) do (
@@ -459,22 +328,19 @@ if "%GITIGNORE_OK%"=="1" (
 echo.
 
 :: ============================================================
-:: STEP 10/10 - Done
+:: STEP 8/8 - Done
 :: ============================================================
-echo [STEP 10/10] Setup complete!
+echo [STEP 8/8] Setup complete!
 echo.
 echo ============================================================
 echo   MUSICSTREAM SETUP - Complete
 echo ============================================================
 echo.
-echo   Tailscale IP : !TAILSCALE_IP!
-echo   Plex URL     : http://!TAILSCALE_IP!:!PLEX_HOST_PORT!/web
 echo   Daemon API   : http://localhost:9079/health
 echo.
 echo   Next steps:
 echo     1. Run startup.bat to start the full stack
-echo     2. Open Plex at http://!TAILSCALE_IP!:!PLEX_HOST_PORT!/web to finish setup
-echo     3. Daemon will sync Spotify automatically every 15 minutes
+echo     2. Daemon will sync Spotify automatically every 15 minutes
 echo.
 echo   Useful commands:
 echo     startup.bat              - Day-to-day operations menu

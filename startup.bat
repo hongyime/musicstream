@@ -3,12 +3,6 @@ setlocal enabledelayedexpansion
 
 title MUSICSTREAM OPERATIONS
 set "PSQL=docker exec musicstream-postgres psql -X -U musicstream -d musicstream -v ON_ERROR_STOP=1 -P pager=off"
-set "PLEX_HOST_PORT=32401"
-if exist ".env" (
-    for /f "usebackq tokens=1,* delims==" %%a in (".env") do (
-        if /I "%%a"=="PLEX_HOST_PORT" set "PLEX_HOST_PORT=%%b"
-    )
-)
 
 if /I "%~1"=="status" (
     set "NONINTERACTIVE=1"
@@ -84,8 +78,6 @@ timeout /t 15 /nobreak >nul
 echo.
 echo --- Health ---
 curl -sf http://localhost:9079/health 2>nul && echo. || echo [WARN] Daemon not yet up - check logs with option 5
-curl -sf http://localhost:%PLEX_HOST_PORT%/identity >nul 2>&1 && echo [OK] Plex up on :%PLEX_HOST_PORT% || echo [WARN] Plex not yet up on :%PLEX_HOST_PORT%
-curl -sf http://localhost:9078/health >nul 2>&1 && echo [OK] Scrobbler up || echo [WARN] Scrobbler not yet up
 goto opt1_done
 
 :opt1_fail
@@ -111,13 +103,6 @@ curl -s http://localhost:9079/health 2>nul || echo [DOWN] Daemon not responding
 echo.
 echo --- Last 5 runs ---
 curl -s http://localhost:9079/status 2>nul
-echo.
-echo --- Plex ---
-curl -s -o nul -w "HTTP %%{http_code}" http://localhost:%PLEX_HOST_PORT%/identity 2>nul
-echo  on :%PLEX_HOST_PORT%
-echo.
-echo --- Scrobbler ---
-curl -s http://localhost:9078/health 2>nul || echo [DOWN] Scrobbler not responding
 echo.
 pause
 goto menu

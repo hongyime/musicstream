@@ -20,15 +20,12 @@ $Script:LogDir = Join-Path $Script:Root "logs"
 $Script:LogPath = Join-Path $Script:LogDir "self_heal.log"
 $Script:StatePath = Join-Path $Script:LogDir "self_heal_state.json"
 $Script:LastPath = Join-Path $Script:LogDir "self_heal_last.json"
-$Script:EnvPath = Join-Path $Script:Root ".env"
 $Script:TaskName = "SelfHeal"
 $Script:TaskPath = "\Musicstream\"
 
 $Script:Services = @(
-    @{ Name = "postgres";  Container = "musicstream-postgres"  },
-    @{ Name = "plex";      Container = "musicstream-plex"      },
-    @{ Name = "scrobbler"; Container = "musicstream-scrobbler" },
-    @{ Name = "daemon";    Container = "musicstream-daemon"    }
+    @{ Name = "postgres"; Container = "musicstream-postgres" },
+    @{ Name = "daemon";   Container = "musicstream-daemon"   }
 )
 
 function Initialize-LogDir {
@@ -140,279 +137,13 @@ function Wait-DockerReady {
     throw "Docker engine did not become ready within $TimeoutSeconds seconds."
 }
 
-function Get-EnvFileValue {
-    param(
-        [Parameter(Mandatory = $true)][string]$Name,
-        [string]$Default = ""
-    )
-
-    if (-not (Test-Path -LiteralPath $Script:EnvPath)) {
-        return $Default
-    }
-
-    $escaped = [regex]::Escape($Name)
-    foreach ($line in [System.IO.File]::ReadLines($Script:EnvPath)) {
-        if ($line -match "^\s*#") {
-            continue
-        }
-        if ($line -match "^\s*$escaped\s*=(.*)$") {
-            $value = $Matches[1].Trim()
-            if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
-                $value = $value.Substring(1, $value.Length - 2)
-            }
-            return $value
-        }
-    }
-
-    return $Default
-}
-
-function Set-EnvFileValue {
-    param(
-        [Parameter(Mandatory = $true)][string]$Name,
-        [Parameter(Mandatory = $true)][string]$Value
-    )
-
-    $lines = New-Object System.Collections.Generic.List[string]
-    if (Test-Path -LiteralPath $Script:EnvPath) {
-        foreach ($line in Get-Content -LiteralPath $Script:EnvPath) {
-            [void]$lines.Add($line)
-        }
-    }
-
-    $escaped = [regex]::Escape($Name)
-    $replaced = $false
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -notmatch "^\s*#" -and $lines[$i] -match "^\s*$escaped\s*=") {
-            $lines[$i] = "$Name=$Value"
-            $replaced = $true
-            break
-        }
-    }
-
-    if (-not $replaced) {
-        [void]$lines.Add("$Name=$Value")
-    }
-
-    $encoding = New-Object System.Text.UTF8Encoding $false
-    [System.IO.File]::WriteAllLines($Script:EnvPath, $lines, $encoding)
-}
-
-function Convert-ToPort {
-    param([string]$Value)
-
-    $port = 0
-    if ([int]::TryParse($Value, [ref]$port) -and $port -gt 0 -and $port -lt 65536) {
-        return $port
-    }
-    return $null
-}
-
-function Test-TruthyFlag {
-    param([string]$Value)
-
-    return $Value -match "^(1|true|yes|on)$"
-}
-
-function Test-PlexHostPortAutoFallbackEnabled {
-    if (Test-TruthyFlag -Value $env:PLEX_HOST_PORT_AUTO_FALLBACK) {
-        return $true
-    }
-    return Test-TruthyFlag -Value (Get-EnvFileValue -Name "PLEX_HOST_PORT_AUTO_FALLBACK" -Default "false")
-}
-
-function Get-PreferredPlexPort {
-    $fromProcess = Convert-ToPort $env:PLEX_HOST_PORT
-    if ($null -ne $fromProcess) {
-        return $fromProcess
-    }
-
-    $fromEnvFile = Convert-ToPort (Get-EnvFileValue -Name "PLEX_HOST_PORT" -Default "")
-    if ($null -ne $fromEnvFile) {
-        return $fromEnvFile
-    }
-
-    return 32401
-}
-
-function Get-CurrentPlexPublishedPort {
-    $result = Invoke-Docker -Arguments @("port", "musicstream-plex", "32400/tcp") -NoThrow
-    if ($result.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($result.Output)) {
-        return $null
-    }
-
-    foreach ($line in ($result.Output -split "`n")) {
-        if ($line.Trim() -match ":(\d+)$") {
-            return [int]$Matches[1]
-        }
-    }
-
-    return $null
-}
-
-function Get-PortOwnerDetails {
-    param([int]$Port)
-
-    $connections = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
-    if ($null -eq $connections) {
-        return @()
-    }
-
-    $owners = @()
-    foreach ($connection in $connections) {
-        $processName = ""
-        $processPath = ""
-        $process = Get-Process -Id $connection.OwningProcess -ErrorAction SilentlyContinue
-        if ($null -ne $process) {
-            $processName = $process.ProcessName
-            try {
-                $processPath = [string]$process.Path
-            } catch {
-                $processPath = ""
-            }
-        }
-        $owners += [pscustomobject]@{
-            port = $Port
-            pid = [int]$connection.OwningProcess
-            process_name = $processName
-            path = $processPath
-            state = [string]$connection.State
-        }
-    }
-    return $owners | Sort-Object -Property pid, process_name -Unique
-}
-
-function Format-PortOwnerDetails {
-    param($Owners)
-
-    $items = @()
-    foreach ($owner in @($Owners)) {
-        $items += ("{0}/{1}/{2}" -f $owner.pid, $owner.process_name, $owner.state)
-    }
-    return ($items -join ", ")
-}
-
-function Test-PlexHostPortPreflight {
-    param([int]$Port)
-
-    $currentPlexPort = Get-CurrentPlexPublishedPort
-    $owners = @(Get-PortOwnerDetails -Port $Port)
-    if ($null -ne $currentPlexPort -and $currentPlexPort -eq $Port) {
-        return [pscustomobject]@{
-            port = $Port
-            usable = $true
-            reason = "current-musicstream-plex"
-            owners = $owners
-            message = "Port $Port is already published by musicstream-plex."
-        }
-    }
-
-    if ($owners.Count -eq 0) {
-        return [pscustomobject]@{
-            port = $Port
-            usable = $true
-            reason = "free"
-            owners = @()
-            message = "Port $Port is free."
-        }
-    }
-
-    $names = @($owners | ForEach-Object { ([string]$_.process_name).ToLowerInvariant() })
-    $reason = "other-process"
-    if ($names | Where-Object { $_ -in @("com.docker.backend", "wslrelay") }) {
-        $reason = "docker-backend-ghost"
-    } elseif ($names | Where-Object { $_ -match "plex" }) {
-        $reason = "host-plex"
-    }
-
-    $ownerText = Format-PortOwnerDetails -Owners $owners
-    return [pscustomobject]@{
-        port = $Port
-        usable = $false
-        reason = $reason
-        owners = $owners
-        message = "Port $Port is blocked by $reason owners: $ownerText"
-    }
-}
-
-function Select-PlexHostPort {
-    param([int[]]$Exclude = @())
-
-    $preferred = Get-PreferredPlexPort
-    $autoFallback = Test-PlexHostPortAutoFallbackEnabled
-    $candidates = New-Object System.Collections.Generic.List[int]
-    [void]$candidates.Add($preferred)
-    foreach ($port in 32401..32410) {
-        [void]$candidates.Add($port)
-    }
-    [void]$candidates.Add(32400)
-
-    foreach ($port in ($candidates | Select-Object -Unique)) {
-        if ($Exclude -contains $port) {
-            if ($port -eq $preferred -and -not $autoFallback) {
-                throw "Plex host port $port failed a compose bind and automatic fallback is disabled. Set PLEX_HOST_PORT manually or set PLEX_HOST_PORT_AUTO_FALLBACK=true."
-            }
-            continue
-        }
-        $decision = Test-PlexHostPortPreflight -Port $port
-        if ($decision.usable) {
-            if ($port -ne $preferred) {
-                Write-Log "warn" ("Using fallback Plex host port {0}; preferred port {1} was unavailable." -f $port, $preferred)
-            }
-            return $port
-        }
-
-        Write-Log "warn" $decision.message
-        if ($port -eq $preferred -and -not $autoFallback) {
-            throw ("Plex host port {0} is unavailable ({1}) and automatic fallback is disabled. Set PLEX_HOST_PORT manually or set PLEX_HOST_PORT_AUTO_FALLBACK=true." -f $port, $decision.reason)
-        }
-    }
-
-    throw "No usable Plex host port found in candidate range 32401-32410 plus 32400."
-}
-
-function Ensure-PlexHostPort {
-    param([int[]]$Exclude = @())
-
-    $port = Select-PlexHostPort -Exclude $Exclude
-    $currentValue = Get-EnvFileValue -Name "PLEX_HOST_PORT" -Default ""
-    if ($currentValue -ne "$port") {
-        if (Test-PlexHostPortAutoFallbackEnabled) {
-            Set-EnvFileValue -Name "PLEX_HOST_PORT" -Value "$port"
-            Write-Log "info" "Persisted PLEX_HOST_PORT=$port in .env."
-        } else {
-            Write-Log "info" "Using PLEX_HOST_PORT=$port for this run without rewriting .env."
-        }
-    }
-    $env:PLEX_HOST_PORT = "$port"
-    return $port
-}
-
 function Start-ComposeStack {
-    $excluded = @()
-
-    for ($attempt = 1; $attempt -le 12; $attempt++) {
-        $port = Ensure-PlexHostPort -Exclude $excluded
-        Write-Log "info" "Starting musicstream Compose project with Plex host port $port."
-        $result = Invoke-Compose -Arguments @("up", "-d") -NoThrow
-        if ($result.ExitCode -eq 0) {
-            return $port
-        }
-
-        $bindFailure = $result.Output -match "ports are not available|Only one usage|bind|port is already allocated"
-        if ($bindFailure) {
-            Write-Log "warn" ("Compose bind failed on Plex host port {0}: {1}" -f $port, ($result.Output -replace "\s+", " ").Trim())
-            if (-not (Test-PlexHostPortAutoFallbackEnabled)) {
-                throw "Compose bind failed on Plex host port $port and automatic fallback is disabled. Set PLEX_HOST_PORT manually or set PLEX_HOST_PORT_AUTO_FALLBACK=true."
-            }
-            $excluded += $port
-            continue
-        }
-
-        throw ("docker compose up failed: {0}" -f $result.Output)
+    Write-Log "info" "Starting musicstream Compose project."
+    $result = Invoke-Compose -Arguments @("up", "-d") -NoThrow
+    if ($result.ExitCode -eq 0) {
+        return
     }
-
-    throw "Unable to start Compose after trying Plex fallback ports."
+    throw ("docker compose up failed: {0}" -f $result.Output)
 }
 
 function Get-ContainerState {
@@ -516,14 +247,6 @@ function Restart-ContainerWithCooldown {
     Write-Log "error" ("docker restart {0} failed: {1}" -f $Container, $result.Output)
 }
 
-function Test-PlexMaintenance {
-    $result = Invoke-Docker -Arguments @(
-        "exec", "musicstream-plex",
-        "sh", "-lc", "curl -s --max-time 5 http://localhost:32400/identity || true"
-    ) -NoThrow
-
-    return ($result.Output -match "database migrations|Maintenance")
-}
 
 function Repair-Containers {
     foreach ($service in $Script:Services) {
@@ -541,10 +264,6 @@ function Repair-Containers {
         }
 
         if ($state.Health -eq "unhealthy") {
-            if ($container -eq "musicstream-plex" -and (Test-PlexMaintenance)) {
-                Write-Log "info" "Plex is unhealthy because it is running database migrations; waiting instead of restarting it."
-                continue
-            }
             Restart-ContainerWithCooldown -Container $container -Reason "unhealthy"
         }
     }
@@ -674,7 +393,7 @@ function Get-DeepHealthSnapshot {
 }
 
 function Wait-ServiceHealth {
-    param([int]$PlexPort, [int]$TimeoutSeconds)
+    param([int]$TimeoutSeconds)
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
@@ -691,8 +410,7 @@ function Wait-ServiceHealth {
         }
 
         if ($bad.Count -eq 0 -and
-            (Test-HttpOk -Uri "http://127.0.0.1:9079/health") -and
-            (Test-HttpOk -Uri "http://127.0.0.1:$PlexPort/identity")) {
+            (Test-HttpOk -Uri "http://127.0.0.1:9079/health")) {
             Write-Log "info" "Musicstream health checks are passing."
             return $true
         }
@@ -817,7 +535,6 @@ function Repair-DaemonDeepHealth {
 function Write-LastSummary {
     param(
         [string]$Status,
-        [int]$PlexPort,
         $Snapshot,
         $DeepHealth,
         [string]$ErrorMessage = ""
@@ -827,7 +544,6 @@ function Write-LastSummary {
     [pscustomobject]@{
         checked_at = (Get-Date).ToString("o")
         status = $Status
-        plex_host_port = $PlexPort
         snapshot = $Snapshot
         deep_health = $DeepHealth
         error = $ErrorMessage
@@ -835,16 +551,15 @@ function Write-LastSummary {
 }
 
 function Invoke-SelfHeal {
-    $plexPort = 0
     $snapshot = $null
     $deepHealth = $null
 
     try {
         Write-Log "info" "Self-heal pass started."
         Wait-DockerReady -TimeoutSeconds $DockerWaitSeconds
-        $plexPort = Start-ComposeStack
+        Start-ComposeStack
         Repair-Containers
-        $healthy = Wait-ServiceHealth -PlexPort $plexPort -TimeoutSeconds $HealthWaitSeconds
+        $healthy = Wait-ServiceHealth -TimeoutSeconds $HealthWaitSeconds
         $deepHealth = Get-DeepHealthSnapshot
         Repair-DaemonDeepHealth -DeepHealth $deepHealth
         $snapshot = Get-ProgressSnapshot
@@ -855,13 +570,13 @@ function Invoke-SelfHeal {
         if ($healthy -and $null -ne $deepHealth -and $deepHealth.status -eq "ok") {
             $status = "ok"
         }
-        Write-LastSummary -Status $status -PlexPort $plexPort -Snapshot $snapshot -DeepHealth $deepHealth
+        Write-LastSummary -Status $status -Snapshot $snapshot -DeepHealth $deepHealth
         Write-Log "info" "Self-heal pass completed."
         return 0
     } catch {
         $message = $_.Exception.Message
         Write-Log "error" $message
-        Write-LastSummary -Status "error" -PlexPort $plexPort -Snapshot $snapshot -DeepHealth $deepHealth -ErrorMessage $message
+        Write-LastSummary -Status "error" -Snapshot $snapshot -DeepHealth $deepHealth -ErrorMessage $message
         return 1
     }
 }
@@ -926,7 +641,7 @@ function Register-SelfHealTask {
     $logonTrigger = New-ScheduledTaskTrigger -AtLogOn
     $startupTrigger = New-ScheduledTaskTrigger -AtStartup
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
-    $description = "Starts and repairs the Musicstream Docker Compose stack, including Plex host-port fallback."
+    $description = "Starts and repairs the Musicstream Docker Compose stack."
 
     try {
         Register-ScheduledTask -TaskName $Script:TaskName -TaskPath $Script:TaskPath -Action $action -Trigger @($startupTrigger, $logonTrigger, $repeatTrigger) -Settings $settings -Description $description -Force | Out-Null
