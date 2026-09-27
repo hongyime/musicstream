@@ -14,7 +14,7 @@
 #   - --no-install-recommends shrinks the runtime layer
 
 # --- Stage 1: Build React Frontend ---
-FROM node:26-alpine AS frontend-builder
+FROM node:26-alpine AS frontend-dependencies
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 # Use npm ci so the build fails fast on lockfile drift instead of
@@ -22,11 +22,15 @@ COPY frontend/package*.json ./
 # lockfile is present (e.g. fresh checkout in CI without a committed
 # package-lock.json) — keep this conditional rather than hard-failing.
 RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+FROM frontend-dependencies AS frontend-dev
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+
+FROM frontend-dependencies AS frontend-builder
 COPY frontend/ ./
 RUN npm run build
 
 # --- Stage 2: Python Backend ---
-FROM python:3.14-slim AS runtime
+FROM python:3.14-slim AS dependencies
 WORKDIR /app
 
 # Install system dependencies + tini (signal forwarding) + gosu (entrypoint
@@ -76,11 +80,22 @@ RUN groupadd --gid 1000 musicstream \
 # Install Python dependencies as root (needed for system site-packages),
 # then transfer ownership of /app to the runtime user.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
+RUN sed '/^[Pp][Yy][Tt][Ee][Ss][Tt]/d' requirements.txt > /tmp/runtime-requirements.txt \
+    && pip install --no-cache-dir -r /tmp/runtime-requirements.txt \
     && pip install --no-cache-dir yt-dlp-ejs==0.8.0 \
     # yt-dlp breaks against YouTube changes every few weeks — always build
     # with the freshest release, not whatever requirements.txt pinned.
     && pip install --no-cache-dir --upgrade yt-dlp
+
+FROM dependencies AS dev
+RUN pip install --no-cache-dir watchfiles==1.3.0 \
+    && mkdir -p /app/data /app/logs /app/backups /app/temp /media \
+    && chown -R musicstream:musicstream /app /media
+USER musicstream
+ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
+CMD ["uvicorn", "src.daemon:app", "--host", "0.0.0.0", "--port", "9079", "--reload", "--reload-dir", "/app/src"]
+
+FROM dependencies AS runtime
 
 # Copy backend code
 COPY . .
@@ -124,3 +139,5 @@ ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/docker-entrypoint.sh"]
 
 # --workers 1 is REQUIRED — see header comment.
 CMD ["uvicorn", "src.daemon:app", "--host", "0.0.0.0", "--port", "9079", "--workers", "1"]
+
+FROM runtime AS production

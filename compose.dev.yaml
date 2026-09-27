@@ -1,0 +1,67 @@
+# Explicit standalone development stack; never merges production data mounts.
+name: musicstream-dev
+services:
+  postgres:
+    image: postgres:16.13-alpine
+    environment:
+      POSTGRES_USER: musicstream
+      POSTGRES_PASSWORD: development
+      POSTGRES_DB: musicstream
+    volumes:
+    - dev-postgres:/var/lib/postgresql/data
+  daemon:
+    image: musicstream-dev:local
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile.daemon
+      target: dev
+    init: true
+    command: [uvicorn, src.daemon:app, --host, 0.0.0.0, --port, "9079", --reload, --reload-dir, /app/src, --reload-dir, /app/migrations]
+    env_file:
+    - path: .env.dev
+      required: false
+    environment:
+      WATCHFILES_FORCE_POLLING: 'true'
+      WATCHFILES_POLL_DELAY_MS: '500'
+      PYTHONDONTWRITEBYTECODE: '1'
+      SKIP_BACKGROUND_STARTUP: 'true'
+      DAEMON_DEV_NOAUTH: 'true'
+      DATABASE_URL: postgresql://musicstream:development@postgres:5432/musicstream
+      MEDIA_DIR: /media
+    volumes:
+    - ./src:/app/src:ro
+    - ./alembic.ini:/app/alembic.ini:ro
+    - ./migrations:/app/migrations:ro
+    - dev-data:/app/data
+    - dev-logs:/app/logs
+    - dev-backups:/app/backups
+    - dev-temp:/app/temp
+    - dev-media:/media
+    ports:
+    - 127.0.0.1:9079:9079
+    depends_on:
+    - postgres
+  frontend:
+    image: musicstream-frontend-dev:local
+    pull_policy: never
+    build:
+      context: .
+      dockerfile: Dockerfile.daemon
+      target: frontend-dev
+    init: true
+    environment:
+      DEV_API_URL: http://daemon:9079
+      CHOKIDAR_USEPOLLING: 'true'
+    volumes:
+    - ./frontend:/app/frontend
+    - /app/frontend/node_modules
+    ports:
+    - 127.0.0.1:5173:5173
+volumes:
+  dev-postgres: {}
+  dev-data: {}
+  dev-logs: {}
+  dev-backups: {}
+  dev-temp: {}
+  dev-media: {}
