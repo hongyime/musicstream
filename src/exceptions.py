@@ -44,7 +44,7 @@ class TaggingError(MusicStreamError):
 
 
 class OrganiserError(MusicStreamError):
-    """Raised when a file cannot be moved into the Plex directory structure."""
+    """Raised when a file cannot be moved into the organised directory structure."""
 
 
 # ── Integrity ──────────────────────────────────────────────────────────────────

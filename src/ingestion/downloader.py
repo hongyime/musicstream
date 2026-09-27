@@ -296,15 +296,7 @@ class DownloadOrchestrator:
         # MEDIA_DIR is the container-internal mount point (always /media).
         # EXTERNAL_MEDIA_DRIVE is the HOST path — wrong inside the container.
         media_drive = os.environ.get("MEDIA_DIR") or os.environ.get("EXTERNAL_MEDIA_DRIVE", "/media")
-        plex_url = os.environ.get("PLEX_URL", "http://localhost:32400")
-        plex_token = os.environ.get("PLEX_TOKEN", "")
-        plex_section_id = os.environ.get("PLEX_LIBRARY_SECTION_ID", "")
-        self._organiser = FileOrganiser(
-            media_drive=media_drive,
-            plex_url=plex_url,
-            plex_token=plex_token,
-            plex_section_id=plex_section_id,
-        )
+        self._organiser = FileOrganiser(media_drive=media_drive)
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -761,7 +753,7 @@ class DownloadOrchestrator:
                             exc_info=True,
                         )
 
-                    # ── Move file into Plex library (fatal: no file = no point) ─
+                    # ── Move file into media library (fatal: no file = no point) ─
                     try:
                         final_path = self._organiser.organise(path, track, session)
 

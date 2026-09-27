@@ -52,7 +52,6 @@ _VALIDATION_TARGETS = [
     "src/ingestion/tagger.py",
     "src/ingestion/organiser.py",
     "src/discovery/listenbrainz.py",
-    "src/discovery/plex_playlists.py",
     "src/integrity/checker.py",
 ]
 

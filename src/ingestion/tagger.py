@@ -865,7 +865,7 @@ class MetadataTagger:
             audio["TIT2"] = TIT2(encoding=3, text=tags.title)
         if tags.artist:
             # Split ", "-joined multi-artist string into separate ID3v2.4 values
-            # so Plex links each artist individually. Single artists unaffected.
+            # so multi-artist tagging is recognised correctly by media players. Single artists unaffected.
             artists = [a.strip() for a in tags.artist.split(", ") if a.strip()]
             audio["TPE1"] = TPE1(encoding=3, text=artists)
 
@@ -873,8 +873,8 @@ class MetadataTagger:
         album_artist = tags.album_artist or tags.artist or ""
         audio["TPE2"] = TPE2(encoding=3, text=album_artist)
 
-        # TCMP=1 marks compilation albums so Plex groups them correctly and
-        # still shows individual track artists instead of "Various Artists".
+        # TCMP=1 marks compilation albums so compilation-aware players group them correctly and
+        # still show individual track artists instead of "Various Artists".
         if album_artist.lower() == "various artists":
             audio["TCMP"] = TCMP(encoding=3, text="1")
 
@@ -910,7 +910,7 @@ class MetadataTagger:
         album_artist = tags.album_artist or tags.artist or ""
         audio["albumartist"] = [album_artist]
 
-        # COMPILATION=1 tells Plex this is a Various Artists album
+        # COMPILATION=1 marks this as a Various Artists album for compilation-aware players
         if album_artist.lower() == "various artists":
             audio["compilation"] = ["1"]
 
@@ -947,7 +947,7 @@ class MetadataTagger:
         album_artist = tags.album_artist or tags.artist or ""
         audio["aART"] = [album_artist]
 
-        # cpil=True marks compilation albums in iTunes/Plex for M4A files
+        # cpil=True marks compilation albums in iTunes and other M4A-aware players
         if album_artist.lower() == "various artists":
             audio["cpil"] = [True]
 

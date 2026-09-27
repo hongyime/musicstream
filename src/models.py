@@ -139,9 +139,6 @@ class Track(Base):
     file_size_bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     file_sha256:     Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
-    # Plex
-    plex_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-
     # Wave 3 blocklist (SPEC §W3 T12, invariant V7): blocked tracks are inert —
     # skipped by downloader, reset-failed, integrity auto-requeue and discovery ingest.
     blocked:        Mapped[bool]                = mapped_column(Boolean, nullable=False, default=False)

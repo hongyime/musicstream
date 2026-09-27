@@ -1,9 +1,9 @@
 """
-musicstream/ingestion/organiser.py — File organisation and Plex library refresh
+musicstream/ingestion/organiser.py — File organisation
 
-Moves a downloaded audio file from temp/ into the Plex-compatible directory
-structure on the external HDD, computes a SHA-256 checksum, updates the DB
-record, and triggers batched Plex library section refreshes.
+Moves a downloaded audio file from temp/ into an organised directory
+structure on the external HDD, computes a SHA-256 checksum, and updates the
+DB record.
 
 Directory structure:
     {media_drive}/{Album Artist}/{Album} ({Year})/{NN} - {Title}.{ext}
@@ -19,27 +19,17 @@ Rules:
     a numeric suffix " (2)", " (3)", … is appended to the stem until the path
     is unique.
   - SHA-256 is computed from the FINAL file at its FINAL path (not temp path).
-  - Plex refreshes are batched: first successful move refreshes immediately,
-    then refresh occurs after PLEX_REFRESH_INTERVAL_SECONDS or
-    PLEX_REFRESH_BATCH_SIZE moves.
-  - Plex refresh is triggered via:
-      GET http://{plex_url}/library/sections/{section_id}/refresh
-      with X-Plex-Token in the request header.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import os
 import re
 import shutil
-import threading
-import time
 from pathlib import Path
 from typing import Optional
 
-import requests
 from sqlalchemy.orm import Session
 
 from src.exceptions import OrganiserError
@@ -58,19 +48,14 @@ _WINDOWS_RESERVED = {
     *(f"LPT{i}" for i in range(1, 10)),
 }
 
-_DEFAULT_PLEX_REFRESH_INTERVAL_SECONDS = 300.0
-_DEFAULT_PLEX_REFRESH_BATCH_SIZE = 25
 
 
 class FileOrganiser:
-    """Moves tagged audio files into the Plex directory structure."""
+    """Moves tagged audio files into an organised directory structure."""
 
     def __init__(
         self,
         media_drive: str,
-        plex_url: str,
-        plex_token: str,
-        plex_section_id: str,
     ) -> None:
         """
         Parameters
@@ -78,44 +63,14 @@ class FileOrganiser:
         media_drive:
             Root path of the external HDD / media drive, e.g. ``/media`` or
             ``E:\\Music``.
-        plex_url:
-            Base URL of the Plex Media Server, e.g. ``http://localhost:32400``.
-            Must NOT have a trailing slash.
-        plex_token:
-            Plex authentication token (``X-Plex-Token``).
-        plex_section_id:
-            Numeric ID of the Plex music library section to refresh.
         """
         self._media_drive = media_drive.rstrip("/\\")
-        self._plex_url = plex_url.rstrip("/")
-        self._plex_token = plex_token
-        self._plex_section_id = plex_section_id
-        self._plex_refresh_interval_seconds = self._read_float_env(
-            "PLEX_REFRESH_INTERVAL_SECONDS",
-            _DEFAULT_PLEX_REFRESH_INTERVAL_SECONDS,
-        )
-        self._plex_refresh_batch_size = self._read_int_env(
-            "PLEX_REFRESH_BATCH_SIZE",
-            _DEFAULT_PLEX_REFRESH_BATCH_SIZE,
-        )
-        self._plex_refresh_lock = threading.Lock()
-        self._last_plex_refresh_at: Optional[float] = None
-        self._moves_since_plex_refresh = 0
-
-        # Build a requests.Session that puts the Plex token in the
-        # X-Plex-Token HEADER instead of the URL query string. SPEC §B15:
-        # tokens in URLs leak into proxy/access logs, container stdout when
-        # curl -v is wired up, and into Plex server access logs.
-        self._http = requests.Session()
-        if plex_token:
-            self._http.headers.update({"X-Plex-Token": plex_token})
-        self._http.headers.update({"Accept": "application/json"})
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def organise(self, temp_path: str, track: Track, session: Session) -> str:
         """
-        Move *temp_path* into the Plex directory structure.
+        Move *temp_path* into the organised directory structure.
 
         Steps:
           1. Determine the target extension from *temp_path*.
@@ -125,7 +80,6 @@ class FileOrganiser:
           5. Move the file with ``shutil.move()``.
           6. Compute SHA-256 of the final file.
           7. Update the DB record.
-          8. Trigger a Plex library refresh.
 
         Returns
         -------
@@ -234,19 +188,12 @@ class FileOrganiser:
             raise
 
         # Sidecar artwork (cover.jpg in album dir, folder.jpg in artist dir).
-        # Plex/Jellyfin/most file browsers expect these as separate JPEGs even
-        # when the audio file already has embedded artwork. Non-fatal.
+        # Most media players and file browsers expect these as separate JPEGs
+        # even when the audio file already has embedded artwork. Non-fatal.
         try:
             self._write_sidecar_artwork(final_path)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Sidecar artwork write failed (non-fatal): %s", exc)
-
-        # Trigger Plex refresh when due (non-fatal on failure). The first move
-        # refreshes immediately; following moves are batched by count/time.
-        try:
-            self._refresh_plex_if_due()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Plex refresh failed (non-fatal): %s", exc)
 
         return final_path
 
@@ -346,112 +293,10 @@ class FileOrganiser:
         except OSError as exc:
             raise OrganiserError(f"Cannot read file for SHA-256: {path!r}: {exc}") from exc
 
-    # ── Plex refresh ───────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _read_float_env(name: str, default: float) -> float:
-        value = os.environ.get(name)
-        if value is None:
-            return default
-        try:
-            parsed = float(value)
-        except ValueError:
-            logger.warning("Invalid %s=%r; using default %s", name, value, default)
-            return default
-        if parsed < 0 or not math.isfinite(parsed):
-            logger.warning("Invalid %s=%r; using default %s", name, value, default)
-            return default
-        return parsed
-
-    @staticmethod
-    def _read_int_env(name: str, default: int) -> int:
-        value = os.environ.get(name)
-        if value is None:
-            return default
-        try:
-            parsed = int(value)
-        except ValueError:
-            logger.warning("Invalid %s=%r; using default %s", name, value, default)
-            return default
-        if parsed < 1:
-            logger.warning("Invalid %s=%r; using default %s", name, value, default)
-            return default
-        return parsed
-
-    def _refresh_plex_if_due(self, now: Optional[float] = None) -> None:
-        """
-        Trigger Plex refresh for the first move, then batch later moves.
-
-        Env knobs:
-          - PLEX_REFRESH_INTERVAL_SECONDS: refresh after this many seconds.
-          - PLEX_REFRESH_BATCH_SIZE: refresh after this many successful moves.
-        """
-        now = time.monotonic() if now is None else now
-        should_refresh = False
-        skipped_moves = 0
-
-        with self._plex_refresh_lock:
-            self._moves_since_plex_refresh += 1
-
-            if self._last_plex_refresh_at is None:
-                should_refresh = True
-            else:
-                elapsed = now - self._last_plex_refresh_at
-                interval_due = elapsed >= self._plex_refresh_interval_seconds
-                batch_due = self._moves_since_plex_refresh >= self._plex_refresh_batch_size
-                should_refresh = interval_due or batch_due
-
-            if should_refresh:
-                self._last_plex_refresh_at = now
-                self._moves_since_plex_refresh = 0
-            else:
-                skipped_moves = self._moves_since_plex_refresh
-
-        if should_refresh:
-            self._refresh_plex()
-        else:
-            logger.debug(
-                "Skipping Plex refresh; %d moves since last refresh.",
-                skipped_moves,
-            )
-
-    def _refresh_plex(self) -> None:
-        """
-        Trigger a Plex library section refresh.
-
-        Sends::
-
-            GET http://{plex_url}/library/sections/{section_id}/refresh
-              with X-Plex-Token in the request HEADER (NOT the URL).
-
-        A non-2xx response is logged as a warning but does NOT raise an
-        exception — a Plex refresh failure must never abort the pipeline.
-        """
-        url = (
-            f"{self._plex_url}/library/sections/{self._plex_section_id}/refresh"
-        )
-        try:
-            # Token comes from self._http session headers, not URL params.
-            resp = self._http.get(url, timeout=10)
-            if resp.ok:
-                logger.info(
-                    "Plex library section %s refresh triggered (HTTP %s).",
-                    self._plex_section_id,
-                    resp.status_code,
-                )
-            else:
-                logger.warning(
-                    "Plex refresh returned HTTP %s: %s",
-                    resp.status_code,
-                    resp.text[:200],
-                )
-        except requests.RequestException as exc:
-            logger.warning("Plex refresh request failed: %s", exc)
-
     # ── Sidecar artwork ────────────────────────────────────────────────────────
 
     def _write_sidecar_artwork(self, audio_path: str) -> None:
-        """Extract embedded artwork from *audio_path* and write Plex-style sidecar
+        """Extract embedded artwork from *audio_path* and write sidecar
         files: ``cover.jpg`` in the album directory and ``folder.jpg`` in the
         artist directory. Existing files are not overwritten so a higher-quality
         replacement put there manually is preserved across re-runs.

@@ -627,12 +627,11 @@ def download_pipeline(run_id: Optional[int] = None) -> tuple[int, int]:
         _DOWNLOAD_PIPELINE_LOCK.release()
 
 def listenbrainz_discovery() -> None:
-    """Run ListenBrainz discovery and Plex playlist sync."""
+    """Run ListenBrainz discovery and export the m3u portable playlist."""
     logger.info("Running ListenBrainz discovery.")
     try:
         from src.db import get_session
         from src.discovery.listenbrainz import ListenBrainzDiscovery
-        from src.discovery.plex_playlists import PlexPlaylistSync
         discovery = ListenBrainzDiscovery()
         with get_session() as session:
             new_tracks = discovery.run(session)
@@ -644,10 +643,7 @@ def listenbrainz_discovery() -> None:
             except Exception as exc:
                 logger.warning("LB artist-discography expansion failed (non-fatal): %s", exc)
 
-        # §W3 T15/V8: export portable .m3u FIRST, then optional Plex push (T16).
-        now = datetime.now(timezone.utc)
-        month_name = now.strftime("%B")
-        year = now.year
+        # §W3 T15/V8: export portable .m3u playlist of newly discovered tracks.
         with get_session() as session:
             try:
                 from src.discovery.m3u_export import export_weekly_discovery
@@ -656,8 +652,6 @@ def listenbrainz_discovery() -> None:
                     logger.info("Weekly discovery m3u exported: %s", out_path)
             except Exception as exc:
                 logger.warning("m3u weekly export failed (non-fatal, V8): %s", exc)
-            plex_sync = PlexPlaylistSync()
-            plex_sync.sync_discovery_playlist(session, month=month_name, year=year)
     except Exception as exc:
         logger.error("ListenBrainz discovery failed: %s", exc, exc_info=True)
 
