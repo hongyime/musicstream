@@ -87,55 +87,6 @@ def test_backfill_exports_every_source_excluding_blocked(tmp_path, session):
     assert "drop.mp3" not in content, "blocked tracks must not leak into exports (V7)"
 
 
-def test_sync_skips_plex_when_unset_but_still_exports_m3u(tmp_path, session, monkeypatch):
-    """§W3 T16: PLEX_URL unset ⇒ zero Plex HTTP calls, m3u still written (V8)."""
-    monkeypatch.delenv("PLEX_URL", raising=False)
-
-    from src.discovery import plex_playlists as pp
-
-    calls = {"n": 0}
-
-    class _NoopHeaders:
-        def update(self, *a, **kw):
-            return None
-
-    class _BoomSession:
-        """Any HTTP GET while disabled must fail the test loudly."""
-
-        def __init__(self):
-            self.headers = _NoopHeaders()
-
-        def get(self, *a, **kw):  # pragma: no cover - must never run
-            calls["n"] += 1
-            raise AssertionError("Plex HTTP attempted while disabled")
-
-    monkeypatch.setattr(pp.requests, "Session", lambda: _BoomSession())
-
-    sync = pp.PlexPlaylistSync()
-    assert sync.enabled is False
-
-    # Seed one ingested+downloaded LB recommendation for the current week
-    from datetime import datetime, timedelta, timezone
-    from src.models import LbRecommendation
-
-    t = _downloaded(session, "lb:recording:w3x1", "Found", "New Artist", str(tmp_path / "f.mp3"))
-    rec = LbRecommendation(
-        recording_mbid="w3-mbid-x1",
-        title="Found",
-        artist="New Artist",
-        fetched_at=datetime.now(timezone.utc) - timedelta(hours=1),
-        status="ingested",
-        track_id=t.id,
-    )
-    session.add(rec)
-    session.flush()
-
-    # Must not raise despite Plex being disabled
-    sync.sync_discovery_playlist(session, month="August", year=2026)
-
-    assert calls["n"] == 0, "no Plex HTTP traffic when disabled"
-
-
 def test_container_paths_translated_to_host(tmp_path, monkeypatch):
     """DB stores /media/... container paths; m3u must carry host paths."""
     from src.discovery.m3u_export import export_playlist

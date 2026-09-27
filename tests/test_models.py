@@ -112,7 +112,7 @@ class TestTrackModel:
             "attempt_count", "last_attempt_at",
             "claimed_at", "heartbeat_at", "claim_owner", "daemon_run_id",
             "file_path", "file_size_bytes", "file_sha256",
-            "plex_verified", "created_at", "updated_at", "last_checked_at",
+            "created_at", "updated_at", "last_checked_at",
         }
         missing = required - cols
         assert not missing, f"Missing columns: {missing}"
@@ -133,10 +133,6 @@ class TestTrackModel:
         session.add(t)
         session.flush()
         assert t.status == TrackStatus.PENDING.value
-
-    def test_default_plex_verified_is_false(self, session):
-        t = _make_track(session, spotify_uri="spotify:track:plex_test")
-        assert t.plex_verified is False
 
     def test_default_cover_art_source_is_none(self, session):
         t = _make_track(session, spotify_uri="spotify:track:cover_test")

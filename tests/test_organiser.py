@@ -9,7 +9,6 @@ Covers all correctness properties from the spec:
   - _resolve_collision(): no collision, same-track collision, different-track collision,
                           multiple collisions
   - organise(): file moved, DB updated, sha256 from final path (P3, P5)
-  - _refresh_plex(): correct URL constructed
 """
 from __future__ import annotations
 
@@ -19,7 +18,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -50,12 +49,7 @@ def session(engine):
 
 
 def _make_organiser(media_drive="/media"):
-    return FileOrganiser(
-        media_drive=media_drive,
-        plex_url="http://localhost:32400",
-        plex_token="fake-token",
-        plex_section_id="1",
-    )
+    return FileOrganiser(media_drive=media_drive)
 
 
 class _TrackStub:
@@ -241,12 +235,7 @@ class TestOrganise:
             media_drive = os.path.join(tmpdir, "media")
             os.makedirs(media_drive, exist_ok=True)
 
-            org = FileOrganiser(
-                media_drive=media_drive,
-                plex_url="http://localhost:32400",
-                plex_token="tok",
-                plex_section_id="1",
-            )
+            org = FileOrganiser(media_drive=media_drive)
 
             # Insert a real Track into the in-memory DB
             track = Track(
@@ -267,8 +256,7 @@ class TestOrganise:
             session.add(track)
             session.flush()
 
-            with patch.object(org, "_refresh_plex"):
-                final_path = org.organise(src_file, track, session)
+            final_path = org.organise(src_file, track, session)
 
             assert os.path.exists(final_path)
             assert track.status == TrackStatus.DOWNLOADED.value
@@ -294,12 +282,7 @@ class TestOrganise:
             media_drive = os.path.join(tmpdir, "media")
             os.makedirs(media_drive, exist_ok=True)
 
-            org = FileOrganiser(
-                media_drive=media_drive,
-                plex_url="http://localhost:32400",
-                plex_token="tok",
-                plex_section_id="1",
-            )
+            org = FileOrganiser(media_drive=media_drive)
 
             track = Track(
                 spotify_uri="spotify:track:sha_test",
@@ -315,109 +298,7 @@ class TestOrganise:
             session.add(track)
             session.flush()
 
-            with patch.object(org, "_refresh_plex"):
-                org.organise(src_file, track, session)
+            org.organise(src_file, track, session)
 
             assert track.file_sha256 == expected_sha
 
-    def test_plex_refresh_failure_does_not_abort_organise(self, session):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            src_file = os.path.join(tmpdir, "source.mp3")
-            with open(src_file, "wb") as f:
-                f.write(b"fake mp3 data")
-
-            media_drive = os.path.join(tmpdir, "media")
-            os.makedirs(media_drive, exist_ok=True)
-
-            org = FileOrganiser(
-                media_drive=media_drive,
-                plex_url="http://localhost:32400",
-                plex_token="tok",
-                plex_section_id="1",
-            )
-
-            track = Track(
-                spotify_uri="spotify:track:plex_refresh_failure_test",
-                title="Plex Failure Song",
-                artist="Artist",
-                album_artist="Artist",
-                album="Album",
-                year="2024",
-                track_number=3,
-                status=TrackStatus.PENDING.value,
-                cover_art_source="none",
-            )
-            session.add(track)
-            session.flush()
-
-            with patch.object(org, "_refresh_plex", side_effect=RuntimeError("plex down")):
-                final_path = org.organise(src_file, track, session)
-
-            assert os.path.exists(final_path)
-            assert track.status == TrackStatus.DOWNLOADED.value
-
-
-# ── _refresh_plex ─────────────────────────────────────────────────────────────
-
-class TestRefreshPlex:
-    def test_refresh_if_due_refreshes_first_move(self):
-        org = _make_organiser()
-        with patch.object(org, "_refresh_plex") as mock_refresh:
-            org._refresh_plex_if_due(now=100.0)
-        mock_refresh.assert_called_once_with()
-
-    def test_refresh_if_due_batches_by_move_count(self):
-        with patch.dict(
-            os.environ,
-            {
-                "PLEX_REFRESH_INTERVAL_SECONDS": "3600",
-                "PLEX_REFRESH_BATCH_SIZE": "3",
-            },
-        ):
-            org = _make_organiser()
-
-        with patch.object(org, "_refresh_plex") as mock_refresh:
-            org._refresh_plex_if_due(now=100.0)
-            org._refresh_plex_if_due(now=101.0)
-            org._refresh_plex_if_due(now=102.0)
-            org._refresh_plex_if_due(now=103.0)
-
-        assert mock_refresh.call_count == 2
-
-    def test_refresh_if_due_batches_by_interval(self):
-        with patch.dict(
-            os.environ,
-            {
-                "PLEX_REFRESH_INTERVAL_SECONDS": "10",
-                "PLEX_REFRESH_BATCH_SIZE": "99",
-            },
-        ):
-            org = _make_organiser()
-
-        with patch.object(org, "_refresh_plex") as mock_refresh:
-            org._refresh_plex_if_due(now=100.0)
-            org._refresh_plex_if_due(now=105.0)
-            org._refresh_plex_if_due(now=111.0)
-
-        assert mock_refresh.call_count == 2
-
-    def test_gets_correct_url(self):
-        org = _make_organiser()
-        with patch.object(org._http, "get") as mock_get:
-            mock_get.return_value = MagicMock(ok=True, status_code=200)
-            org._refresh_plex()
-        call_url = mock_get.call_args[0][0]
-        assert "library/sections/1/refresh" in call_url
-        assert "localhost:32400" in call_url
-
-    def test_includes_plex_token_in_session_headers(self):
-        # SPEC §B15: X-Plex-Token is sent as a request HEADER on the session,
-        # NOT a URL query param (avoids leaking the token in logs/proxies).
-        org = _make_organiser()
-        assert org._http.headers.get("X-Plex-Token") == "fake-token"
-
-    def test_non_ok_response_does_not_raise(self):
-        org = _make_organiser()
-        with patch.object(org._http, "get") as mock_get:
-            mock_get.return_value = MagicMock(ok=False, status_code=500, text="error")
-            org._refresh_plex()  # must not raise
