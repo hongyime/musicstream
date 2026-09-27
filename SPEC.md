@@ -122,7 +122,7 @@ Start T7 (integration tests): start daemon → smoke all 4 new endpoints → the
 
 Scope locked with owner 2026-08-24:
 - **$0 hard constraint** — no paid services or keys anywhere in the wave. Qobuz (paid) tier is moot ⇒ default quality cutoff is mp3_320.
-- **Download-chain first; Plex demoted to optional push target.** Playback happens in whatever player the owner uses; playlists ship as portable .m3u files.
+- **Download-chain only; Plex removed entirely 2026-09-27.** Previously demoted to an optional push target (T16); now deleted outright along with multi-scrobbler and Tailscale-for-Plex-access (see V23). Playback happens in whatever player the owner uses; playlists ship as portable .m3u files.
 - **Player compatibility:** some players ⊥ FLAC + FLAC file size concern ⇒ QUALITY_CUTOFF default mp3_320; FLAC strictly opt-in via env.
 - Dashboard remains the ops/download-status surface; a read-only Library tab is added to it (no playback server work).
 - Failure alerting is REQUIRED: post-run webhook summaries + immediate failure alerts + Spotify-token early warning.
@@ -179,6 +179,7 @@ V13 token age > TOKEN_WARN_HOURS ∧ refresh-fail → alert webhook + /auth/stat
 | T24 | x      | GET /library?q/artist/album/format/status/page — ILIKE search at personal scale (trgm idx deferred, not needed <150k rows) | §W3.I |
 | T25 | x      | FE Library tab: debounced search + format/status filters + pager + Unblock on blocked rows | §W3.I,V7 |
 | T26 | x      | FE Block button on failed rows + degraded-token banner from auth-status | V12,V7 |
+| T27 | x      | Removed Plex Media Server, multi-scrobbler, and Tailscale-for-Plex entirely: docker-compose.yml plex:/scrobbler: services deleted, all PLEX_*/TAILSCALE_IP env vars removed, src/discovery/plex_playlists.py deleted, FileOrganiser Plex-refresh logic deleted, Track.plex_verified column dropped (migration 0008), self-heal Plex-port-fallback deleted; setup.bat/startup.bat/RUNBOOK.md/.gitignore/.dockerignore/README.md/PRD.md updated to match. Supersedes T16/V8. | V23        |
 
 ## §W3.P Waves
 
@@ -210,7 +211,7 @@ A-lib   : q='bohem' returns matching page; artist/format/status filters compose;
 | ffmpeg transcode CPU spikes                      | per-pass batch cap; reuse worker pool                    |
 | fuzzy resolver false positives                   | duration ±5s gate + min artist/title similarity; log every fuzzy resolution |
 | synthetic-uri collides w/ later Spotify ingest   | V9 dedupe check before insert                            |
-| Plex removal breaks scrobbling (multi-scrobbler polls Plex) | OUT OF SCOPE here — flagged; future Subsonic layer would replace feed |
+| Plex removal breaks scrobbling (multi-scrobbler polls Plex) | **RESOLVED 2026-09-27** — Plex and multi-scrobbler were removed together, deliberately; scrobbling is no longer part of this project's scope (see V23). No replacement feed planned. |
 
 ## §W3.E Env
 
@@ -227,6 +228,7 @@ Update `.env.example` in the same PR as T15/T17/T19 (new vars listed in §W3.I).
 - V20: Dashboard track statistics use one grouped row-count query, preserving empty-library and all-status totals; row counts must permit the existing status index to serve them.
 - V21: Startup and scheduled download passes share one process-wide nonblocking guard; an overlapping pass creates no additional downloader, and completion or failure releases the guard.
 - V22: Successful-attempt time lookups used by deep health and burn rate have a partial timestamp index; queries must avoid scanning the full attempt history.
+- V23: musicstream has zero Plex Media Server, multi-scrobbler, or Tailscale-for-Plex dependency: no `PLEX_*`/`TAILSCALE_IP` environment variable is read anywhere in `src/`, `docker-compose.yml` defines only `postgres` and `daemon` services, and `scripts/musicstream_self_heal.ps1` has no Plex-port-fallback logic. ListenBrainz discovery (CF recommendations + weekly playlists feeding the download queue) is unaffected and remains in scope.
 
 Diagnostic JSONL contract: `ts` and `rss_mib` describe the sample before snapshot processing; `pid` and `uptime_s` identify its process lifetime; `traced_mib`, `traced_peak_mib` and `tracer_mib` distinguish the total tracked heap from profiler overhead. `top` contains up to 15 non-profiler leaf locations and is never a total-heap measurement. With `tracing_enabled=false`, heap totals are null and `top` is empty; RSS monitoring continues. Heap tracing remains opt-in via `TRACEMALLOC_ENABLED`.
 

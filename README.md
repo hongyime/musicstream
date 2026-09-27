@@ -1,38 +1,33 @@
 # musicstream
-> Self-hosted autonomous music ecosystem: Spotify → lossless FLAC → Plex, with ListenBrainz scrobbling and automatic music discovery
+> Self-hosted autonomous music pipeline: Spotify → lossless FLAC → tagged, organized library on disk, with ListenBrainz-powered automatic music discovery
 
 ## What it does
-musicstream is a fully self-hosted music pipeline that ingests your entire Spotify library into a PostgreSQL database, downloads every track at the highest available quality (FLAC via SpotiFLAC → MP3 320 via yt-dlp/spotdl), tags each file using MusicBrainz metadata, and serves the result through Plex — with plays scrobbled to ListenBrainz and new music discovered automatically via ListenBrainz Collaborative Filtering.
+musicstream is a fully self-hosted music pipeline that ingests your entire Spotify library into a PostgreSQL database, downloads every track at the highest available quality (FLAC via SpotiFLAC → MP3 320 via yt-dlp/spotdl), tags each file using MusicBrainz metadata, and organizes the result into a structured library on disk — with new music discovered automatically via ListenBrainz Collaborative Filtering.
 
-New tracks added to Spotify reach your Plex library within ~15 minutes of being saved.
+New tracks added to Spotify are downloaded and organized on disk within ~15 minutes of being saved.
 
 ## Features
 - **5-tier download chain**: SpotiFLAC (lossless FLAC from Qobuz/Tidal/Amazon/Deezer) → yt-dlp YTM → spotdl → yt-dlp YouTube → yt-dlp SoundCloud
 - **Acoustic fingerprinting**: pyacoustid + chromaprint for precise MusicBrainz ID matching
 - **Auto-tagging**: title, artist, album, cover art, track number — Spotify-first, MusicBrainz fills gaps
 - **File integrity checker**: SHA-256 hash verification; missing/corrupt files auto-requeued
-- **ListenBrainz scrobbling**: multi-scrobbler polls Plex every 10s (no Plex Pass needed)
 - **Music discovery**: ListenBrainz CF recommendations ingested daily into your library
 - **HTTP control plane**: `/sync`, `/integrity`, `/discover`, `/health`, `/metrics` on port 9079
 - **Automated backups**: `pg_dump` after every full run, 14 snapshots retained
-- **Tailscale VPN**: access Plex from iPhone without port forwarding
 
 ## Tech Stack
 | Layer | Technology |
 |-------|-----------|
 | Database | PostgreSQL 16 |
-| Media server | Plex Media Server |
-| Scrobbler | multi-scrobbler (Docker) |
 | Primary download | SpotiFLAC 0.2.x (FLAC) |
 | Fallback download | yt-dlp, spotdl (MP3 320) |
 | Metadata | spotipy + MusicBrainz WS2 |
 | Fingerprinting | pyacoustid + chromaprint |
 | Tagging | mutagen |
 | Orchestration | Docker Compose |
-| Networking | Tailscale |
 
 ## Requirements
-- Windows 11 + Docker Desktop (WSL2) + Tailscale
+- Windows 11 + Docker Desktop (WSL2)
 - External HDD for music storage
 - Python 3.12+
 - ffmpeg + chromaprint installed in container
@@ -40,7 +35,7 @@ New tracks added to Spotify reach your Plex library within ~15 minutes of being 
 ## Quick Start
 
 ```bash
-# One-time setup (generates .env, Spotify OAuth, starts Plex, runs migrations)
+# One-time setup (generates .env, Spotify OAuth, runs migrations)
 setup.bat
 
 # Day-to-day operations menu
@@ -57,18 +52,16 @@ See `.env.example` for full reference. Key variables:
 SPOTIFY_CLIENT_ID        # PKCE — no secret needed
 LISTENBRAINZ_TOKEN
 LISTENBRAINZ_USERNAME
-PLEX_CLAIM_TOKEN         # from plex.tv/claim (valid 4 min)
 POSTGRES_PASSWORD
-TAILSCALE_IP             # auto-detected
-EXTERNAL_MEDIA_DRIVE     # e.g. E:\PlexMusic
+EXTERNAL_MEDIA_DRIVE     # e.g. E:\Music
 ACOUSTID_API_KEY         # free at acoustid.org
 ```
 
 ## Architecture overview
 ```
-Spotify API → scraper → PostgreSQL → download pipeline → tagger → Plex
-                                          ↑                        ↓
-                              ListenBrainz CF API         multi-scrobbler → ListenBrainz
+Spotify API → scraper → PostgreSQL → download pipeline → tagger → organized library (disk)
+                                          ↑
+                              ListenBrainz CF API (discovery)
 ```
 Full architecture, database schema, and pipeline details: see [PRD.md](PRD.md)
 
@@ -188,166 +181,6 @@ Search: "Queen - Bohemian Rhapsody"
 Spotify: 5:55
 Download: 6:10 → Duration mismatch → Reject → Try next tier ✅
 ```
-
----
-
-## Mobile Access Setup (Plexamp + Tailscale)
-
-### Prerequisites
-- Plex Media Server running on Docker (port 32400)
-- Tailscale installed on host machine
-- Smartphone with Plexamp app
-
-### Step 1: Install Tailscale on Mobile
-
-1. **Download Tailscale**:
-   - iOS: App Store → Search "Tailscale"
-   - Android: Play Store → Search "Tailscale"
-
-2. **Sign in with same account** as your host machine
-
-3. **Enable Tailscale VPN**:
-   ```bash
-   # On mobile app:
-   Toggle "Tailscale" ON
-   ```
-
-### Step 2: Configure Plex for Remote Access
-
-#### Option A: Tailscale IP (Recommended - No Port Forwarding)
-
-1. **Get Tailscale IP** of your host:
-   ```bash
-   # On host machine:
-   tailscale ip -4
-   # Example: media-host.example
-   ```
-
-2. **Configure Plex to use Tailscale**:
-   - Open Plex Web UI: http://localhost:32400
-   - Go to Settings → Network
-   - Find "Custom server access URLs"
-   - Add: `http://media-host.example:32400` (your Tailscale IP)
-
-3. **Enable "Manually specify public port"**:
-   - Set to: `32400`
-
-#### Option B: Port Forwarding (Traditional)
-
-1. **Router configuration**:
-   ```bash
-   # Forward external port to internal Plex:
-   External Port: 32400
-   Internal IP: 192.168.1.100 (your host LAN IP)
-   Internal Port: 32400
-   Protocol: TCP
-   ```
-
-2. **Plex settings**:
-   - Settings → Remote Access → Enable
-   - Manually specify public port: 32400
-
-### Step 3: Connect Plexamp via Tailscale
-
-1. **Open Plexamp on mobile**
-
-2. **Sign in to Plex account** (same email as server)
-
-3. **Select your server**:
-   - If Tailscale is ON, you'll see server as "Available"
-   - Server name: "musicstream" (or your Plex server name)
-   - Connection: Via Tailscale (shows key icon)
-
-4. **Test connection**:
-   ```bash
-   # In Plexamp Settings:
-   Settings → Advanced → Playback → Test Network
-   ```
-
-### Step 4: Verify Remote Access
-
-**Success indicators**:
-- ✅ Plexamp shows "Connected via Tailscale"
-- ✅ Can browse your music library
-- ✅ Album art loads properly
-- ✅ Playback starts without buffering
-
-**Troubleshooting**:
-
-❌ **"Server not available"**:
-- Check Tailscale is running on both devices
-- Verify same Tailscale account
-- Try: Settings → Connection → Reconnect
-
-❌ **"Playback failed"**:
-- Check Plex server is running: `docker ps | grep plex`
-- Verify port 32400 accessible: `curl http://localhost:32400`
-- Check firewall allows Tailscale traffic
-
-❌ **"Slow connection"**:
-- Tailscale uses direct peer-to-peer when possible
-- If relayed, try: Settings → Connection → Exit Node → Enable
-
-### Step 5: Enable Offline Mode (Optional)
-
-Plexamp can download tracks for offline playback:
-
-1. **Settings → Downloads → Enable**
-
-2. **Download specific albums**:
-   - Browse album → ⋮ menu → Download
-   - Downloaded items show checkmark ✓
-
-3. **Offline playback**:
-   - Disable WiFi/mobile data
-   - Plexamp automatically switches to downloaded content
-
-### Network Diagram
-
-```
-┌─────────────────┐         ┌──────────────────┐
-│  Mobile Phone   │         │  Host Machine    │
-│                 │         │                  │
-│ ┌─────────────┐ │  VPN    │ ┌──────────────┐ │
-│ │  Tailscale  │ ├─────────┼─┤  Tailscale   │ │
-│ │   Client    │ │         │ │    Server    │ │
-│ └─────────────┘ │         │ └──────────────┘ │
-│                 │         │         │        │
-│ ┌─────────────┐ │         │ ┌──────────────┐ │
-│ │   Plexamp   │ │ Stream  │ │     Plex     │ │
-│ │    App      │ ├─────────┼─┤    Server    │ │
-│ └─────────────┘ │         │ └──────────────┘ │
-└─────────────────┘         │         │        │
-                            │ ┌──────────────┐ │
-                            │ │  PostgreSQL  │ │
-                            │ └──────────────┘ │
-                            └──────────────────┘
-```
-
-### Security Best Practices
-
-1. **Never expose Plex to internet without auth**
-2. **Use Tailscale for all remote access**
-3. **Enable Plex Home** for user management
-4. **Disable "Allow media deletion" for mobile clients**
-
-### Advanced: Custom Plexamp Settings
-
-```bash
-# In Plexamp Settings → Advanced:
-- Transcode Quality: Original (FLAC if on Tailscale LAN)
-- Remote Quality: 2 Mbps (if on cellular)
-- Crossfade: 2 seconds
-- ReplayGain: Track mode
-- Equalizer: Customize per genre
-```
-
-### Cost Breakdown
-
-- **Tailscale**: Free (personal use)
-- **Plex Pass**: $4.99/month (optional, for offline sync)
-- **Plexamp**: Free
-- **Total**: **$0 - $4.99/month**
 
 ---
 

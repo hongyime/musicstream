@@ -10,16 +10,16 @@
 
 ## 1. Overview
 
-musicstream is a fully self-hosted, autonomous music ecosystem.
+musicstream is a fully self-hosted, autonomous music downloader and organiser.
 It ingests your entire Spotify library into a PostgreSQL database, downloads every
 track at the highest available quality (true lossless FLAC via SpotiFLAC where
-possible, MP3 320 kbps via yt-dlp as fallback), tags each file to Plex Media Server
-standards using MusicBrainz metadata, and serves the library through Plex on a Docker
-stack — with all plays scrobbled to ListenBrainz, and new music discovered automatically
-via the ListenBrainz Collaborative Filtering API.
+possible, MP3 320 kbps via yt-dlp as fallback), tags each file using MusicBrainz
+metadata, and organises the result on an external drive. New music is discovered
+automatically via the ListenBrainz Collaborative Filtering API and fed into the
+download queue.
 
 The first full import is a one-time slow backfill. Every addition after that is
-near-real-time (< 15 minutes from Spotify save to Plex library appearance).
+near-real-time (< 15 minutes from Spotify save to file appearing organised on disk).
 
 ---
 
@@ -34,13 +34,9 @@ near-real-time (< 15 minutes from Spotify save to Plex library appearance).
 | **mutagen** | Python library that writes ID3/MP4/FLAC tags directly to audio files (title, artist, album, cover art, etc.). |
 | **musicbrainz-api** | MusicBrainz Web Service v2 client. Used to fill in missing metadata (track number, year, cover art, album artist) after Spotify data. |
 | **pyacoustid + chromaprint** | Generates an acoustic fingerprint of a downloaded audio file, then looks it up in the AcoustID database to get a confirmed MusicBrainz Recording ID. More reliable than title+artist matching. |
-| **Plex Media Server** | Serves your music library to any device. Reads the organised directory on your external HDD and presents it as a browsable, streamable library. |
-| **Plexamp (iOS)** | The Plex music client on your iPhone. Streams over Tailscale. |
-| **multi-scrobbler** | Free, open-source Docker container. Polls the Plex API every 10 seconds to detect what is playing, then submits each listen to ListenBrainz. **No Plex Pass required.** |
 | **ListenBrainz** | Open-source listening history tracker and music recommendation engine. Stores all your plays and generates weekly Collaborative Filtering (CF) recommendations. |
 | **MusicBrainz** | Open music encyclopaedia. Provides accurate metadata: correct album names, track numbers, ISRCs, album art via Cover Art Archive. |
 | **musicstream daemon** | Your Python service running inside Docker. Orchestrates the full pipeline on schedule (and on-demand), manages the discovery loop, and exposes an HTTP control plane. |
-| **Tailscale** | Zero-config VPN mesh. Your iPhone and home server share a private network. No port forwarding. No public IP exposure. |
 
 ---
 
@@ -73,7 +69,7 @@ per track vs ~8–10MB for MP3 320 kbps.
 | spotdl | MP3 320 kbps | Lossy fallback |
 | yt-dlp (SoundCloud) | MP3 320 kbps | Lossy last resort |
 
-The database records `format` per track. Plex natively plays both FLAC and MP3.
+The database records `format` per track. Both FLAC and MP3 are widely supported by music players and NAS software.
 All files in the library follow identical directory and filename conventions regardless
 of format (see §6.4). There is **no post-processing transcode** — FLAC from SpotiFLAC
 stays FLAC; it is never downgraded to MP3.
@@ -96,30 +92,26 @@ last resort within SpotiFLAC's own fallback chain.
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         EXTERNAL HDD                                │
-│  /music/[Album Artist]/[Album (Year)]/[Track]. [Title].[flac|mp3]  │
+│  /music/[Album Artist]/[Album (Year)]/[NN - Title].[flac|mp3]      │
+│  /Playlists/Discovered_{Month}_{Year}.m3u                           │
 └───────────────────────────────┬─────────────────────────────────────┘
-                                │ bind-mount (read-only for Plex)
-        ┌───────────────────────┼───────────────────────┐
-        │                       │                       │
-   ┌────▼────┐           ┌──────▼──────┐        ┌──────▼──────┐
-   │  plex   │           │   daemon    │        │multi-scrobbl│
-   │  :32400 │◄──polling─│   :9079     │        │   er :9078  │
-   └────┬────┘  sessions │             │        └──────┬──────┘
-        │       API      │  scheduler  │               │
-        │                │  pipeline   │          scrobbles
-        │                │  discovery  │               │
-        │                └──────┬──────┘               ▼
-        │                       │               ┌──────────────┐
-        │                       │ read/write     │ ListenBrainz │
-        │                  ┌────▼────┐          └──────┬───────┘
-        │                  │postgres │                  │
-        │                  │  :5432  │           CF recs│
-        │                  └─────────┘                  │
-        │                                         ┌─────▼──────┐
-        │                              Plex API   │  daemon    │
-        └───────────────────────────────────────► │  playlist  │
-                                                  │  creator   │
-                                                  └────────────┘
+                                │ bind-mount (read-write)
+   ┌───────────────────────┐    │
+   │ Spotify API (inbound) │    │
+   └───────────┬───────────┘    │
+               │                │
+   ┌───────────▼────────────────▼────┐
+   │           daemon  :9079         │
+   │                                 │
+   │  scheduler  │  pipeline         │
+   │  tagger     │  organiser        │
+   │  discovery  │  m3u export       │
+   └──────┬──────────────┬───────────┘
+          │              │
+     ┌────▼────┐         │    ┌─────────────────────┐
+     │postgres │         └───►│ ListenBrainz CF API │
+     │  :5432  │              │ (discovery inbound)  │
+     └─────────┘              └─────────────────────┘
 ```
 
 ---
@@ -133,10 +125,10 @@ musicstream/
 │   ├── scraper.py         # Spotify playlist + liked songs ingestion (spotipy)
 │   ├── downloader.py      # Download orchestrator: SpotiFLAC → yt-dlp → spotdl
 │   ├── tagger.py          # ID3/FLAC tagging: Spotify → AcoustID → MusicBrainz
-│   └── organiser.py       # Move file to Plex directory structure + update DB
+│   └── organiser.py       # Move file to organised directory structure + update DB
 ├── discovery/
 │   ├── listenbrainz.py    # LB CF recommendation fetcher + backfill
-│   └── plex_playlists.py  # Create/update Plex playlists from LB recs
+│   └── m3u_playlists.py   # Export monthly discovery playlists as .m3u files
 ├── integrity/
 │   └── checker.py         # Scan external HDD vs DB; requeue missing/corrupt files
 ├── models.py              # SQLAlchemy ORM models
@@ -202,7 +194,7 @@ CREATE TABLE tracks (
     file_path           TEXT,           -- absolute host path (external HDD)
     file_size_bytes     BIGINT,
     file_sha256         TEXT,           -- for integrity check; redownload if mismatch
-    plex_verified       BOOLEAN DEFAULT FALSE,
+    file_verified        BOOLEAN DEFAULT FALSE,
 
     -- Lifecycle
     created_at          TIMESTAMPTZ DEFAULT NOW(),
@@ -313,7 +305,7 @@ Scopes: `playlist-read-private playlist-read-collaborative user-library-read`
 4. Insert new tracks as `status = 'pending'`. Immediately trigger the download
    pipeline for only the new tracks.
 
-This means a newly-liked Spotify song reaches your Plex library within ~15 minutes
+This means a newly-liked Spotify song is downloaded and organised on disk within ~15 minutes
 of being saved, even outside a scheduled full-run.
 
 ### 7.2 Stage 2 — Download (SpotiFLAC-First with Full Fallback Chain)
@@ -390,7 +382,7 @@ next source only if the current source returns null or empty for that specific f
 - Otherwise:
   → `TPE2 = TPE1` (the track's primary artist)
 
-This preserves full **Artist-based sorting** in Plex for the vast majority of tracks.
+This preserves full **Artist-based sorting** for the vast majority of tracks.
 Only genuine compilation albums land under "Various Artists".
 
 #### 7.3.2 MusicBrainz Lookup
@@ -420,7 +412,7 @@ User-Agent: musicstream/3.0.0 ( github.com/hongyime/musicstream )
 **Cover art:** Fetched from Cover Art Archive:
 `https://coverartarchive.org/release/{mb_release_id}/front-250`
 
-### 7.4 Stage 4 — File Organisation & Move to Plex
+### 7.4 Stage 4 — File Organisation
 
 After tagging passes, the file is moved from `temp/` to the external HDD:
 
@@ -441,7 +433,6 @@ On successful move:
 - `tracks.file_size_bytes` = recorded
 - `tracks.status` = `'downloaded'`
 - `tracks.format` = `'flac'` or `'mp3'`
-- Plex library refresh triggered via `POST http://localhost:32400/library/sections/{id}/refresh`
 
 ### 7.5 Stage 5 — File Integrity Check
 
@@ -494,18 +485,22 @@ The daemon polls the LB CF API once every 24 hours:
 1. Fetch 100 latest recommendations.
 2. Skip any `recording_mbid` already present in `lb_recommendations`.
 3. For each new MBID: fetch MusicBrainz metadata → insert track → trigger download.
-4. New tracks reach Plex within minutes of being discovered.
+4. New tracks are downloaded and organised on disk within minutes of being discovered.
 
-### 8.4 Plex Playlist Sync from LB Recommendations
+### 8.4 Portable Playlist Export from LB Recommendations
 
-After each discovery batch, the daemon creates or updates a dated Plex playlist:
+After each discovery batch, the daemon creates or updates a dated `.m3u` playlist file:
 
-- Playlist name: `Discovered: {Month} {Year}` (e.g., `Discovered: April 2026`)
-- Created via Plex API: `POST /playlists` with the machine identifier and track keys
-  of all successfully downloaded LB recommendation tracks from that month.
-- Existing playlists are updated (not recreated) when new tracks for that month arrive.
+- Playlist name pattern: `Discovered_{Month}_{Year}.m3u` (e.g., `Discovered_April_2026.m3u`)
+- Export directory: `{EXTERNAL_MEDIA_DRIVE}/Playlists/`
+- Contains absolute file paths of all successfully downloaded LB recommendation tracks
+  from that month, one path per line, in standard `.m3u` format.
+- Existing playlists are updated in place when new tracks for that month arrive — new
+  paths are appended; existing entries are not duplicated.
 
-This means Plex shows a new auto-curated playlist each month from your LB discoveries.
+This produces one auto-curated `.m3u` playlist per month from your LB discoveries.
+Any player that supports `.m3u` files (foobar2000, VLC, MusicBee, etc.) can load them
+directly from the external drive.
 
 ---
 
@@ -535,45 +530,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
-  plex:
-    image: plexinc/pms-docker:latest
-    container_name: musicstream-plex
-    network_mode: host
-    environment:
-      - PLEX_CLAIM=${PLEX_CLAIM_TOKEN}
-      - ADVERTISE_IP=http://${TAILSCALE_IP}:32400/
-      - TZ=Asia/Singapore
-    volumes:
-      - ${EXTERNAL_MEDIA_DRIVE}:/media:ro
-      - ./plex/config:/config
-      - ./plex/transcode:/transcode
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:32400/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-
-  scrobbler:
-    image: foxxmd/multi-scrobbler:latest
-    container_name: musicstream-scrobbler
-    volumes:
-      - ./scrobbler/config:/config
-    ports:
-      - "9078:9078"
-    environment:
-      - TZ=Asia/Singapore
-    restart: unless-stopped
-    depends_on:
-      plex:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:9078/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
 
   daemon:
     build:
@@ -630,34 +586,7 @@ CMD ["python", "daemon.py"]
 
 `libchromaprint-dev` is required for `pyacoustid` fingerprinting.
 
-### 9.3 multi-scrobbler Configuration (No Plex Pass)
-
-`./scrobbler/config/config.yaml` (generated by `setup.bat`):
-
-```yaml
-sources:
-  - name: musicstream-plex
-    type: plex
-    polling:
-      interval: 10        # Poll Plex /status/sessions every 10 seconds
-    data:
-      user: ${PLEX_USERNAME}
-      token: ${PLEX_TOKEN}
-
-scrobbles:
-  - name: musicstream-lb
-    type: listenbrainz
-    data:
-      token: ${LISTENBRAINZ_TOKEN}
-```
-
-**How polling-mode scrobbling works without Plex Pass:**
-multi-scrobbler calls `GET http://plex:32400/status/sessions?X-Plex-Token={token}` every
-10 seconds. This endpoint is available to all Plex accounts at no cost. When a track's
-play progress crosses the 50% threshold, it is submitted to ListenBrainz as a listen.
-Latency vs webhook-based scrobbling: ~5–15 seconds. Functionally equivalent.
-
-### 9.4 Daemon HTTP Control Plane (Port 9079)
+### 9.3 Daemon HTTP Control Plane (Port 9079)
 
 ```
 GET  /health          → {"status": "ok", "uptime_s": 3600, "db_tracks": 4200}
@@ -839,41 +768,31 @@ Timestamp and file size are printed to the console on completion.
 
 ```
 1. Check prerequisites:
-   Python 3.12+ | Docker Desktop (running) | Tailscale | FFmpeg | chromaprint
+   Python 3.12+ | Docker Desktop (running) | FFmpeg | chromaprint
 
 2. Generate .env:
-   SPOTIFY_CLIENT_ID (32-char, PKCE — no secret required)
+   SPOTIFY_CLIENT_ID     (32-char, PKCE — no secret required)
    LISTENBRAINZ_TOKEN
    LISTENBRAINZ_USERNAME
    POSTGRES_PASSWORD
-   EXTERNAL_MEDIA_DRIVE  (e.g. E:\PlexMusic)
-   PLEX_CLAIM_TOKEN      (link: https://plex.tv/claim — valid 4 min)
-   PLEX_USERNAME
-   TAILSCALE_IP          (auto-detected: tailscale ip -4)
+   EXTERNAL_MEDIA_DRIVE  (e.g. E:\Music)
    ACOUSTID_API_KEY      (free registration: acoustid.org)
 
 3. Create directories:
-   ./backups/ ./logs/ ./plex/config/ ./plex/transcode/
-   ./scrobbler/config/ ./downloads/ ./temp/
+   ./backups/ ./logs/ ./downloads/ ./temp/
 
-4. Generate ./scrobbler/config/config.yaml from .env values
+4. docker-compose pull (pull all images)
 
-5. Configure Windows Defender Firewall (PowerShell, elevation required):
-   Allow TCP 32400 on Tailscale interface only
-   Block TCP 32400 on all other interfaces
+5. docker-compose up -d postgres (start only DB)
 
-6. docker-compose pull (pull all images)
+6. Wait for postgres healthcheck to pass, then run Alembic migrations
 
-7. docker-compose up -d postgres (start only DB)
+7. Validate .gitignore completeness
 
-8. Wait for postgres healthcheck to pass, then run Alembic migrations
-
-9. Validate .gitignore completeness
-
-10. Print completion summary:
-    Tailscale IP:  100.x.x.x
-    Plex URL:      http://100.x.x.x:32400
-    Run startup.bat to launch the full stack.
+8. Print completion summary:
+   Music drive: E:\Music
+   Daemon URL:  http://localhost:9079
+   Run startup.bat to launch the full stack.
 ```
 
 ### 15.2 `startup.bat` — Operations Menu
@@ -915,19 +834,11 @@ SPOTIFY_CLIENT_ID=
 LISTENBRAINZ_TOKEN=
 LISTENBRAINZ_USERNAME=
 
-# ── Plex ──────────────────────────────────────────────────────────────────────
-PLEX_CLAIM_TOKEN=        # from https://plex.tv/claim (valid 4 minutes)
-PLEX_USERNAME=
-PLEX_TOKEN=              # auto-retrieved by setup.bat after first Plex start
-
 # ── PostgreSQL ────────────────────────────────────────────────────────────────
 POSTGRES_PASSWORD=
 
-# ── Network ───────────────────────────────────────────────────────────────────
-TAILSCALE_IP=            # auto-detected by setup.bat via: tailscale ip -4
-
 # ── Storage ───────────────────────────────────────────────────────────────────
-EXTERNAL_MEDIA_DRIVE=E:\PlexMusic
+EXTERNAL_MEDIA_DRIVE=E:\Music
 
 # ── Metadata ──────────────────────────────────────────────────────────────────
 ACOUSTID_API_KEY=        # free: https://acoustid.org/api-key
@@ -950,11 +861,6 @@ cookies.txt
 headers_auth.json
 spotify_token*
 .spotify_cache*
-
-# Plex and service configs with state
-/plex/config/
-/plex/transcode/
-/scrobbler/config/config.yaml
 
 # Logs
 /logs/
@@ -984,9 +890,6 @@ __pycache__/
 |---|---|---|
 | Database | PostgreSQL 16 (Docker) | Named volume; `pg_dump` for backups |
 | ORM + migrations | SQLAlchemy 2.0 + Alembic | Auto-migrate on daemon start |
-| Media Server | `plexinc/pms-docker:latest` | — |
-| Mobile Client | Plexamp (iOS) | Tailscale streaming |
-| Scrobbler | `foxxmd/multi-scrobbler:latest` | Polling mode — no Plex Pass needed |
 | Primary downloader | SpotiFLAC 0.2.x (Python lib) | FLAC from Qobuz/Tidal/Amazon/Deezer |
 | Fallback downloader 1 | yt-dlp (nightly) + ytmusicapi | MP3 320 kbps via FFmpeg |
 | Fallback downloader 2 | spotdl | MP3 320 kbps, independent YT matching |
@@ -997,7 +900,6 @@ __pycache__/
 | Fingerprinting | pyacoustid + chromaprint | Confirm MusicBrainz Recording ID |
 | ID3 writing | mutagen | Writes FLAC/MP3/M4A tags |
 | Discovery | ListenBrainz CF API | `/1/cf/recommendation/user/{u}/recording` |
-| Networking | Tailscale | No port forwarding |
 | Container runtime | Docker Engine + Docker Compose v2 | WSL2 backend |
 | Daemon scheduler | APScheduler (BackgroundScheduler) | Cron-style job definitions |
 | Daemon HTTP | Flask (minimal, port 9079) | Control plane + health endpoint |
@@ -1015,10 +917,9 @@ __pycache__/
 | SpotiFLAC version stability | Library is relatively new (0.2.x) | Pin version in requirements.txt; monitor for breaking changes |
 | chromaprint fingerprinting on FLAC | Fingerprinting is slower on large FLAC files | Run asynchronously after move, not in the blocking download path |
 | ISRC availability | ~5% of Spotify tracks lack ISRC | Fall through to AcoustID → text search |
-| Plex `PLEX_TOKEN` retrieval | Token needed for multi-scrobbler polling; retrieved programmatically in setup.bat | Document manual fallback retrieval steps |
-| WSL2 + external HDD path mapping | Docker bind-mount of Windows drive letters can be unreliable across WSL2 versions | Document both `E:\PlexMusic` and `/mnt/e/PlexMusic` path formats; test on setup |
+| WSL2 + external HDD path mapping | Docker bind-mount of Windows drive letters can be unreliable across WSL2 versions | Document both `E:\Music` and `/mnt/e/Music` path formats; test on setup |
 | cookies.txt expiry (yt-dlp) | Stale cookies cause YouTube 429s | Daemon warns at startup if cookies.txt is older than 30 days |
 | ListenBrainz CF API response size | API cap at 200 recommendations | Weekly differential sync keeps queue manageable |
-| MP3 vs FLAC consistency in library | Mixed formats may affect Plex display | DB `format` column allows future audit/conversion if desired |
+| MP3 vs FLAC consistency in library | Mixed formats may affect playback consistency across different players | DB `format` column allows future audit/conversion if desired |
 
 Machine-specific values in this document use privacy placeholders.

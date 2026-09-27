@@ -16,7 +16,6 @@ is being debuggable and predictable.
 | Daemon | FastAPI + APScheduler, single process, `uvicorn --workers 1` (LOAD-BEARING) |
 | Container | `musicstream-daemon` — API on **port 9079** |
 | Database | PostgreSQL 16 — `musicstream-postgres` (db/user/name all `musicstream`, port 5432) |
-| Media server | `musicstream-plex` (32400) · Scrobbler | `musicstream-scrobbler` (9078) |
 | Compose | `docker-compose.yml` (prod) + `docker-compose.override.yml` (dev bind-mounts, gitignored) |
 
 **`--workers 1` is required** — scheduler, WebSocket manager, circuit breaker, and the
@@ -138,10 +137,10 @@ Recommended ramp:
    the SQL checks above.
 2. Set `MAX_CONCURRENT_WORKERS=2` during a planned change window, recreate only the
    daemon, and watch for at least 60 minutes.
-3. If there are no new stale `downloading` rows, 429/circuit-breaker spikes, Spotify
-   lockouts, or sustained Plex refresh timeouts, try `3`, then `4`.
-4. Treat `3-4` as the normal ceiling until a longer burn-in shows clean stale-row,
-   circuit-breaker, and Plex-refresh behavior. Do not use `6-12` as a first ramp target.
+3. If there are no new stale `downloading` rows, 429/circuit-breaker spikes, or Spotify
+   lockouts, try `3`, then `4`.
+4. Treat `3-4` as the normal ceiling until a longer burn-in shows clean stale-row and
+   circuit-breaker behavior. Do not use `6-12` as a first ramp target.
 
 T0 librespot must remain single-flight. T1 SpotiFLAC should stay conservative while
 pinned to the current synchronous dependency. T2/T4/T5 are the best candidates for
@@ -220,10 +219,9 @@ psql -U musicstream -d musicstream < backups/musicstream_<TS>.sql   # ignore the
 ### Host-scheduled watchdogs
 
 `scripts/musicstream_self_heal.ps1` is the Windows host watchdog. It waits for
-Docker Desktop, persists `PLEX_HOST_PORT` in `.env`, skips host ports that are
-already held by Docker's networking backend, starts only the `C:\musicstream`
-Compose project, restarts unhealthy musicstream containers, and logs to
-`logs/self_heal.log`.
+Docker Desktop, starts the `C:\musicstream` Compose project (postgres + daemon),
+restarts unhealthy musicstream containers, checks deep health, repairs stale
+downloads, and logs to `logs/self_heal.log`.
 
 Install or refresh the scheduled task:
 ```powershell
@@ -243,7 +241,7 @@ The older stuck-download alert-only watchdog can still run from the Startup fold
 @echo off
 "C:\Program Files\Git\bin\bash.exe" -lc "while true; do /c/musicstream/scripts/watchdog_stuck_downloads.sh; sleep 600; done"
 ```
-- `scripts/musicstream_self_heal.ps1` -- starts/repairs the stack and handles Plex host-port conflicts.
+- `scripts/musicstream_self_heal.ps1` -- starts/repairs the stack (postgres + daemon), restarts unhealthy containers, and repairs stale downloads.
 - `scripts/watchdog_stuck_downloads.sh` -- alerts if tracks sit in `downloading` >30min (silent otherwise).
 - `scripts/verify_backup_restore.sh` -- monthly restore check.
 
@@ -269,5 +267,3 @@ The file logger self-heals via a 60s watchdog after uvicorn's dictConfig wipes h
 ## 9. Boot autostart
 The whole stack autostarts via the self-heal scheduled task and the
 Startup-folder `.bat` wrapper (see `scripts/Musicstream_Startup.bat`).
-Plex/Tailscale mobile access details are in `README.md`; use the port in
-`.env` as `PLEX_HOST_PORT`.
