@@ -406,18 +406,49 @@ Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 ## Container development on Windows and Linux
 
-Use Docker Compose 2.24 or newer. Create .env.dev with development settings for
+Use Docker Compose 2.32.2 or newer. Create .env.dev with development settings for
 this project. The commands below work in PowerShell and Linux shells; they select
 a standalone development stack, with a separate project and data volumes.
 
 ~~~sh
 # Initial development image build; repeat only for dependency manifests/system packages:
 docker compose --env-file .env.dev -f compose.dev.yaml build
-# Daily use: source changes are delivered by bind mounts and reload automatically:
-docker compose --env-file .env.dev -f compose.dev.yaml up --no-build
+# Explicit first-time acquisition of the development database image:
+docker compose --env-file .env.dev -f compose.dev.yaml pull postgres
+# Daily use when the Docker host can access this checkout directly:
+docker compose --env-file .env.dev -f compose.dev.yaml up --no-build --pull never
 # After a dependency rebuild, refresh anonymous frontend dependency/cache volumes:
-docker compose --env-file .env.dev -f compose.dev.yaml up --no-build --renew-anon-volumes
+docker compose --env-file .env.dev -f compose.dev.yaml up --no-build --pull never --renew-anon-volumes
 ~~~
+
+For an SMB checkout that Docker Desktop cannot bind-mount, run the source-sync
+launcher after the same initial build and explicit database pull. It needs
+Python 3.10+ on the host:
+
+~~~powershell
+# Windows PowerShell
+python scripts/dev-watch.py --settings .env.dev
+~~~
+
+~~~sh
+# Linux
+python3 scripts/dev-watch.py --settings .env.dev
+~~~
+
+The launcher seeds only approved source trees into a temporary local directory,
+then watches edits directly in the checkout with Compose `sync`. It does not
+change source timestamps. Dependency manifests, dependency folders and private
+files are excluded from synchronization. It starts with `--no-build --pull never`
+and waits for all source files before launching the reloaders. The sync path
+uses the image's Node dependencies directly, without anonymous dependency volumes.
+
+Ctrl-C stops this development stack and its watcher, removes the temporary seed,
+and retains named development data volumes and reusable images. For a disposable
+test, add `--project musicstream-smoke-dev --discard-data` to remove that test
+project's volumes too. The launcher refuses an already existing project so it
+cannot tear down a dev session it did not create. The sync path was exercised
+with real SMB edits: backend and frontend responses changed while container IDs,
+image IDs and start times stayed unchanged; the test restored the source files.
 
 The API is at http://localhost:9079 and the Vite UI at http://localhost:5173. Background acquisition is disabled with SKIP_BACKGROUND_STARTUP; the development API uses DAEMON_DEV_NOAUTH only on a loopback host port. Dev PostgreSQL, media, and working data use separate named volumes. Source mounts cover src and frontend; no production media/session mounts are inherited.
 

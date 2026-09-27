@@ -330,7 +330,8 @@ async def lifespan(app: FastAPI):
         _tracemalloc_dump()
     except Exception:
         pass
-    scheduler.shutdown()
+    if scheduler.running:
+        scheduler.shutdown()
 
 async def _background_startup():
     """Run the 9-step startup sequence in the background."""

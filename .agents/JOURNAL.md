@@ -45,3 +45,5 @@ Machine-specific values in this document use privacy placeholders.
 2026-09-27: User authorized maintenance publication, bounded runtime tests and database migration after backup. Current upstream state was retained while resolving documentation-only merge conflicts.
 
 - 2026-09-27: Separate existing development requirement group from production; validate the published image dependency inventory and package visibility in CI.
+
+- 2026-09-27: Add source-only Compose-watch startup for SMB checkouts, scoped teardown and dependency/private-file exclusions; guard shutdown of an intentionally unstarted dev scheduler. Preserve bind-based local development and production behavior.

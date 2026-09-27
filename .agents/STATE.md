@@ -178,3 +178,10 @@ Machine-specific values in this document use privacy placeholders.
 ## 2026-09-27: Production dependency isolation
 
 The first publisher and cleanup run succeeded. Follow-up separates the existing Dev tools section during dependency installation: production omits test/type/lint tools while development installs them explicitly. CI pulls and inspects the exact production image in a disposable container to verify package exclusion. Source-mounted development commands are unchanged. Package visibility is verified separately because new GHCR packages default to private.
+
+
+## 2026-09-27: SMB source synchronization
+
+Added scripts/dev-watch.py for checkouts that the Docker host cannot bind-mount. It seeds explicit source trees locally, watches the real checkout with Compose sync, excludes private/dependency files, waits for all source files, and starts with no build or pull. Ctrl-C tears down its own stack and temporary seed; named dev data/images stay available unless disposable-data cleanup is requested. Existing project containers cause a refusal instead of being removed.
+
+Real SMB backend/frontend edit responses were observed without container/image replacement. Eight portable source/lifecycle fixtures pass on Windows and Linux. A scheduler shutdown guard prevents the skipped-background dev mode from raising during reload; three focused tests pass, including inside the Linux development image. Full published CI and final helper runtime evidence are recorded separately.
