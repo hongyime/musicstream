@@ -1,8 +1,8 @@
 """discovery/m3u_export.py — Portable .m3u playlist writer.
 
 SPEC.md §W3 T15 / invariant V8: every playlist publish writes a UTF-8
-#EXTM3U file BEFORE any (optional) Plex push, so playlists survive
-independently of Plex and can be consumed by any player that reads m3u.
+#EXTM3U file so playlists are portable and can be consumed by any player
+that reads m3u.
 
 Public API:
     export_playlist(name, entries, export_dir=None) -> Path | None
@@ -88,7 +88,7 @@ def export_playlist(
 def export_weekly_discovery(session, export_dir: Optional[str] = None) -> Optional[Path]:
     """Export the current ISO week's resolved discovery playlist (§W3 T15).
 
-    Same eligibility rules as the Plex weekly playlist, plus blocked tracks
+    Same eligibility rules as the weekly discovery playlist, plus blocked tracks
     excluded per V7.
     """
     from src.models import LbRecommendation, Track, TrackStatus

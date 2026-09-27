@@ -451,7 +451,7 @@ app = FastAPI(title="Musicstream API", lifespan=lifespan)
 # response timing on long mismatches. The `Authorization: Bearer <token>`
 # header is the single source of truth — there is no cookie fallback, no
 # query-string fallback (the latter would re-introduce the very leak we
-# fixed for Plex in #8).
+# fixed in #8).
 
 def require_auth(authorization: Optional[str] = Header(default=None)) -> None:
     """FastAPI dependency: enforce DAEMON_API_TOKEN bearer auth."""
