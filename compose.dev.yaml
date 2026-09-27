@@ -17,6 +17,7 @@ services:
       dockerfile: Dockerfile.daemon
       target: dev
     init: true
+    command: [uvicorn, src.daemon:app, --host, 0.0.0.0, --port, "9079", --reload, --reload-dir, /app/src, --reload-dir, /app/migrations]
     env_file:
     - path: .env.dev
       required: false
@@ -30,6 +31,8 @@ services:
       MEDIA_DIR: /media
     volumes:
     - ./src:/app/src:ro
+    - ./alembic.ini:/app/alembic.ini:ro
+    - ./migrations:/app/migrations:ro
     - dev-data:/app/data
     - dev-logs:/app/logs
     - dev-backups:/app/backups
