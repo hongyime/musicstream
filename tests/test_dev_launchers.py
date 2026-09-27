@@ -46,7 +46,7 @@ class ComposeLauncherContracts(unittest.TestCase):
                             expected += ["--no-build"]
                         expected += ["service with spaces"]
                         self.assertEqual(call["args"], expected)
-                        self.assertEqual(call["cwd"], str(root))
+                        self.assertTrue(Path(call["cwd"]).samefile(root), "launcher changed to a different directory")
 
     def test_up_rejects_build_and_pull_overrides(self):
         for repo in (REPO_KIND,):
