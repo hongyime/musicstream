@@ -1,0 +1,115 @@
+name: Publish container images
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ghcr-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"name": "daemon", "context": ".", "file": "Dockerfile.daemon"}]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify manifest retention rules
+        run: node --test .github/scripts/ghcr-retention.test.cjs
+      - uses: docker/setup-buildx-action@v3
+      - name: Image name
+        id: image
+        env:
+          REPOSITORY: ${{ github.repository }}
+          COMPONENT: ${{ matrix.name }}
+        run: |
+          echo "name=ghcr.io/${REPOSITORY,,}/$COMPONENT" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: metadata
+        with:
+          images: ${{ steps.image.outputs.name }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short,prefix=sha-
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          target: production
+          platforms: linux/amd64
+          # Single architecture without attestations; retention also inspects manifests.
+          provenance: false
+          sbom: false
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+      - name: Record published image size
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+        run: |
+          docker buildx imagetools inspect "$IMAGE:sha-${GITHUB_SHA::7}" --raw |
+            python -c 'import json,sys; m=json.load(sys.stdin); print("Compressed layer bytes:", sum(x["size"] for x in m.get("layers", [])))'
+
+  cleanup:
+    needs: publish
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"name": "daemon"}]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Package name
+        id: package
+        env:
+          REPOSITORY: ${{ github.event.repository.name }}
+          COMPONENT: ${{ matrix.name }}
+        run: echo "name=${REPOSITORY,,}/$COMPONENT" >> "$GITHUB_OUTPUT"
+      - name: Verify manifests and select old tagged versions
+        id: retention
+        uses: actions/github-script@v7
+        env:
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+        with:
+          script: |
+            const plan = require('./.github/scripts/ghcr-retention.cjs');
+            await plan({github, context, core});
+      - name: Retain three untagged versions
+        if: steps.retention.outputs.safe_single_arch == 'true'
+        uses: actions/delete-package-versions@v5
+        with:
+          owner: ${{ github.repository_owner }}
+          package-name: ${{ steps.package.outputs.name }}
+          package-type: container
+          delete-only-untagged-versions: true
+          min-versions-to-keep: 3
+      - name: Bound tagged history separately
+        if: steps.retention.outputs.tagged_ids != ''
+        uses: actions/delete-package-versions@v5
+        with:
+          owner: ${{ github.repository_owner }}
+          package-name: ${{ steps.package.outputs.name }}
+          package-type: container
+          package-version-ids: ${{ steps.retention.outputs.tagged_ids }}

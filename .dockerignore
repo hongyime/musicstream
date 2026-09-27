@@ -53,3 +53,21 @@ librespot_credentials.json
 # OS Files
 .DS_Store
 Thumbs.db
+
+# Keep local state, test tooling and private material out of image contexts.
+**/.git
+**/.agents
+**/.env*
+**/node_modules
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/tests
+**/test_*.py
+**/logs
+**/backups
+**/sessions
+**/cookies*.txt
+**/credentials.json
+**/*.pem
+**/*.key

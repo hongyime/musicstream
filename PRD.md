@@ -4,7 +4,7 @@
 **Version:** 3.0
 **Status:** DRAFT
 **Date:** 2026-04-22
-**Author:** Bryan Seah
+**Author:** the maintainer
 
 ---
 
@@ -1020,3 +1020,5 @@ __pycache__/
 | cookies.txt expiry (yt-dlp) | Stale cookies cause YouTube 429s | Daemon warns at startup if cookies.txt is older than 30 days |
 | ListenBrainz CF API response size | API cap at 200 recommendations | Weekly differential sync keeps queue manageable |
 | MP3 vs FLAC consistency in library | Mixed formats may affect Plex display | DB `format` column allows future audit/conversion if desired |
+
+Machine-specific values in this document use privacy placeholders.

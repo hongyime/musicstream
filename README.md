@@ -220,14 +220,14 @@ Download: 6:10 → Duration mismatch → Reject → Try next tier ✅
    ```bash
    # On host machine:
    tailscale ip -4
-   # Example: 100.64.0.42
+   # Example: media-host.example
    ```
 
 2. **Configure Plex to use Tailscale**:
    - Open Plex Web UI: http://localhost:32400
    - Go to Settings → Network
    - Find "Custom server access URLs"
-   - Add: `http://100.64.0.42:32400` (your Tailscale IP)
+   - Add: `http://media-host.example:32400` (your Tailscale IP)
 
 3. **Enable "Manually specify public port"**:
    - Set to: `32400`
@@ -403,3 +403,86 @@ This prevents YouTube/Spotify API rate limits.
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+## Container development on Windows and Linux
+
+Use Docker Compose 2.24 or newer. Create .env.dev with development settings for
+this project. The commands below work in PowerShell and Linux shells; they select
+a standalone development stack, with a separate project and data volumes.
+
+~~~sh
+# Initial development image build; repeat only for dependency manifests/system packages:
+docker compose --env-file .env.dev -f compose.dev.yaml build
+# Daily use: source changes are delivered by bind mounts and reload automatically:
+docker compose --env-file .env.dev -f compose.dev.yaml up --no-build
+# After a dependency rebuild, refresh anonymous frontend dependency/cache volumes:
+docker compose --env-file .env.dev -f compose.dev.yaml up --no-build --renew-anon-volumes
+~~~
+
+The API is at http://localhost:9079 and the Vite UI at http://localhost:5173. Background acquisition is disabled with SKIP_BACKGROUND_STARTUP; the development API uses DAEMON_DEV_NOAUTH only on a loopback host port. Dev PostgreSQL, media, and working data use separate named volumes. Source mounts cover src and frontend; no production media/session mounts are inherited.
+
+Reload restarts application processes without rebuilding images or recreating
+containers. Polling is enabled for SMB/Windows mounts. Python dependencies stay
+outside source mounts; anonymous Node dependency volumes shield node_modules.
+The dependency-refresh command does not delete named database/data volumes.
+
+Production builds run in GitHub Actions and publish to GHCR. Local development
+uses local tags with pull_policy: never, so a missing image requires the explicit
+build above. Download a production image only when wanted:
+
+~~~sh
+docker pull ghcr.io/hongyime/musicstream/daemon:latest
+~~~
+
+CI publishes latest on the default branch and a short SHA tag, with GHA build
+caching. These images are single-architecture linux/amd64 with provenance/SBOM
+attestations disabled. Before cleanup, CI inspects every tagged manifest and stops
+on a multi-platform index, attestation, unknown manifest, or registry error.
+Retention keeps at least three tagged versions plus latest, and three untagged
+versions. Tagged SHA history is bounded separately. Grant the repository Actions
+admin access to its packages for deletion. Release versions outside retention
+may be removed; changing to multi-architecture publication requires revisiting
+retention.
+
+Image size is unknown until CI builds it; CI records compressed layer bytes.
+Aim for about 200 MB where this stack permits. Public package visibility must be
+checked on the package itself. The 500 MB storage and 1 GB/month private-package
+figures are planning assumptions: verify current
+[GitHub billing documentation](https://docs.github.com/en/billing/concepts/product-billing/github-packages).
+GITHUB_TOKEN-authenticated downloads inside GitHub Actions do not count toward
+package transfer usage.
+
+
+### Windows and Linux development shortcuts
+
+The explicit development Compose commands above also have native launchers:
+
+| Step | Windows PowerShell | Linux |
+| --- | --- | --- |
+| First build, or after dependency manifest changes | `pwsh -File ./dev.ps1 build` | `sh dev.sh build` |
+| Daily development | `pwsh -File ./dev.ps1` | `sh dev.sh` |
+| Stop the development stack | `pwsh -File ./dev.ps1 down` | `sh dev.sh down` |
+| View development logs | `pwsh -File ./dev.ps1 logs` | `sh dev.sh logs` |
+
+Create the documented local `.env.dev` first. Daily startup always passes
+`--no-build`; source edits use the development mounts and reloaders. Dependency
+changes require the explicit build command, then the documented dependency-volume
+refresh where applicable. Pulling a production image remains a separate explicit
+Compose command. Optional profiles are selected explicitly with `COMPOSE_PROFILES`
+or the full Compose command; they are not enabled by these launchers.
+
+The scripts resolve the checkout directory and preserve Docker's exit code.
+Invoke Linux scripts with `sh` on SMB mounts where executable bits are unavailable.
+Mount paths must exist on the Docker daemon's host; a Windows drive letter is not
+a Linux mount path. Existing production and Windows administration launchers remain
+separate from these development commands.
+
+### SMB and remote Docker hosts
+
+Run Compose from a checkout path that the selected Docker daemon can access.
+A mapped Windows drive is not automatically available inside WSL or on a remote
+Linux Docker host; use that host's mounted share path or a local checkout when
+necessary. Polling handles missing file-change events after the bind mount works;
+it cannot make an inaccessible path visible. The maintenance checks validated
+Compose configuration and Windows/Linux reload fixtures, but did not launch this
+full stack or verify its actual SMB bind mount.

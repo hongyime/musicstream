@@ -57,7 +57,7 @@
 ## Auto State
 
 - Updated: 2026-09-24 00:01:05 +08:00
-- Machine: PRAWN-L390
+- Machine: dev-host-3.example
 - Harness: claude
 - Event: stop
 - Branch: main
@@ -132,7 +132,7 @@ Portfolio upkeep reviewed storage/session settings, provider backoff, backup rot
   - Scheduler `download_pipeline` cron changed `hour=3` → `hour="*/4"` — 4-hourly instead of daily. Six chances per day to drain the backlog instead of one.
 - Memory: bumped `docker-compose.yml` daemon limit `512M → 1024M`. Under load with 4 yt-dlp workers + ffmpeg subprocesses + LIBRESPOT_SWEEP_CONCURRENT running Phase 1 in parallel with Phase 2 + startup Spotify sync + LB discovery, the 512 MiB cap was reached in 13 min from cold boot and starved the FastAPI /health endpoint. Post-bump: 213 MiB / 1 GiB (20%) after 5 min warm, healthy. The bump is a workaround; the actual leak is what tracemalloc is instrumented to find.
 - Tracemalloc leak-hunt now armed: `TRACEMALLOC_ENABLED=1` in `.env`, baseline dump lands in `/app/logs/tracemalloc.jsonl` ~3s after boot (offloaded to a thread via `asyncio.to_thread` — the first attempt ran inline in the asyncio event loop and blocked the /health endpoint for seconds; that's what looked like a leak but was really loop starvation). Hourly dumps continue via the APScheduler job. To hunt: `jq '.top[0]' logs/tracemalloc.jsonl` across snapshots — a growing `size_mib` at the same `loc` string is the leak.
-- Neighbour-container check: `nebula-sync` is actually healthy right now (FailingStreak=0). Recent errors are Tailscale reachability timeouts to two pihole replicas (`100.87.34.38`, `100.92.164.125`) — transient network, not a broken container. `pihole` itself is healthy but its log is warning about **load average 47-60 on an 8-vCPU WSL2 VM**. `unifiedcollector_postgres` alone consumes ~180% CPU sustained. Musicstream's CPU-starved boots (72s+ for DB connection, 90s+ for alembic migrations) are downstream of this host contention — not fixable in musicstream config.
+- Neighbour-container check: `nebula-sync` is actually healthy right now (FailingStreak=0). Recent errors are Tailscale reachability timeouts to two pihole replicas (`192.0.2.27`, `192.0.2.150`) — transient network, not a broken container. `pihole` itself is healthy but its log is warning about **load average 47-60 on an 8-vCPU WSL2 VM**. `unifiedcollector_postgres` alone consumes ~180% CPU sustained. Musicstream's CPU-starved boots (72s+ for DB connection, 90s+ for alembic migrations) are downstream of this host contention — not fixable in musicstream config.
 - pytest sweep run in an ephemeral container (`docker compose run --rm --no-deps daemon pytest tests/ -q`): **329 passed, 3 failed, 4 errors, 6 skipped, 71 warnings, 341s total**. All 3 failures + 4 errors are `PytestUnknownMarkWarning: Unknown pytest.mark.asyncio` — pytest-asyncio plugin missing from the image (STATE 2026-09-02 shows 341 passing → this is a regression in the image, not caused by my changes). None of the failing tests touch code I modified.
 - Files changed this pass: `.env`, `.env.example`, `docker-compose.yml`, `src/daemon.py`, `src/ingestion/downloader.py`, `.agents/STATE.md`, `.agents/JOURNAL.md`. Committed to `main` with `git add` per-file (no `git add .` — `docker_ports.txt` is legitimately untracked local state; STATE 2026-09-02 flagged preservation).
 - Not yet done: (1) actual leak location — needs 2-3h of production traffic through tracemalloc-enabled daemon then a `jq` diff across `logs/tracemalloc.jsonl` entries; (2) pytest-asyncio reinstate — needs a Dockerfile.daemon change to pin the plugin; (3) the WSL2 host load average is another day's problem.
@@ -167,3 +167,9 @@ Portfolio upkeep reviewed storage/session settings, provider backoff, backup rot
   - SIGUSR1 on-demand dump STILL doesn't append even with tini -g confirmed forwarding + handler logged as registered. Suspect uvicorn's own signal handling shadows the asyncio `add_signal_handler` for SIGUSR1, or the handler thread is starved. The hourly-cron dump path works (that's what diagnosed the leak), so SIGUSR1 is a convenience, not load-bearing. Left as-is; revisit if on-demand dumps become necessary.
   - Post-rebuild RSS read 500 MiB early in a heavy-load boot — need to confirm the MALLOC_ARENA_MAX=2 plateau holds once startup settles and the host calms. Watch tracemalloc.jsonl rss_mib over the next day.
 - Files changed this pass: `requirements.txt` (pytest-asyncio 0.26.0 → 1.4.0), `.agents/STATE.md`, `.agents/JOURNAL.md`. (Dockerfile.daemon tini -g + docker-compose malloc env were committed in 5c3dec4 last pass and are now actually built into the image.)
+
+Machine-specific values in this document use privacy placeholders.
+
+2026-09-27: Added explicit standalone development Compose configuration with mounted backend reload and frontend development services, isolated development data, and GHCR publishing with guarded retention. Local configuration and static checks passed. Image builds, full-stack runtime, and live CI publication remain unverified; no commit/push.
+
+2026-09-27: Publication is being prepared from the current remote main. Reviewed development, portability and privacy changes are isolated from the original checkout; runtime smoke and initial image CI verification are in progress.

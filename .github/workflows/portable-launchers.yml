@@ -1,0 +1,21 @@
+name: Portable development launcher contracts
+on:
+  push:
+    paths: ['dev.sh', 'dev.ps1', 'tests/test_dev_launchers.py', '.github/workflows/portable-launchers.yml']
+  pull_request:
+    paths: ['dev.sh', 'dev.ps1', 'tests/test_dev_launchers.py', '.github/workflows/portable-launchers.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  launchers:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tests -p test_dev_launchers.py -v
