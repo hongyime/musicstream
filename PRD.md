@@ -194,7 +194,6 @@ CREATE TABLE tracks (
     file_path           TEXT,           -- absolute host path (external HDD)
     file_size_bytes     BIGINT,
     file_sha256         TEXT,           -- for integrity check; redownload if mismatch
-    file_verified        BOOLEAN DEFAULT FALSE,
 
     -- Lifecycle
     created_at          TIMESTAMPTZ DEFAULT NOW(),
