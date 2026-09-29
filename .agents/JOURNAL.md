@@ -55,3 +55,4 @@ Machine-specific values in this document use privacy placeholders.
 - 2026-09-28 16:10:30 +08:00 [PRAWN-L390/claude/stop] branch=main head=c8ba1ce dirty=1
 - 2026-09-28 18:41:08 +08:00 [PRAWN-L390/claude/stop] branch=main head=db490f4 dirty=1
 - 2026-09-28 19:16:05 +08:00 [PRAWN-L390/claude/stop] branch=main head=db490f4 dirty=1
+2026-09-27: Backported reviewed and merged SMB source-sync maintenance to this existing checkout without changing its branch, HEAD, or staged index. Includes the explicit no-build/no-pull development helper, guarded shutdown, and production dependency checks. Eleven focused synthetic lifecycle/source-sync tests passed here. Dependency manifests were unchanged. Existing local work is preserved; no canonical commit, push, reset, or stash was performed. Live runtime evidence belongs to the separate isolated verification checkout.
