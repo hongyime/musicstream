@@ -296,7 +296,15 @@ class TestSchedulerJobs:
         assert ic_call is not None
         assert ic_call[1]["day_of_week"] == "sun"
 
-    def test_db_backup_on_sunday(self):
+    def test_db_backup_daily(self):
+        """db_backup cron has no day_of_week filter — fires daily, not just Sunday.
+
+        Changed 2026-09-30: weekly-only left up to 7 days of exposure if a
+        daemon restart also happened to straddle that one window (which is
+        exactly what caused a real 10-day backup gap). Daily is now the
+        cron backstop; the primary path is the parallel startup fire at
+        Step 7 (see test_daemon_background_startup_*).
+        """
         import src.daemon as daemon_module
         mock_scheduler = MagicMock()
         with patch.object(daemon_module, "scheduler", mock_scheduler):
@@ -307,4 +315,5 @@ class TestSchedulerJobs:
             (c for c in calls if c[1].get("id") == "db_backup"), None
         )
         assert bk_call is not None
-        assert bk_call[1]["day_of_week"] == "sun"
+        assert bk_call[1]["hour"] == 5
+        assert "day_of_week" not in bk_call[1]

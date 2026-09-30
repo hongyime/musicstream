@@ -13,7 +13,7 @@ New tracks added to Spotify are downloaded and organized on disk within ~15 minu
 - **File integrity checker**: SHA-256 hash verification; missing/corrupt files auto-requeued
 - **Music discovery**: ListenBrainz CF recommendations ingested daily into your library
 - **HTTP control plane**: `/sync`, `/integrity`, `/discover`, `/health`, `/metrics` on port 9079
-- **Automated backups**: `pg_dump` after every full run, 14 snapshots retained
+- **Automated backups**: `pg_dump` fires in parallel on every daemon startup (non-blocking) plus a daily 5am cron backstop, 14 snapshots retained
 
 ## Tech Stack
 | Layer | Technology |

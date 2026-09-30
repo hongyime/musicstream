@@ -392,7 +392,18 @@ async def _background_startup():
         _background_tasks.add(_spotify_task)
         _spotify_task.add_done_callback(_background_tasks.discard)
 
-        logger.info("Step 7/9: Running download pipeline…")
+        logger.info("Step 7/9: Scheduling DB backup (parallel, fires immediately)…")
+        # Step 7 fires-and-forgets in parallel for the same reason step 8 does:
+        # a long download_pipeline() (can be hours when there's a backlog) must
+        # not gate the backup. Previously backup ran sequentially AFTER download
+        # pipeline finished — if the daemon restarted before that (Docker/host
+        # instability, redeploys) the startup backup never fired, and the lone
+        # weekly cron backstop left up to 7 days of exposure if a restart also
+        # happened to straddle that window. pg_dump reads an MVCC snapshot, so
+        # running it concurrently with active downloads writing rows is safe.
+        _backup_task = asyncio.create_task(asyncio.to_thread(tasks.db_backup))
+        _background_tasks.add(_backup_task)
+        _backup_task.add_done_callback(_background_tasks.discard)
 
         # Step 8 fires-and-forgets in parallel so a long download_pipeline()
         # (can be hours when there's a backlog) doesn't starve discovery.
@@ -404,11 +415,9 @@ async def _background_startup():
         _background_tasks.add(_lb_task)
         _lb_task.add_done_callback(_background_tasks.discard)
 
+        logger.info("Step 9/9: Running download pipeline…")
         dl, fail = await asyncio.to_thread(tasks.download_pipeline, run_id=run_id)
         await asyncio.to_thread(tasks._record_run_complete, run_id=run_id, downloaded=dl, failed=fail)
-
-        logger.info("Step 9/9: Running DB backup…")
-        await asyncio.to_thread(tasks.db_backup)
 
         logger.info("Daemon fully initialised. Scheduler running.")
     except Exception as exc:
@@ -846,7 +855,10 @@ def _register_scheduler_jobs():
     scheduler.add_job(tasks.requeue_stale_downloads, "interval", minutes=15, id="stale_download_requeue", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.listenbrainz_discovery, "cron", hour=4, id="lb_discovery", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.full_integrity_check, "cron", day_of_week="wed,sun", hour=5, id="integrity_check", replace_existing=True, misfire_grace_time=GRACE)
-    scheduler.add_job(tasks.db_backup, "cron", day_of_week="sun", hour=5, id="db_backup", replace_existing=True, misfire_grace_time=GRACE)
+    # Daily (not weekly) backstop: even with Step 7's parallel fire-and-forget
+    # backup on every startup, a daemon that stays up for days without a
+    # restart would otherwise wait a full week for this cron to catch it.
+    scheduler.add_job(tasks.db_backup, "cron", hour=5, id="db_backup", replace_existing=True, misfire_grace_time=GRACE)
     # §W3 T18/V13: hourly token early-warning probe.
     scheduler.add_job(tasks.probe_spotify_token, "interval", hours=1, id="token_probe", replace_existing=True, misfire_grace_time=GRACE)
     # §W3 T20: weekly quality-upgrade requeue (before the 03:00 daily pipeline
