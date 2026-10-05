@@ -1,5 +1,13 @@
 # STATE
 
+## Current task — 2026-10-06
+- Rebuilt `musicstream-daemon` from the current Dockerfile and recreated it. Production image reports `yt-dlp 2026.08.19` and excludes pytest; frontend build completed.
+- Musicstream containers use CPUs `0-7`; daemon memory cap is 2 GiB and PostgreSQL 1 GiB. Existing WSL settings expose all 8 CPUs and enough memory for these caps.
+- Database volume `musicstream_postgres_data` remains mounted. It is the only volume labeled for this Compose project; no unused Musicstream volume was found. Unrelated detached Docker volumes were left untouched.
+- Live verification on 2026-10-06: daemon and PostgreSQL healthy; `/health/deep` reports `status=ok`, database and scheduler healthy, downloads enabled, 4 downloading, zero stale, and 6,422 successes/24h. New MP3 output was verified on the configured host media drive; stored Spotify authentication works without interactive login.
+- Docker Desktop has `AutoStart=true` and a Windows logon Run entry; Compose containers use `restart: unless-stopped`. The self-heal loop is currently running and checking every 5 minutes, but no persistent `SelfHeal` scheduled task or Startup-folder launcher is installed, so that watchdog itself is not guaranteed to relaunch after sign-out/reboot.
+- Local changes intended for push: `.agents/STATE.md`, `.agents/JOURNAL.md`, and `docker-compose.yml`. Preserve untracked `docker_ports.txt` and the gitignored local Compose override.
+
 ## 2026-09-22 — restore outage and resolve health timeouts (completed 2026-09-23)
 - User requested resolution of remaining operational failures; all work is text-only (no images or screenshots sent to models/agents).
 - Daemon and Plex are stopped with exit 137, not OOM. Docker refuses restart because `/run/desktop/mnt/host/c` is stale; daemon logs show `OSError: [Errno 5] Input/output error` on log files. Nightly restart at 04:00 failed (task result 1).
@@ -81,13 +89,13 @@
 <!-- MOLT_AUTO_START -->
 ## Auto State
 
-- Updated: 2026-09-30 09:19:20 +08:00
+- Updated: 2026-10-06 06:36:59 +08:00
 - Machine: PRAWN-L390
-- Harness: claude
-- Event: stop
+- Harness: codex
+- Event: session-start
 - Branch: main
-- HEAD: 137301b
-- Dirty files: 1
+- HEAD: a7d4e5b
+- Dirty files: 2
 - Resume hint: Read .agents/STATE.md, then the latest file in .agents/handoffs/ if present.
 <!-- MOLT_AUTO_END -->
 

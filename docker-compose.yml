@@ -25,13 +25,10 @@ services:
           # daemon's `SELECT tracks.id FROM tracks WHERE status='pending'` for
           # the pending sweep pushed the server past 128M and Postgres OOM-killed
           # itself mid-COMMIT (see incident post-mortem in commit body).
-          # 2026-09-28: bumped 256M -> 512M.  DB grew to 453k tracks (2.3x the
-          # size at the last bump) and live usage was sitting at 202M/256M
-          # (79%, only 54M headroom) with 0.7G free on the host overall.
-          # 512M restores the same ~2x headroom ratio the 256M bump gave at
-          # the time; this is a cap, not a reservation - actual usage won't
-          # jump to 512M just because the ceiling moved.
-          memory: 512M
+          # 2026-09-28: raised 256M -> 512M as the DB grew to 453k tracks.
+          # 2026-10-05: raised 512M -> 1G after live usage reached 428M
+          # (84%) during collection. This is a cap, not a reservation.
+          memory: 1G
     # Cap docker json-file logs — without this, /var/lib/docker/containers/<id>-json.log
     # grows without bound (saw 44 MB on neighbour projects). 10m × 3 = 30 MB max per service.
     logging:
@@ -141,13 +138,15 @@ services:
     # workers + ffmpeg subprocesses + LIBRESPOT_SWEEP_CONCURRENT running
     # Phase 1 in parallel with Phase 2, RSS reached 503/512 MiB (98%) in
     # 13 min from cold boot and starved the FastAPI /health endpoint.
-    # 1 GiB gives real headroom for the yt-dlp + ffmpeg working set while
-    # still capping the runaway blast radius.  Watch tracemalloc.jsonl for
-    # the actual leak (this bump is a workaround, not the root cause).
+    # 1 GiB gives headroom for the yt-dlp + ffmpeg working set while still
+    # capping the runaway blast radius.  Watch tracemalloc.jsonl for the
+    # actual leak (this bump is a workaround, not the root cause).
+    # 2026-10-05: raised 1 GiB -> 2 GiB after live collection reached
+    # 754 MiB (74%). This remains a cap, not a reservation.
     deploy:
       resources:
         limits:
-          memory: 1024M
+          memory: 2048M
     depends_on:
       postgres:
         condition: service_healthy
