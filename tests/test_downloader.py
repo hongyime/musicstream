@@ -211,6 +211,53 @@ class TestBuildMp3Opts:
         opts = self.orch._build_mp3_opts("/tmp/mystem")
         assert "/tmp/mystem" in opts["outtmpl"]
 
+    def test_configured_po_token_provider_is_shared_mp3_option(self, monkeypatch):
+        monkeypatch.setenv("YTDLP_POT_PROVIDER_URL", "http://pot.test:4416")
+        self.orch._attach_cookie_snapshot = MagicMock(return_value=None)
+
+        opts = self.orch._build_mp3_opts("/tmp/pot")
+
+        assert opts["extractor_args"]["youtubepot-bgutilhttp"] == {
+            "base_url": ["http://pot.test:4416"],
+        }
+
+    def test_tier4_flat_search_uses_configured_po_token_provider(self, monkeypatch):
+        from src.ingestion import downloader as downloader_module
+
+        monkeypatch.setenv("YTDLP_POT_PROVIDER_URL", "http://pot.test:4416")
+        orch = self.orch
+        orch._rate_limiter = MagicMock()
+        orch._throttle = MagicMock()
+        orch._throttle.wait.return_value = True
+        orch._provider_limiter = MagicMock()
+        orch._provider_limiter.acquire.return_value = object()
+        orch._attach_cookie_snapshot = MagicMock(return_value=None)
+        orch._release_cookie_snapshot = MagicMock()
+        track = Track(id=123, title="Song", artist="Artist", duration_ms=180000)
+        captured = []
+
+        class FakeYoutubeDL:
+            def __init__(self, options):
+                captured.append(options)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def extract_info(self, *_args, **_kwargs):
+                return {"entries": []}
+
+        with patch.object(downloader_module.yt_dlp, "YoutubeDL", FakeYoutubeDL):
+            assert orch._tier4_ytdlp_youtube(track) is None
+
+        assert len(captured) == 2
+        for options in captured:
+            assert options["extractor_args"]["youtubepot-bgutilhttp"] == {
+                "base_url": ["http://pot.test:4416"],
+            }
+
 
 # ── download_track() — P8: single failure never stops queue ──────────────────
 

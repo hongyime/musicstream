@@ -47,6 +47,22 @@ services:
       timeout: 5s
       retries: 5
 
+  yt-pot-provider:
+    # Keep the HTTP token service inside the Compose network; it has no host port.
+    image: brainicism/bgutil-ytdlp-pot-provider:2.0.2
+    container_name: musicstream-yt-pot-provider
+    expose:
+      - "4416"
+    init: true
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    security_opt:
+      - no-new-privileges:true
+
   daemon:
     build:
       context: .
@@ -102,6 +118,7 @@ services:
       # bypass for local dev only — never set in production.
       - DAEMON_API_TOKEN=${DAEMON_API_TOKEN}
       - DAEMON_DEV_NOAUTH=***
+      - YTDLP_POT_PROVIDER_URL=http://yt-pot-provider:4416
       # Audit #13: persisted throttle state (rate-limiter backoff history)
       # so a daemon restart doesn't reset cooldowns and re-trigger 429s.
       - THROTTLE_STATE_PATH=/app/data/throttle_state.json
@@ -150,6 +167,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      yt-pot-provider:
+        condition: service_started
     # 2026-09-18: tightened from interval=60s/retries=3/timeout=10s.  A 16h
     # uptime run had the FastAPI socket hung while APScheduler jobs kept
     # running; Docker didn't mark unhealthy for over an hour because 60s x 3

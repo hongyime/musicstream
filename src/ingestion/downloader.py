@@ -191,6 +191,17 @@ _DEFAULT_TRANSIENT_RETRY_BASE_MINUTES = 30
 _DEFAULT_TRANSIENT_RETRY_MAX_MINUTES = 1440
 
 
+def _yt_dlp_extractor_args() -> dict[str, dict[str, list[str]]]:
+    """Shared YouTube extractor configuration, including the optional PO-token service."""
+    args: dict[str, dict[str, list[str] | str]] = {
+        "youtube": {"player_client": ["android", "web"]},
+    }
+    provider_url = os.environ.get("YTDLP_POT_PROVIDER_URL", "").strip()
+    if provider_url:
+        args["youtubepot-bgutilhttp"] = {"base_url": [provider_url]}
+    return args
+
+
 def _content_failure_threshold() -> int:
     try:
         return max(1, int(os.environ.get("CONTENT_FAILURE_PASSES", str(_DEFAULT_CONTENT_FAILURE_PASSES))))
@@ -1886,6 +1897,7 @@ class DownloadOrchestrator:
                 "extract_flat": "in_playlist",
                 "noplaylist": False,
                 "ignoreerrors": True,
+                "extractor_args": _yt_dlp_extractor_args(),
             }
             cookie_snapshot = self._attach_cookie_snapshot(flat_opts)
             try:
@@ -2276,9 +2288,7 @@ class DownloadOrchestrator:
             # Android player client returns pre-signed format URLs that bypass
             # YouTube's JS nsig decryption challenge — no JS runtime required.
             # Without this, modern music content returns "format not available".
-            "extractor_args": {
-                "youtube": {"player_client": ["android", "web"]},
-            },
+            "extractor_args": _yt_dlp_extractor_args(),
         }
 
         self._attach_cookie_snapshot(opts)

@@ -11,6 +11,8 @@ python-dotenv==1.2.2
 # earlier 'unsolvable conflict' note was about pinning to arbitrary versions).
 # yt-dlp ships breaking changes often — bump deliberately via Dependabot PRs.
 yt-dlp[default]==2026.7.4
+# YouTube PO-token provider plugin; paired with the 2.0.2 HTTP sidecar in Compose.
+bgutil-ytdlp-pot-provider==2.0.2
 ytmusicapi==1.12.1
 spotdl==4.5.0
 # spotdl 3.9.6 imports pkg_resources (legacy setuptools API).
