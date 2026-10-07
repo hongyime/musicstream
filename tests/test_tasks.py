@@ -42,6 +42,7 @@ class TestResetFailedTracks:
         t = _track(session, "spotify:track:rf1", "failed", attempt_count=25)
         t.content_failure_passes = 6
         t.transient_failure_passes = 4
+        t.consecutive_failed_passes = 6
         t.next_retry_at = datetime.now(timezone.utc) + timedelta(hours=1)
         t.last_pipeline_outcome = "content_miss"
         t.last_pipeline_error = "no_candidates"
@@ -55,6 +56,7 @@ class TestResetFailedTracks:
         assert rt.last_attempt_at is None
         assert rt.content_failure_passes == 0
         assert rt.transient_failure_passes == 0
+        assert rt.consecutive_failed_passes == 0
         assert rt.next_retry_at is None
         assert rt.last_pipeline_outcome is None
         assert rt.last_pipeline_error is None

@@ -441,6 +441,7 @@ def reset_failed_tracks(session) -> int:
                 "last_attempt_at": None,
                 "content_failure_passes": 0,
                 "transient_failure_passes": 0,
+                "consecutive_failed_passes": 0,
                 "next_retry_at": None,
                 "last_pipeline_outcome": None,
                 "last_pipeline_error": None,
@@ -486,6 +487,7 @@ def unblock_track(session, track_id: int) -> bool:
     track.last_attempt_at = None
     track.content_failure_passes = 0
     track.transient_failure_passes = 0
+    track.consecutive_failed_passes = 0
     track.next_retry_at = None
     track.last_pipeline_outcome = None
     track.last_pipeline_error = None
@@ -499,46 +501,35 @@ def unblock_track(session, track_id: int) -> bool:
 
 
 def auto_block_if_exhausted(session, track) -> bool:
-    """Quarantine a track once it has failed on >= AUTO_BLOCK_THRESHOLD distinct
-    days (§W3 T14/V7). Distinct-day counting approximates 'consecutive full-chain
-    passes' without new schema: multiple tier failures within one day collapse to
-    one pass. Only non-downloaded tracks are eligible. Returns True if blocked now.
+    """Quarantine after AUTO_BLOCK_THRESHOLD consecutive complete content misses.
+
+    The counter is maintained on Track once per pipeline outcome, so tier
+    attempts, calendar boundaries, and retention pruning do not affect it.
+    Provider-only transient failures are inconclusive and never trigger a block.
     """
-    from sqlalchemy import func
-    from sqlalchemy import func
     from src.core import config
-    from src.models import DownloadAttempt, TrackStatus
+    from src.models import TrackStatus
 
     if track.blocked or track.status == TrackStatus.DOWNLOADED.value:
         return False
 
-    threshold = config.AUTO_BLOCK_THRESHOLD
-    rows = (
-        session.query(func.date(DownloadAttempt.attempted_at))
-        .filter(
-            DownloadAttempt.track_id == track.id,
-            DownloadAttempt.success.is_(False),
-        )
-        .distinct()
-        .all()
-    )
-    # func.date() is ISO 'YYYY-MM-DD' on both SQLite and PostgreSQL.
-    pass_days = len({row[0] for row in rows})
-    if pass_days < threshold:
+    threshold = max(1, config.AUTO_BLOCK_THRESHOLD)
+    failed_passes = track.consecutive_failed_passes or 0
+    if track.last_pipeline_outcome != "content_miss" or failed_passes < threshold:
         return False
 
     track.blocked = True
-    track.blocked_reason = f"auto: {pass_days} consecutive failed passes"
+    track.blocked_reason = f"auto: {failed_passes} consecutive content-miss pipeline passes"
     track.blocked_at = datetime.now(timezone.utc)
     session.flush()
     logger.warning(
-        "[AUTO_BLOCK] track id=%d '%s' by '%s' — %d distinct failed-pass days >= threshold %d",
-        track.id, track.title, track.artist, pass_days, threshold,
+        "[AUTO_BLOCK] track id=%d '%s' by '%s' — %d consecutive failed pipeline passes >= threshold %d",
+        track.id, track.title, track.artist, failed_passes, threshold,
     )
     try:
         from src.services.notify import notify_failure
         notify_failure(
-            f"Track auto-blocked after {pass_days} failed passes",
+            f"Track auto-blocked after {failed_passes} failed passes",
             detail=f"{track.title} — {track.artist} (id={track.id})",
         )
     except Exception as exc:

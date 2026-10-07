@@ -3,13 +3,11 @@
 Blocked tracks must be inert everywhere:
   - reset_failed_tracks never touches them
   - IntegrityChecker never requeues them (missing/corrupt file stays as-is)
-  - auto-block fires after AUTO_BLOCK_THRESHOLD distinct failed-pass days
+  - auto-block fires after AUTO_BLOCK_THRESHOLD consecutive failed passes
   - block_track / unblock_track task helpers manage the flag
 """
 
 from __future__ import annotations
-
-from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -21,6 +19,7 @@ from src.core.tasks import (
     unblock_track,
 )
 from src.integrity.checker import IntegrityChecker
+from src.ingestion.downloader import DownloadOrchestrator
 from src.models import DownloadAttempt, Track
 from tests.conftest import _make_track
 
@@ -92,27 +91,15 @@ def test_integrity_corrupt_file_leaves_blocked_track_alone(session, tmp_path):
     assert t.status == "downloaded"
 
 
-# ── T14: auto-block after N distinct failed-pass days ────────────────────────
-
-def _seed_failed_attempts(session, track_id: int, days: list[int]):
-    base = datetime(2026, 8, 1, tzinfo=timezone.utc)
-    for i, day_offset in enumerate(days):
-        session.add(
-            DownloadAttempt(
-                track_id=track_id,
-                attempted_at=base + timedelta(days=day_offset),
-                method="ytm",
-                success=False,
-                error="test failure",
-            )
-        )
-    session.flush()
+# ── T14: auto-block after N consecutive complete failed passes ───────────────
 
 
 def test_auto_block_fires_at_threshold(session, monkeypatch):
     monkeypatch.setattr(config, "AUTO_BLOCK_THRESHOLD", 3)
     t = _make_track(session, "spotify:track:w3ab1", status="pending")
-    _seed_failed_attempts(session, t.id, days=[0, 1, 2])  # 3 distinct days
+    orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+    for _ in range(3):
+        orch._record_pipeline_pass(session, t, "content_miss", "no_candidates")
 
     hit = auto_block_if_exhausted(session, t)
 
@@ -121,12 +108,15 @@ def test_auto_block_fires_at_threshold(session, monkeypatch):
     assert t.blocked is True
     assert t.blocked_reason and "3" in t.blocked_reason
     assert t.blocked_at is not None
+    assert session.query(DownloadAttempt).filter_by(track_id=t.id, method="pipeline_pass").count() == 3
 
 
 def test_auto_block_does_not_fire_below_threshold(session, monkeypatch):
     monkeypatch.setattr(config, "AUTO_BLOCK_THRESHOLD", 6)
     t = _make_track(session, "spotify:track:w3ab2", status="pending")
-    _seed_failed_attempts(session, t.id, days=[0, 0, 1])  # same-day fails = 1 pass each
+    orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+    for _ in range(5):
+        orch._record_pipeline_pass(session, t, "content_miss", "no_candidates")
 
     hit = auto_block_if_exhausted(session, t)
 
@@ -139,15 +129,8 @@ def test_auto_block_ignores_successful_attempts(session, monkeypatch):
     """A successful attempt means the track worked before — never auto-block."""
     monkeypatch.setattr(config, "AUTO_BLOCK_THRESHOLD", 2)
     t = _make_track(session, "spotify:track:w3ab3", status="downloaded")
-    _seed_failed_attempts(session, t.id, days=[0, 1])
-    session.add(
-        DownloadAttempt(
-            track_id=t.id,
-            attempted_at=datetime(2026, 8, 3, tzinfo=timezone.utc),
-            method="ytm",
-            success=True,
-        )
-    )
+    t.consecutive_failed_passes = 2
+    t.last_pipeline_outcome = "success"
     session.flush()
 
     # downloaded track shouldn't even be considered
@@ -158,10 +141,26 @@ def test_auto_block_ignores_successful_attempts(session, monkeypatch):
     assert t.blocked is False
 
 
+def test_transient_failure_breaks_streak_and_does_not_auto_block(session, monkeypatch):
+    monkeypatch.setattr(config, "AUTO_BLOCK_THRESHOLD", 3)
+    t = _make_track(session, "spotify:track:w3transient", status="pending")
+    t.consecutive_failed_passes = 2
+    t.last_pipeline_outcome = "content_miss"
+    orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+
+    orch._record_pipeline_pass(session, t, "transient_failure", "provider_error")
+
+    assert t.consecutive_failed_passes == 0
+    assert auto_block_if_exhausted(session, t) is False
+    assert t.blocked is False
+
+
 # ── Manual block/unblock task helpers (API layer uses these) ─────────────────
 
 def test_block_and_unblock_roundtrip(session):
     t = _make_track(session, "spotify:track:w3rt1", status="failed")
+    t.consecutive_failed_passes = 4
+    session.flush()
 
     assert block_track(session, t.id, reason="sounds wrong") is True
     session.refresh(t)
@@ -173,6 +172,7 @@ def test_block_and_unblock_roundtrip(session):
     assert t.blocked is False
     assert t.blocked_reason is None
     assert t.status == "pending", "unblock should give the track a fresh start"
+    assert t.consecutive_failed_passes == 0
 
 
 def test_block_missing_track_returns_false(session):

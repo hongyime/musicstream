@@ -966,7 +966,14 @@ class DownloadOrchestrator:
         if outcome == "success":
             track.content_failure_passes = 0
             track.transient_failure_passes = 0
+            track.consecutive_failed_passes = 0
             track.next_retry_at = None
+        elif outcome == "content_miss":
+            track.consecutive_failed_passes = (track.consecutive_failed_passes or 0) + 1
+        elif outcome == "transient_failure":
+            # A provider outage makes this pass inconclusive and breaks the
+            # content-failure streak, but does not terminally fail the track.
+            track.consecutive_failed_passes = 0
 
     # ── Tier 1: SpotiFLAC ─────────────────────────────────────────────────────
 

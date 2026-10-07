@@ -244,6 +244,7 @@ class TestDownloadTrackIsolation:
     def test_transient_provider_failures_stay_pending_and_back_off(self, session, monkeypatch):
         track = _make_track(session, "spotify:track:transient_pending")
         track.content_failure_passes = 5
+        track.consecutive_failed_passes = 5
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         orch._rate_limiter = MagicMock()
         orch._tier1_enabled = False
@@ -259,6 +260,7 @@ class TestDownloadTrackIsolation:
         assert result is False
         assert track.status == TrackStatus.PENDING.value
         assert track.content_failure_passes == 5
+        assert track.consecutive_failed_passes == 0
         assert track.transient_failure_passes == 1
         assert track.last_pipeline_outcome == "transient_failure"
         assert track.next_retry_at is not None
@@ -296,6 +298,7 @@ class TestDownloadTrackIsolation:
         track = _make_track(session, "spotify:track:tier1_success")
         track.content_failure_passes = 4
         track.transient_failure_passes = 2
+        track.consecutive_failed_passes = 5
         track.next_retry_at = _utcnow()
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         orch._rate_limiter = MagicMock()
@@ -323,6 +326,7 @@ class TestDownloadTrackIsolation:
         assert track.claim_owner is None
         assert track.content_failure_passes == 0
         assert track.transient_failure_passes == 0
+        assert track.consecutive_failed_passes == 0
         assert track.next_retry_at is None
         pass_row = session.query(DownloadAttempt).filter_by(
             track_id=track.id, method="pipeline_pass", success=True,
