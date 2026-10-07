@@ -289,10 +289,10 @@ class DownloadOrchestrator:
         os.makedirs(TEMP_DIR, exist_ok=True)
 
         # Track ephemeral cookies copies so they can be cleaned at exit.
-        # Each yt-dlp call creates one if cookies.txt is read-only (Docker
-        # bind-mount); without explicit tracking they accumulate forever.
-        # (audit #20)
+        # Every yt-dlp invocation gets its own writable snapshot so concurrent
+        # yt-dlp cookie-jar updates cannot race through a shared file.
         self._tmp_cookie_files: set[str] = set()
+        self._cookie_snapshot_lock = threading.Lock()
 
         # Lazy-init tagger and organiser from env vars.
         # Imported here to avoid circular imports at module level.
@@ -1299,6 +1299,7 @@ class DownloadOrchestrator:
 
             out_stem = os.path.join(TEMP_DIR, str(uuid.uuid4()))
             ydl_opts = self._build_mp3_opts(out_stem)
+            cookie_snapshot = ydl_opts.get("cookiefile")
             url = f"https://www.youtube.com/watch?v={video_id}"
 
             try:
@@ -1374,6 +1375,8 @@ class DownloadOrchestrator:
                     )
                     self._rate_limiter.record_failure("youtube")
                     raise DownloadError(f"Tier 2 yt-dlp download failed: {exc}") from exc
+            finally:
+                self._release_cookie_snapshot(cookie_snapshot)
 
         self._note_fail(te.CONTENT_MISS)
         return None
@@ -1738,8 +1741,7 @@ class DownloadOrchestrator:
                 "noplaylist": False,
                 "ignoreerrors": True,
             }
-            if os.path.exists("cookies.txt") and os.path.getsize("cookies.txt") > 0:
-                flat_opts["cookiefile"] = "cookies.txt"
+            cookie_snapshot = self._attach_cookie_snapshot(flat_opts)
             try:
                 with yt_dlp.YoutubeDL(flat_opts) as ydl:
                     flat = ydl.extract_info(query, download=False)
@@ -1769,6 +1771,8 @@ class DownloadOrchestrator:
                 )
                 logger.warning("Tier 4 flat-extract '%s' failed: %s", query, exc)
                 continue
+            finally:
+                self._release_cookie_snapshot(cookie_snapshot)
             if (flat or {}).get("entries"):
                 self._provider_limiter_instance().complete(permit, success=True)
             else:
@@ -1828,6 +1832,7 @@ class DownloadOrchestrator:
 
             out_stem = os.path.join(TEMP_DIR, str(uuid.uuid4()))
             ydl_opts = self._build_mp3_opts(out_stem)
+            cookie_snapshot = ydl_opts.get("cookiefile")
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
@@ -1862,6 +1867,8 @@ class DownloadOrchestrator:
                 )
                 logger.warning("Tier 4 download '%s' failed: %s", url, exc)
                 continue
+            finally:
+                self._release_cookie_snapshot(cookie_snapshot)
 
             downloaded = self._find_output_file(out_stem)
             if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 0:
@@ -1900,6 +1907,7 @@ class DownloadOrchestrator:
         query = f"scsearch8:{track.title} {track.artist}"
         out_stem = os.path.join(TEMP_DIR, str(uuid.uuid4()))
         ydl_opts = self._build_mp3_opts(out_stem)
+        cookie_snapshot = ydl_opts.get("cookiefile")
         ydl_opts["noplaylist"] = False
         ydl_opts["ignoreerrors"] = True
         ydl_opts["max_downloads"] = 1
@@ -1923,6 +1931,8 @@ class DownloadOrchestrator:
                 self._rate_limiter.record_failure("soundcloud")
             logger.warning("Tier 5 SoundCloud failed for track %d ('%s'): %s", track.id, track.title, exc)
             return None
+        finally:
+            self._release_cookie_snapshot(cookie_snapshot)
 
         downloaded = self._find_output_file(out_stem)
         if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 0:
@@ -2050,19 +2060,7 @@ class DownloadOrchestrator:
             },
         }
 
-        cookies_src = "cookies.txt"
-        if os.path.exists(cookies_src) and os.path.getsize(cookies_src) > 0:
-            if os.access(cookies_src, os.W_OK):
-                opts["cookiefile"] = cookies_src
-            else:
-                # Docker mounts cookies.txt :ro — yt-dlp tries to write-lock it
-                # on open, causing EROFS. Reuse a single per-instance temp
-                # copy instead of leaking a fresh tempfile per call.
-                # (audit #20)
-                tmp_path = self._get_or_refresh_cookie_copy(cookies_src)
-                if tmp_path:
-                    opts["cookiefile"] = tmp_path
-
+        self._attach_cookie_snapshot(opts)
         return opts
 
     def _find_output_file(self, out_stem: str) -> Optional[str]:
@@ -2073,57 +2071,90 @@ class DownloadOrchestrator:
                 return candidate
         return None
 
-    def _get_or_refresh_cookie_copy(self, cookies_src: str) -> Optional[str]:
-        """Return a writable copy of cookies.txt, refreshed when source mtime moves.
+    def _attach_cookie_snapshot(self, opts: dict, cookies_src: str = "cookies.txt") -> Optional[str]:
+        """Attach a unique writable cookie snapshot to one yt-dlp options dict.
 
-        We keep one copy per Downloader instance and refresh only when the
-        underlying file changes — Docker bind-mount cookies are typically
-        rotated on a daily basis, much rarer than the per-call frequency
-        the previous implementation triggered.
-
-        Old copies (with stale mtime) get unlinked. Any errors degrade
-        gracefully to "no cookies" instead of breaking the tier.
+        Read the source metadata before and after copying. If an operator
+        replaces or edits cookies.txt during the copy, retry against the new
+        mtime/size instead of handing yt-dlp a potentially torn jar. A fresh
+        copy per call also prevents concurrent yt-dlp writers from sharing a
+        cookie jar. Missing or unreadable cookies degrade to anonymous access.
         """
-        try:
-            src_mtime = os.path.getmtime(cookies_src)
-        except OSError:
-            return None
+        lock = getattr(self, "_cookie_snapshot_lock", None)
+        if lock is None:  # Keep __new__-constructed test instances supported.
+            lock = self._cookie_snapshot_lock = threading.Lock()
+        files = getattr(self, "_tmp_cookie_files", None)
+        if files is None:
+            files = self._tmp_cookie_files = set()
 
-        cached = getattr(self, "_active_cookie_copy", None)
-        if cached and cached.get("src_mtime") == src_mtime and os.path.exists(cached["path"]):
-            return cached["path"]
+        with lock:
+            for _ in range(2):
+                tmp_path: Optional[str] = None
+                try:
+                    before = os.stat(cookies_src)
+                    if before.st_size <= 0:
+                        return None
+                    os.makedirs(TEMP_DIR, exist_ok=True)
+                    tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False, dir=TEMP_DIR)
+                    tmp_path = tmp.name
+                    tmp.close()
+                    shutil.copyfile(cookies_src, tmp_path)
+                    after = os.stat(cookies_src)
+                    before_signature = (before.st_mtime_ns, before.st_ctime_ns, before.st_size, before.st_ino)
+                    after_signature = (after.st_mtime_ns, after.st_ctime_ns, after.st_size, after.st_ino)
+                    if before_signature != after_signature:
+                        os.unlink(tmp_path)
+                        continue
+                    try:
+                        os.chmod(tmp_path, 0o600)
+                    except OSError:
+                        pass
+                    files.add(tmp_path)
+                    opts["cookiefile"] = tmp_path
+                    return tmp_path
+                except OSError as exc:
+                    if tmp_path:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                    logger.debug("Could not snapshot cookies.txt: %s", exc)
+                    return None
+        logger.debug("cookies.txt changed repeatedly while snapshotting; continuing without cookies")
+        return None
 
-        # Refresh: unlink old copy, create new one.
-        if cached and os.path.exists(cached.get("path", "")):
+    def _release_cookie_snapshot(self, path: Optional[str]) -> None:
+        if not path:
+            return
+        files = getattr(self, "_tmp_cookie_files", set())
+        lock = getattr(self, "_cookie_snapshot_lock", None)
+        if lock is None:
+            lock = self._cookie_snapshot_lock = threading.Lock()
+        with lock:
             try:
-                os.unlink(cached["path"])
-                self._tmp_cookie_files.discard(cached["path"])
-            except OSError:
+                os.unlink(path)
+            except FileNotFoundError:
                 pass
-
-        try:
-            tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False, dir=TEMP_DIR)
-            shutil.copy2(cookies_src, tmp.name)
-            tmp.close()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Could not copy cookies.txt to temp: %s", exc)
-            return None
-
-        self._tmp_cookie_files.add(tmp.name)
-        self._active_cookie_copy = {"path": tmp.name, "src_mtime": src_mtime}
-        return tmp.name
+            except OSError as exc:
+                logger.debug("Could not remove private cookie snapshot %r: %s", path, exc)
+            finally:
+                files.discard(path)
 
     def cleanup_temp_cookies(self) -> None:
         """Remove any tracked temp cookie copies. Safe to call repeatedly."""
-        for path in list(self._tmp_cookie_files):
-            try:
-                if os.path.exists(path):
+        lock = getattr(self, "_cookie_snapshot_lock", None)
+        if lock is None:
+            lock = self._cookie_snapshot_lock = threading.Lock()
+        with lock:
+            for path in list(getattr(self, "_tmp_cookie_files", set())):
+                try:
                     os.unlink(path)
-            except OSError as exc:
-                logger.debug("Could not remove temp cookies %r: %s", path, exc)
-            finally:
-                self._tmp_cookie_files.discard(path)
-        self._active_cookie_copy = None
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.debug("Could not remove temp cookies %r: %s", path, exc)
+                finally:
+                    self._tmp_cookie_files.discard(path)
 
     def __del__(self) -> None:
         # Best-effort cleanup at GC time. __del__ is unreliable so we don't

@@ -616,6 +616,38 @@ class TestProperty2PreservationYouTubeDownloads:
             "Fragment retry count should remain 3 (unchanged)"
         assert opts.get("skip_unavailable_fragments") is True, \
             "skip_unavailable_fragments should remain True (unchanged)"
+
+    def test_cookie_snapshots_are_private_per_invocation_and_refresh_after_replace(
+        self, tmp_path, monkeypatch
+    ):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from src.ingestion import downloader as downloader_module
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(downloader_module, "TEMP_DIR", str(tmp_path / "temp"))
+        source = tmp_path / "cookies.txt"
+        source.write_text("old-cookie-jar", encoding="utf-8")
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            options = list(pool.map(lambda i: orch._build_mp3_opts(f"/tmp/{i}"), range(6)))
+
+        snapshots = [opts["cookiefile"] for opts in options]
+        assert len(set(snapshots)) == len(snapshots)
+        assert all(Path(path).read_text(encoding="utf-8") == "old-cookie-jar" for path in snapshots)
+        assert source.read_text(encoding="utf-8") == "old-cookie-jar"
+
+        source.write_text("replacement-cookie-jar", encoding="utf-8")
+        replacement_opts = orch._build_mp3_opts("/tmp/replacement")
+        replacement = replacement_opts["cookiefile"]
+        assert replacement not in snapshots
+        assert Path(replacement).read_text(encoding="utf-8") == "replacement-cookie-jar"
+        assert all(Path(path).exists() for path in snapshots)
+
+        orch.cleanup_temp_cookies()
+        assert all(not Path(path).exists() for path in snapshots + [replacement])
+        assert source.read_text(encoding="utf-8") == "replacement-cookie-jar"
     
     @given(stem=st.sampled_from(["/tmp/test", "/tmp/video", "/tmp/audio123"]))
     @settings(max_examples=10)

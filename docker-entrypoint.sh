@@ -49,7 +49,7 @@ done
 # permissive-mode warning and re-applies after bind-mount remounts that reset
 # host-derived perms to 0777. Still owner-writable so OAuth/credential refresh
 # (Spotipy/spotdl/librespot rewrite these in place) keeps working.
-for f in /app/spotify_token.json /app/cookies.txt /app/data/librespot_credentials.json; do
+for f in /app/spotify_token.json /app/data/librespot_credentials.json; do
     if [ -e "$f" ]; then
         chown "$RUNTIME_UID:$RUNTIME_GID" "$f" 2>/dev/null || true
         chmod 600 "$f" 2>/dev/null || true
