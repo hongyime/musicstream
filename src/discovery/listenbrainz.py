@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session
 
 from src.exceptions import ListenBrainzError, MusicBrainzError
 from src.models import LbRecommendation, Track, TrackStatus
-from src.rate_limiter import ServiceRateLimiter
+from src.rate_limiter import ServiceRateLimiter, get_adaptive_provider_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,7 @@ class ListenBrainzDiscovery:
         self._token    = token    or os.environ.get("LISTENBRAINZ_TOKEN", "")
         self._username = username or os.environ.get("LISTENBRAINZ_USERNAME", "")
         self._rl       = rate_limiter or ServiceRateLimiter()
+        self._provider_limiter = get_adaptive_provider_limiter()
 
         # Shared HTTP session for ListenBrainz calls
         self._lb_session = requests.Session()
@@ -174,7 +175,10 @@ class ListenBrainzDiscovery:
                 self._rl.wait("listenbrainz", attempt=attempt)
 
             try:
-                resp = self._lb_session.get(url, params=params, timeout=30)
+                resp = self._provider_limiter.observe_call(
+                    "listenbrainz", self._lb_session.get,
+                    url, params=params, timeout=30,
+                )
             except requests.RequestException as exc:
                 self._rl.record_failure("listenbrainz")
                 if attempt == 2:
@@ -227,7 +231,8 @@ class ListenBrainzDiscovery:
 
         url = f"{MB_WS2_BASE}/recording/{recording_mbid}"
         try:
-            resp = self._mb_session.get(
+            resp = self._provider_limiter.observe_call(
+                "musicbrainz", self._mb_session.get,
                 url,
                 params={"inc": "releases artists", "fmt": "json"},
                 timeout=15,

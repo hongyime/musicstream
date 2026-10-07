@@ -10,6 +10,7 @@ Covers:
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -18,9 +19,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 from src.rate_limiter import (
+    AdaptiveProviderLimiter,
     ExpiringResolutionCache,
     MusicDownloadChaosMonkey,
+    ProviderLimitConfig,
     ServiceRateLimiter,
+    classify_provider_failure,
+    is_youtube_bot_challenge,
 )
 
 
@@ -136,6 +141,135 @@ class TestServiceRateLimiterWait:
         # attempt=20 would give base * 2^20 >> max without capping
         computed = rl.calculate_wait_time("musicbrainz", attempt=20)
         assert computed <= ServiceRateLimiter.CONFIGS["musicbrainz"].max * 1.3  # allow jitter
+
+
+class TestAdaptiveProviderLimiter:
+    @staticmethod
+    def _clear_youtube_env(monkeypatch):
+        for suffix in ("MIN_GAP_S", "MAX_GAP_S", "MAX_INFLIGHT"):
+            monkeypatch.delenv(f"PROVIDER_LIMITER_YOUTUBE_{suffix}", raising=False)
+
+    def test_defaults_to_shadow_mode(self, monkeypatch):
+        monkeypatch.delenv("PROVIDER_LIMITER_ENABLED", raising=False)
+        limiter = AdaptiveProviderLimiter()
+        assert limiter.snapshot()["enabled"] is False
+        assert limiter.snapshot()["mode"] == "shadow"
+
+    def test_youtube_challenge_is_a_throttle_signal_not_content_miss(self):
+        from src.ingestion.downloader import DownloadOrchestrator
+
+        challenge = Exception("Sign in to confirm you're not a bot")
+        assert is_youtube_bot_challenge(challenge)
+        assert classify_provider_failure(challenge) == "bot_challenge"
+        assert DownloadOrchestrator._is_content_error(challenge) is False
+        assert DownloadOrchestrator._is_content_error(Exception("Sign in to confirm your age")) is True
+
+    def test_enforced_max_inflight_is_atomic_across_threads(self, monkeypatch):
+        self._clear_youtube_env(monkeypatch)
+        limiter = AdaptiveProviderLimiter(
+            enabled=True,
+            provider_configs={"youtube": ProviderLimitConfig(0, 0, 1)},
+        )
+        first = limiter.acquire("youtube")
+        assert first is not None
+
+        acquired = threading.Event()
+        second_permit = []
+
+        def worker():
+            second_permit.append(limiter.acquire("youtube", wait_cap_s=1.0))
+            acquired.set()
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        assert acquired.wait(0.05) is False
+        limiter.complete(first, success=True)
+        assert acquired.wait(0.5) is True
+        thread.join(timeout=0.5)
+        assert second_permit[0] is not None
+        limiter.complete(second_permit[0], success=True)
+        assert limiter.snapshot()["providers"]["youtube"]["in_flight"] == 0
+
+    def test_backoff_is_scoped_to_provider_and_caps_retry_after(self, monkeypatch):
+        self._clear_youtube_env(monkeypatch)
+        limiter = AdaptiveProviderLimiter(
+            enabled=False,
+            min_samples=1,
+            signal_ratio=0.5,
+            backoff_factor=2,
+            retry_after_cap_s=20,
+            provider_configs={"youtube": ProviderLimitConfig(1, 8, 1)},
+        )
+        permit = limiter.acquire("youtube")
+        assert permit is not None
+        limiter.complete(
+            permit, success=False, failure_reason="bot_challenge", retry_after_s=100,
+        )
+
+        snapshot = limiter.snapshot()
+        yt = snapshot["providers"]["youtube"]
+        spotify = snapshot["providers"]["spotify_api"]
+        assert yt["throttle_signal_count"] == 1
+        assert yt["failure_reasons"] == {"bot_challenge": 1}
+        assert yt["current_gap_s"] == 2
+        assert yt["last_retry_after_s"] == 20
+        assert yt["backoff_remaining_s"] > 0
+        assert spotify["current_gap_s"] == spotify["min_gap_s"]
+        assert spotify["backoff_remaining_s"] == 0
+
+    def test_clean_traffic_recovers_gradually(self, monkeypatch):
+        self._clear_youtube_env(monkeypatch)
+        limiter = AdaptiveProviderLimiter(
+            enabled=False,
+            min_samples=1,
+            signal_ratio=0.5,
+            backoff_factor=2,
+            recovery_factor=0.8,
+            provider_configs={"youtube": ProviderLimitConfig(0.25, 8, 2)},
+        )
+        permit = limiter.acquire("youtube")
+        assert permit is not None
+        limiter.complete(permit, success=False, failure_reason="rate_limited")
+        backed_off_gap = limiter.snapshot()["providers"]["youtube"]["current_gap_s"]
+        assert backed_off_gap == 0.5
+
+        clean_gaps = []
+        for _ in range(3):
+            permit = limiter.acquire("youtube")
+            assert permit is not None
+            limiter.complete(permit, success=True)
+            clean_gaps.append(limiter.snapshot()["providers"]["youtube"]["current_gap_s"])
+        assert backed_off_gap > clean_gaps[0] > clean_gaps[1] > clean_gaps[2]
+        assert clean_gaps[-1] > 0.25
+
+    def test_shadow_allows_would_be_throttled_call_and_enforce_skips_over_cap(self, monkeypatch):
+        self._clear_youtube_env(monkeypatch)
+        config = ProviderLimitConfig(1, 1, 1)
+        shadow = AdaptiveProviderLimiter(
+            enabled=False,
+            provider_configs={"youtube": config},
+        )
+        first = shadow.acquire("youtube")
+        assert first is not None
+        shadow.complete(first, success=True)
+        second = shadow.acquire("youtube")
+        assert second is not None
+        shadow.complete(second, success=True)
+        shadow_metrics = shadow.snapshot()["providers"]["youtube"]
+        assert shadow_metrics["would_throttle_count"] == 1
+        assert shadow_metrics["request_count"] == 2
+
+        enforcing = AdaptiveProviderLimiter(
+            enabled=True,
+            provider_configs={"youtube": config},
+        )
+        first = enforcing.acquire("youtube")
+        assert first is not None
+        enforcing.complete(first, success=True)
+        assert enforcing.acquire("youtube", wait_cap_s=0.01) is None
+        enforced_metrics = enforcing.snapshot()["providers"]["youtube"]
+        assert enforced_metrics["skipped_count"] == 1
+        assert enforced_metrics["request_count"] == 1
 
 
 # ── ExpiringResolutionCache ───────────────────────────────────────────────────

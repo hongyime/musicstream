@@ -1042,6 +1042,7 @@ def _default_token_refresher() -> bool:
     import time
 
     import requests
+    from src.rate_limiter import get_adaptive_provider_limiter
 
     client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "").strip()
 
@@ -1069,7 +1070,9 @@ def _default_token_refresher() -> bool:
         }
         if client_secret:  # confidential-client tokens REQUIRE the secret on refresh
             payload["client_secret"] = client_secret
-        resp = requests.post(
+        resp = get_adaptive_provider_limiter().observe_call(
+            "spotify_api",
+            requests.post,
             "https://accounts.spotify.com/api/token",
             data=payload,
             timeout=15,

@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 
 from src.core import config
 from src.models import LbRecommendation, Track, TrackStatus
-from src.rate_limiter import ServiceRateLimiter
+from src.rate_limiter import ServiceRateLimiter, get_adaptive_provider_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,7 @@ class DiscoverWeekly:
         self._token = token or os.environ.get("LISTENBRAINZ_TOKEN", "")
         self._username = username or os.environ.get("LISTENBRAINZ_USERNAME", "")
         self._rl = rate_limiter or ServiceRateLimiter()
+        self._provider_limiter = get_adaptive_provider_limiter()
         self._http = http_session or requests.Session()
         if self._token:
             self._http.headers.update({"Authorization": f"Token {self._token}"})
@@ -325,7 +326,9 @@ class DiscoverWeekly:
             if not self._rl.is_healthy("listenbrainz"):
                 break
             try:
-                resp = self._http.get(url, timeout=30)
+                resp = self._provider_limiter.observe_call(
+                    "listenbrainz", self._http.get, url, timeout=30,
+                )
             except requests.RequestException as exc:
                 last_exc = exc
                 self._rl.record_failure("listenbrainz")

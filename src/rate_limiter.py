@@ -13,10 +13,14 @@ import json
 import logging
 import os
 import random
+import re
 import threading
 import time
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from collections import Counter, deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Callable, Deque, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -407,6 +411,461 @@ class ServiceThrottle:
                 svc: {"min_gap": state.min_gap, "floor": self.CONFIGS[svc].floor}
                 for svc, state in self._state.items()
             }
+
+
+# ── Adaptive provider limiter and rolling metrics ────────────────────────────
+
+@dataclass(frozen=True)
+class ProviderLimitConfig:
+    """Per-provider spacing and concurrency limits."""
+
+    min_gap_s: float
+    max_gap_s: float
+    max_inflight: int
+
+
+@dataclass
+class _ProviderEvent:
+    event_id: int
+    started_at: float
+    outcome: Optional[str] = None
+    failure_reason: Optional[str] = None
+    throttle_signal: bool = False
+
+
+@dataclass
+class _ProviderState:
+    config: ProviderLimitConfig
+    current_gap_s: float
+    next_allowed_at: float = 0.0
+    retry_after_until: float = 0.0
+    last_retry_after_s: float = 0.0
+    in_flight: int = 0
+    skipped_count: int = 0
+    would_throttle_count: int = 0
+    next_event_id: int = 1
+    last_backoff_signal_id: int = 0
+    events: Deque[_ProviderEvent] = field(default_factory=deque)
+
+
+@dataclass
+class ProviderPermit:
+    """A reserved provider operation. Complete it exactly once."""
+
+    provider: str
+    event: _ProviderEvent
+    _finished: bool = False
+
+
+_DEFAULT_PROVIDER_CONFIGS: Dict[str, ProviderLimitConfig] = {
+    "youtube": ProviderLimitConfig(min_gap_s=4.5, max_gap_s=60.0, max_inflight=2),
+    "spotify_api": ProviderLimitConfig(min_gap_s=0.1, max_gap_s=15.0, max_inflight=3),
+    "spotify_streaming": ProviderLimitConfig(min_gap_s=0.0, max_gap_s=30.0, max_inflight=1),
+    "soundcloud": ProviderLimitConfig(min_gap_s=1.5, max_gap_s=30.0, max_inflight=2),
+    "listenbrainz": ProviderLimitConfig(min_gap_s=1.0, max_gap_s=30.0, max_inflight=5),
+    "musicbrainz": ProviderLimitConfig(min_gap_s=1.0, max_gap_s=15.0, max_inflight=1),
+    "acoustid": ProviderLimitConfig(min_gap_s=0.5, max_gap_s=15.0, max_inflight=3),
+    "artwork": ProviderLimitConfig(min_gap_s=0.5, max_gap_s=30.0, max_inflight=3),
+}
+
+_THROTTLE_FAILURE_REASONS = {"bot_challenge", "rate_limited", "http_429", "retry_after"}
+_ORDINARY_MISS_REASONS = {"content_miss", "no_candidates", "not_found", "http_404"}
+
+
+def is_youtube_bot_challenge(exc: BaseException | str) -> bool:
+    """Identify YouTube's sign-in bot challenge separately from content misses."""
+    message = str(exc).lower().replace("’", "'")
+    return any(phrase in message for phrase in (
+        "sign in to confirm you're not a bot",
+        "sign in to confirm you are not a bot",
+        "confirm you're not a bot",
+        "confirm you are not a bot",
+        "confirm that you're not a bot",
+        "confirm that you are not a bot",
+    ))
+
+
+def extract_retry_after(exc: BaseException | Any, cap_s: Optional[float] = None) -> float:
+    """Read numeric or HTTP-date Retry-After values from exceptions/responses."""
+    candidates = [exc, getattr(exc, "response", None)]
+    headers = getattr(exc, "headers", None)
+    if headers is not None:
+        candidates.append(headers)
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        source = getattr(candidate, "headers", candidate)
+        try:
+            value = source.get("Retry-After") or source.get("retry-after")
+        except (AttributeError, TypeError):
+            value = None
+        if value is None:
+            continue
+        try:
+            seconds = max(0.0, float(value))
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(str(value))
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                seconds = max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                continue
+        return min(seconds, cap_s) if cap_s is not None else seconds
+    match = re.search(r"retry[- ]after\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", str(exc), re.I)
+    if match:
+        seconds = float(match.group(1))
+        return min(seconds, cap_s) if cap_s is not None else seconds
+    return 0.0
+
+
+def classify_provider_failure(exc: BaseException | Any) -> str:
+    """Return a stable provider failure category for rolling metrics."""
+    if is_youtube_bot_challenge(exc):
+        return "bot_challenge"
+    status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
+    response = getattr(exc, "response", None)
+    if status is None and response is not None:
+        status = getattr(response, "status_code", None)
+    text = str(exc).lower()
+    if status == 429 or any(token in text for token in (
+        "too many requests", "http error 429", "http status 429", "rate limit", "rate-limited",
+        "rate limited", "ratelimit", "retry will occur",
+    )):
+        return "rate_limited"
+    if status in (401, 403) or any(token in text for token in (
+        "unauthorized", "invalid token", "authentication failed", "invalid credentials",
+    )):
+        return "auth_failure"
+    if status == 404 or any(token in text for token in (
+        "video unavailable", "private video", "requested format is not available",
+        "no results", "not found",
+    )):
+        return "content_miss"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    return "provider_error"
+
+
+class AdaptiveProviderLimiter:
+    """Atomic, provider-scoped adaptive limiter with rolling outcome metrics.
+
+    A disabled limiter still records requests and logs would-throttle events.
+    ``observe_call`` is the integration stub used by non-YouTube providers; it
+    gathers metrics without enforcing spacing or concurrency in this pass.
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: Optional[bool] = None,
+        window_s: Optional[float] = None,
+        signal_ratio: Optional[float] = None,
+        min_samples: Optional[int] = None,
+        backoff_factor: Optional[float] = None,
+        recovery_factor: Optional[float] = None,
+        retry_after_cap_s: Optional[float] = None,
+        provider_configs: Optional[Dict[str, ProviderLimitConfig | Dict[str, Any]]] = None,
+    ) -> None:
+        self.enabled = _env_bool("PROVIDER_LIMITER_ENABLED", False) if enabled is None else bool(enabled)
+        self.window_s = _env_float("PROVIDER_LIMITER_WINDOW_S", 300.0) if window_s is None else float(window_s)
+        self.signal_ratio = _env_float("PROVIDER_LIMITER_SIGNAL_RATIO", 0.2) if signal_ratio is None else float(signal_ratio)
+        self.min_samples = _env_int("PROVIDER_LIMITER_MIN_SAMPLES", 10) if min_samples is None else int(min_samples)
+        self.backoff_factor = _env_float("PROVIDER_LIMITER_BACKOFF_FACTOR", 2.0) if backoff_factor is None else float(backoff_factor)
+        self.recovery_factor = _env_float("PROVIDER_LIMITER_RECOVERY_FACTOR", 0.9) if recovery_factor is None else float(recovery_factor)
+        self.retry_after_cap_s = _env_float("PROVIDER_LIMITER_RETRY_AFTER_CAP_S", 300.0) if retry_after_cap_s is None else float(retry_after_cap_s)
+        self._validate_global_config()
+
+        self._configs = dict(_DEFAULT_PROVIDER_CONFIGS)
+        if provider_configs:
+            for provider, config in provider_configs.items():
+                if provider not in self._configs:
+                    raise ValueError(f"Unknown provider '{provider}'. Valid providers: {sorted(self._configs)}")
+                if isinstance(config, ProviderLimitConfig):
+                    self._configs[provider] = config
+                else:
+                    base = self._configs[provider]
+                    self._configs[provider] = ProviderLimitConfig(
+                        min_gap_s=float(config.get("min_gap_s", base.min_gap_s)),
+                        max_gap_s=float(config.get("max_gap_s", base.max_gap_s)),
+                        max_inflight=int(config.get("max_inflight", base.max_inflight)),
+                    )
+        self._configs = {provider: self._env_config(provider, config) for provider, config in self._configs.items()}
+        for provider, config in self._configs.items():
+            if config.min_gap_s < 0 or config.max_gap_s < config.min_gap_s or config.max_inflight < 1:
+                raise ValueError(f"Invalid rate-limit config for {provider}: {config}")
+
+        self._condition = threading.Condition(threading.RLock())
+        self._states = {
+            provider: _ProviderState(config=config, current_gap_s=config.min_gap_s)
+            for provider, config in self._configs.items()
+        }
+        logger.info("Adaptive provider limiter mode=%s window=%.0fs", "enforce" if self.enabled else "shadow", self.window_s)
+
+    def _validate_global_config(self) -> None:
+        if self.window_s <= 0 or not 0 <= self.signal_ratio <= 1 or self.min_samples < 1:
+            raise ValueError("Invalid provider limiter window, signal ratio, or minimum sample count")
+        if self.backoff_factor <= 1 or not 0 < self.recovery_factor < 1 or self.retry_after_cap_s < 0:
+            raise ValueError("Invalid provider limiter backoff, recovery, or Retry-After cap")
+
+    @staticmethod
+    def _env_config(provider: str, config: ProviderLimitConfig) -> ProviderLimitConfig:
+        key = provider.upper()
+        return ProviderLimitConfig(
+            min_gap_s=_env_float(f"PROVIDER_LIMITER_{key}_MIN_GAP_S", config.min_gap_s),
+            max_gap_s=_env_float(f"PROVIDER_LIMITER_{key}_MAX_GAP_S", config.max_gap_s),
+            max_inflight=_env_int(f"PROVIDER_LIMITER_{key}_MAX_INFLIGHT", config.max_inflight),
+        )
+
+    def _prune(self, state: _ProviderState, now: float) -> None:
+        cutoff = now - self.window_s
+        while state.events and state.events[0].started_at < cutoff:
+            state.events.popleft()
+
+    def _metrics(self, provider: str, state: _ProviderState, now: float) -> dict[str, Any]:
+        self._prune(state, now)
+        events = list(state.events)
+        requests = len(events)
+        signals = sum(1 for event in events if event.throttle_signal)
+        failure_reasons = Counter(
+            event.failure_reason for event in events
+            if event.outcome == "failure" and event.failure_reason
+        )
+        failures = sum(1 for event in events if event.outcome == "failure")
+        successes = sum(1 for event in events if event.outcome == "success")
+        return {
+            "request_count": requests,
+            "success_count": successes,
+            "failure_count": failures,
+            "throttle_signal_count": signals,
+            "ordinary_miss_count": sum(failure_reasons.get(reason, 0) for reason in _ORDINARY_MISS_REASONS),
+            "failure_reasons": dict(failure_reasons),
+            "signal_ratio": round(signals / requests, 4) if requests else 0.0,
+            "current_gap_s": round(state.current_gap_s, 3),
+            "min_gap_s": state.config.min_gap_s,
+            "max_gap_s": state.config.max_gap_s,
+            "max_inflight": state.config.max_inflight,
+            "in_flight": state.in_flight,
+            "backoff_remaining_s": round(max(0.0, state.retry_after_until - now), 3),
+            "last_retry_after_s": round(state.last_retry_after_s, 3),
+            "skipped_count": state.skipped_count,
+            "would_throttle_count": state.would_throttle_count,
+        }
+
+    def _new_event(self, provider: str, state: _ProviderState, now: float) -> _ProviderEvent:
+        event = _ProviderEvent(event_id=state.next_event_id, started_at=now)
+        state.next_event_id += 1
+        state.events.append(event)
+        self._prune(state, now)
+        return event
+
+    def acquire(
+        self,
+        provider: str,
+        *,
+        wait_cap_s: Optional[float] = None,
+        enforce: Optional[bool] = None,
+    ) -> Optional[ProviderPermit]:
+        """Reserve an atomic provider slot, or return None when it should skip."""
+        if provider not in self._states:
+            raise ValueError(f"Unknown provider '{provider}'. Valid providers: {sorted(self._states)}")
+        enforce = self.enabled if enforce is None else bool(enforce)
+        state = self._states[provider]
+        cap = min(state.config.max_gap_s, self.retry_after_cap_s) if wait_cap_s is None else max(0.0, float(wait_cap_s))
+        deadline = time.monotonic() + cap
+
+        with self._condition:
+            while True:
+                now = time.monotonic()
+                self._prune(state, now)
+                due_at = max(state.next_allowed_at, state.retry_after_until)
+                wait_s = max(0.0, due_at - now)
+                at_capacity = state.in_flight >= state.config.max_inflight
+
+                if not enforce:
+                    reserved_at = max(now, due_at)
+                    if wait_s > 0 or at_capacity:
+                        state.would_throttle_count += 1
+                        logger.info(
+                            "Provider limiter shadow: provider=%s wait=%.2fs in_flight=%d/%d cap=%.2fs",
+                            provider, wait_s, state.in_flight, state.config.max_inflight, cap,
+                        )
+                    state.next_allowed_at = reserved_at + state.current_gap_s
+                    event = self._new_event(provider, state, now)
+                    state.in_flight += 1
+                    return ProviderPermit(provider=provider, event=event)
+
+                if not at_capacity and wait_s <= 0:
+                    event = self._new_event(provider, state, now)
+                    state.next_allowed_at = now + state.current_gap_s
+                    state.in_flight += 1
+                    return ProviderPermit(provider=provider, event=event)
+
+                if wait_s > cap or now >= deadline:
+                    state.skipped_count += 1
+                    logger.info(
+                        "Provider limiter skip: provider=%s wait=%.2fs in_flight=%d/%d cap=%.2fs",
+                        provider, wait_s, state.in_flight, state.config.max_inflight, cap,
+                    )
+                    return None
+
+                remaining = max(0.0, deadline - now)
+                timeout = min(wait_s, remaining) if wait_s > 0 else remaining
+                self._condition.wait(timeout=max(0.001, timeout))
+
+    def complete(
+        self,
+        permit: ProviderPermit,
+        *,
+        success: bool,
+        failure_reason: Optional[str] = None,
+        retry_after_s: float = 0.0,
+    ) -> None:
+        """Record an operation result and release its in-flight slot."""
+        if permit._finished:
+            return
+        with self._condition:
+            if permit._finished:
+                return
+            state = self._states[permit.provider]
+            now = time.monotonic()
+            reason = None if success else (failure_reason or "provider_error")
+            is_signal = bool(reason in _THROTTLE_FAILURE_REASONS or (retry_after_s and retry_after_s > 0))
+            permit.event.outcome = "success" if success else "failure"
+            permit.event.failure_reason = reason
+            permit.event.throttle_signal = is_signal
+            state.in_flight = max(0, state.in_flight - 1)
+
+            if success:
+                state.current_gap_s = max(state.config.min_gap_s, state.current_gap_s * self.recovery_factor)
+
+            retry_after_s = min(max(0.0, float(retry_after_s or 0.0)), self.retry_after_cap_s)
+            if retry_after_s:
+                state.last_retry_after_s = retry_after_s
+                state.retry_after_until = max(state.retry_after_until, now + retry_after_s)
+
+            metrics = self._metrics(permit.provider, state, now)
+            newest_signal_id = max(
+                (event.event_id for event in state.events if event.throttle_signal),
+                default=0,
+            )
+            pressure = (
+                metrics["request_count"] >= self.min_samples
+                and metrics["signal_ratio"] >= self.signal_ratio
+            )
+            if pressure and newest_signal_id > state.last_backoff_signal_id:
+                old_gap = state.current_gap_s
+                state.current_gap_s = min(state.config.max_gap_s, max(
+                    state.config.min_gap_s, state.current_gap_s * self.backoff_factor,
+                ))
+                state.last_backoff_signal_id = newest_signal_id
+                logger.warning(
+                    "Adaptive provider backoff: provider=%s gap=%.2fs->%.2fs signal_ratio=%.3f samples=%d",
+                    permit.provider, old_gap, state.current_gap_s,
+                    metrics["signal_ratio"], metrics["request_count"],
+                )
+            if is_signal or retry_after_s:
+                logger.warning(
+                    "Provider throttle signal: provider=%s reason=%s retry_after=%.2fs",
+                    permit.provider, reason or "retry_after", retry_after_s,
+                )
+            permit._finished = True
+            self._condition.notify_all()
+
+    def observe_call(self, provider: str, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Observe a non-enforced provider call and capture HTTP/exception outcome."""
+        permit = self.acquire(provider, enforce=False)
+        assert permit is not None
+        try:
+            result = callback(*args, **kwargs)
+        except Exception as exc:
+            self.complete(
+                permit, success=False, failure_reason=classify_provider_failure(exc),
+                retry_after_s=extract_retry_after(exc, self.retry_after_cap_s),
+            )
+            raise
+        status = getattr(result, "status_code", None)
+        if isinstance(status, int) and status >= 400:
+            reason = "rate_limited" if status == 429 else "auth_failure" if status in (401, 403) else "content_miss" if status == 404 else "http_error"
+            self.complete(
+                permit, success=False, failure_reason=reason,
+                retry_after_s=extract_retry_after(result, self.retry_after_cap_s),
+            )
+        else:
+            self.complete(permit, success=True)
+        return result
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return JSON-safe rolling metrics for all providers."""
+        with self._condition:
+            now = time.monotonic()
+            providers = {
+                provider: self._metrics(provider, state, now)
+                for provider, state in self._states.items()
+            }
+        return {
+            "enabled": self.enabled,
+            "mode": "enforce" if self.enabled else "shadow",
+            "window_s": self.window_s,
+            "signal_ratio_threshold": self.signal_ratio,
+            "min_samples": self.min_samples,
+            "providers": providers,
+        }
+
+    def compact_snapshot(self) -> dict[str, Any]:
+        """Small health payload showing only active or recently used providers."""
+        snapshot = self.snapshot()
+        return {
+            "enabled": snapshot["enabled"],
+            "mode": snapshot["mode"],
+            "window_s": snapshot["window_s"],
+            "providers": {
+                provider: {
+                    key: metrics[key] for key in (
+                        "request_count", "success_count", "failure_count",
+                        "throttle_signal_count", "signal_ratio", "current_gap_s",
+                        "max_inflight", "in_flight", "backoff_remaining_s", "skipped_count",
+                    )
+                }
+                for provider, metrics in snapshot["providers"].items()
+                if metrics["request_count"] or metrics["in_flight"] or metrics["backoff_remaining_s"]
+            },
+        }
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    return default if value is None else value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s; using default %.3f", name, default)
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s; using default %d", name, default)
+        return default
+
+
+_adaptive_provider_limiter: Optional[AdaptiveProviderLimiter] = None
+_adaptive_provider_limiter_lock = threading.Lock()
+
+
+def get_adaptive_provider_limiter() -> AdaptiveProviderLimiter:
+    """Return the shared process-wide limiter used by workers and API routes."""
+    global _adaptive_provider_limiter
+    if _adaptive_provider_limiter is None:
+        with _adaptive_provider_limiter_lock:
+            if _adaptive_provider_limiter is None:
+                _adaptive_provider_limiter = AdaptiveProviderLimiter()
+    return _adaptive_provider_limiter
 
 
 # ── Expiring resolution cache ──────────────────────────────────────────────────
