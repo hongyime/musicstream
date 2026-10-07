@@ -22,6 +22,7 @@ from sqlalchemy import (
     Integer,
     String,
     Table,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.orm import (
@@ -262,6 +263,20 @@ class DownloadAttempt(Base):
             f"<DownloadAttempt(id={self.id}, track_id={self.track_id}, "
             f"method={self.method!r}, success={self.success})>"
         )
+
+
+class DownloadAttemptAggregate(Base):
+    """Lifetime success/failure totals retained after attempt-row pruning."""
+
+    __tablename__ = "download_attempt_aggregates"
+    __table_args__ = (
+        UniqueConstraint("method", "success", name="uq_download_attempt_aggregate_method_success"),
+    )
+
+    id:          Mapped[int] = mapped_column(Integer, primary_key=True)
+    method:      Mapped[str] = mapped_column(String, nullable=False)
+    success:     Mapped[bool] = mapped_column(Boolean, nullable=False)
+    total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
 # ── DaemonRun Model ───────────────────────────────────────────────────────────

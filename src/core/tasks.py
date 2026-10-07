@@ -18,6 +18,7 @@ _SPOTIFY_TASK_LOCK = threading.Lock()
 _DOWNLOAD_PIPELINE_LOCK = threading.Lock()
 _BACKUP_LOCK = threading.Lock()
 _BACKUP_VERIFY_LOCK = threading.Lock()
+_DOWNLOAD_ATTEMPT_PRUNE_LOCK = threading.Lock()
 
 
 def _spotify_task_min_token_hours() -> float:
@@ -805,10 +806,66 @@ def _prune_backups() -> None:
         logger.warning("Backup pruning failed: %s", exc)
 
 
+def prune_download_attempts() -> int:
+    """Aggregate and delete attempt rows older than the configured retention."""
+    if not _DOWNLOAD_ATTEMPT_PRUNE_LOCK.acquire(blocking=False):
+        logger.info("Download-attempt pruning skipped: another prune is running.")
+        return 0
+
+    try:
+        from sqlalchemy import func
+
+        from src.core import config
+        from src.db import get_session
+        from src.models import DownloadAttempt, DownloadAttemptAggregate
+
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            days=max(1, int(config.DOWNLOAD_ATTEMPT_RETENTION_DAYS))
+        )
+        normalized_method = func.coalesce(DownloadAttempt.method, "unknown")
+        with get_session() as session:
+            old_groups = session.query(
+                normalized_method,
+                DownloadAttempt.success,
+                func.count(DownloadAttempt.id),
+            ).filter(
+                DownloadAttempt.attempted_at < cutoff,
+            ).group_by(
+                normalized_method, DownloadAttempt.success,
+            ).all()
+
+            for method, success, count in old_groups:
+                aggregate = session.query(DownloadAttemptAggregate).filter_by(
+                    method=method, success=success,
+                ).with_for_update().one_or_none()
+                if aggregate is None:
+                    session.add(DownloadAttemptAggregate(
+                        method=method, success=success, total_count=int(count),
+                    ))
+                else:
+                    aggregate.total_count += int(count)
+
+            deleted = session.query(DownloadAttempt).filter(
+                DownloadAttempt.attempted_at < cutoff,
+            ).delete(synchronize_session=False)
+
+        logger.info(
+            "Download-attempt retention pruned %d rows older than %d days into %d aggregates",
+            deleted, max(1, int(config.DOWNLOAD_ATTEMPT_RETENTION_DAYS)), len(old_groups),
+        )
+        return int(deleted)
+    except Exception as exc:
+        logger.error("Download-attempt retention pruning failed: %s", exc, exc_info=True)
+        return 0
+    finally:
+        _DOWNLOAD_ATTEMPT_PRUNE_LOCK.release()
+
+
 _EXPECTED_RESTORE_TABLES = (
     "alembic_version",
     "daemon_runs",
     "download_attempts",
+    "download_attempt_aggregates",
     "lb_recommendations",
     "sources",
     "track_sources",

@@ -50,7 +50,7 @@ docker exec -i "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$SCRATC
   || fail "psql rejected SQL while restoring ${latest}"
 
 # Assert every application and migration table expected in a complete dump.
-for table in alembic_version daemon_runs download_attempts lb_recommendations sources track_sources tracks; do
+for table in alembic_version daemon_runs download_attempts download_attempt_aggregates lb_recommendations sources track_sources tracks; do
   exists="$(docker exec "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$SCRATCH_DB" -tAc \
     "SELECT to_regclass('public.${table}') IS NOT NULL;" 2>/dev/null | tr -d '[:space:]')"
   [ "$exists" = "t" ] || fail "expected table ${table} missing after restore"

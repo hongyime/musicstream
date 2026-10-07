@@ -17,6 +17,11 @@ BACKUP_COUNT = 3
 
 BACKUP_RETENTION_DAYS = 14
 
+try:
+    DOWNLOAD_ATTEMPT_RETENTION_DAYS = max(1, int(os.environ.get("DOWNLOAD_ATTEMPT_RETENTION_DAYS", "30")))
+except ValueError:
+    DOWNLOAD_ATTEMPT_RETENTION_DAYS = 30
+
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 
 TIMEZONE = "Asia/Singapore"

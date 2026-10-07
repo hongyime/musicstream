@@ -2,6 +2,7 @@ import asyncio
 import subprocess
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
 from unittest.mock import Mock
@@ -12,7 +13,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
-from src.models import Base, Track
+from src.models import Base, DownloadAttempt, DownloadAttemptAggregate, Track
 
 TEST_TOKEN = "test_token_123"
 pytestmark = pytest.mark.asyncio
@@ -195,3 +196,34 @@ async def test_stats_handles_empty_library(api_client: AsyncClient) -> None:
         "total_tracks": 0, "downloaded": 0, "pending": 0,
         "failed": 0, "active": 0, "progress_pct": 0.0,
     }
+
+
+async def test_metrics_include_retained_attempt_aggregates(api_client: AsyncClient) -> None:
+    from src.db import get_session
+
+    with get_session() as session:
+        track = Track(
+            spotify_uri="test:metrics:aggregate", title="Metric test", artist="Artist",
+            status="pending",
+        )
+        session.add(track)
+        session.flush()
+        session.add_all([
+            DownloadAttemptAggregate(
+                method="tier2_ytdlp_ytm", success=True, total_count=4,
+            ),
+            DownloadAttempt(
+                track_id=track.id, attempted_at=datetime.now(timezone.utc),
+                method="tier2_ytdlp_ytm", success=False,
+            ),
+        ])
+
+    response = await api_client.get("/api/musicstream/metrics")
+    assert response.status_code == 200
+    row = next(
+        item for item in response.json()["data"]
+        if item["method"] == "tier2_ytdlp_ytm"
+    )
+    assert row["success"] == 4
+    assert row["fail"] == 1
+    assert row["total"] == 5

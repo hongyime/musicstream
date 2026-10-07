@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.models import Track, TrackStatus  # noqa: E402
+from src.models import DownloadAttempt, DownloadAttemptAggregate, Track, TrackStatus  # noqa: E402
 from src.core import tasks  # noqa: E402
 from src.core.tasks import reset_failed_tracks, reset_orphaned_downloads  # noqa: E402
 
@@ -246,3 +246,49 @@ def test_requeue_stale_downloads_uses_configured_threshold(monkeypatch):
 
     assert tasks.requeue_stale_downloads() == 3
     assert calls == [(False, 12)]
+
+
+def test_download_attempt_pruning_preserves_aggregates_and_pass_state(session, monkeypatch):
+    track = _track(session, "spotify:track:attempt_retention", "pending", attempt_count=12)
+    track.consecutive_failed_passes = 4
+    now = datetime.now(timezone.utc)
+    session.add_all([
+        DownloadAttempt(
+            track_id=track.id, attempted_at=now - timedelta(days=40),
+            method="tier2_ytdlp_ytm", success=True,
+        ),
+        DownloadAttempt(
+            track_id=track.id, attempted_at=now - timedelta(days=40),
+            method="tier2_ytdlp_ytm", success=False,
+        ),
+        DownloadAttempt(
+            track_id=track.id, attempted_at=now - timedelta(days=40),
+            method=None, success=False,
+        ),
+        DownloadAttempt(
+            track_id=track.id, attempted_at=now - timedelta(days=2),
+            method="tier2_ytdlp_ytm", success=False,
+        ),
+    ])
+    session.flush()
+
+    @contextmanager
+    def fake_get_session():
+        yield session
+
+    monkeypatch.setattr("src.db.get_session", fake_get_session)
+    monkeypatch.setattr("src.core.config.DOWNLOAD_ATTEMPT_RETENTION_DAYS", 30)
+
+    assert tasks.prune_download_attempts() == 3
+    assert session.query(DownloadAttempt).filter_by(track_id=track.id).count() == 1
+    aggregates = {
+        (row.method, row.success): row.total_count
+        for row in session.query(DownloadAttemptAggregate).all()
+    }
+    assert aggregates == {
+        ("tier2_ytdlp_ytm", True): 1,
+        ("tier2_ytdlp_ytm", False): 1,
+        ("unknown", False): 1,
+    }
+    # Auto-block streak state is on tracks and stays independent of pruned rows.
+    assert session.get(Track, track.id).consecutive_failed_passes == 4

@@ -865,6 +865,7 @@ def _register_scheduler_jobs():
     scheduler.add_job(tasks.db_backup, "cron", hour=5, id="db_backup", replace_existing=True, misfire_grace_time=GRACE)
     # Verify an actual restore on the first day of each month, after the 05:00 backup.
     scheduler.add_job(tasks.verify_backup_restore, "cron", day=1, hour=6, id="backup_restore_verify", replace_existing=True, misfire_grace_time=GRACE)
+    scheduler.add_job(tasks.prune_download_attempts, "cron", hour=5, minute=30, id="download_attempt_prune", replace_existing=True, misfire_grace_time=GRACE)
     # §W3 T18/V13: hourly token early-warning probe.
     scheduler.add_job(tasks.probe_spotify_token, "interval", hours=1, id="token_probe", replace_existing=True, misfire_grace_time=GRACE)
     # §W3 T20: weekly quality-upgrade requeue (before the 03:00 daily pipeline
@@ -1069,18 +1070,27 @@ def get_tracks(status: str = "pending", limit: int = 100):
 @app.get("/api/musicstream/metrics")
 def get_metrics():
     from src.db import get_session
-    from src.models import DownloadAttempt
+    from src.models import DownloadAttempt, DownloadAttemptAggregate
     from sqlalchemy import func
     try:
         with get_session() as session:
             results = session.query(
-                DownloadAttempt.method,
+                func.coalesce(DownloadAttempt.method, "unknown"),
                 DownloadAttempt.success,
                 func.count(DownloadAttempt.id)
-            ).group_by(DownloadAttempt.method, DownloadAttempt.success).all()
-            
+            ).group_by(
+                func.coalesce(DownloadAttempt.method, "unknown"),
+                DownloadAttempt.success,
+            ).all()
+
             metrics = {}
-            for method, success, count in results:
+            historical = session.query(
+                DownloadAttemptAggregate.method,
+                DownloadAttemptAggregate.success,
+                DownloadAttemptAggregate.total_count,
+            ).all()
+            for method, success, count in [*historical, *results]:
+                method = method or "unknown"
                 if method not in metrics:
                     metrics[method] = {"success": 0, "fail": 0, "total": 0}
                 if success:
@@ -1088,7 +1098,7 @@ def get_metrics():
                 else:
                     metrics[method]["fail"] += count
                 metrics[method]["total"] += count
-            
+
             data = []
             for method, stats in metrics.items():
                 data.append({
