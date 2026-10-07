@@ -7,12 +7,12 @@
 # daemon mount, NOT the postgres container, so we pipe via stdin), asserts the
 # core tables are present and populated, then drops the scratch DB.
 #
-# Run monthly via the Windows Startup folder (same pattern as
-# watchdog_stuck_downloads.sh; this env cannot register Scheduled Tasks):
+# The daemon runs this verification through APScheduler on the first of each month.
+# Run manually from Git Bash on the host when needed:
 #   "C:\Program Files\Git\bin\bash.exe" -lc "/c/musicstream/scripts/verify_backup_restore.sh"
 #
 # Exit: 0 = restore verified; 1 = verification failed; 2 = no backup / setup error.
-set -uo pipefail
+set -euo pipefail
 
 PG_CONTAINER="${PG_CONTAINER:-musicstream-postgres}"
 PG_USER="${PG_USER:-musicstream}"
@@ -29,14 +29,14 @@ log() {
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
     echo "[$(ts)] $*" >> "$LOG_FILE" 2>/dev/null || true
 }
-psql_main() { docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" "$@"; }
+psql_main() { docker exec "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$PG_DB" "$@"; }
 cleanup() { psql_main -c "DROP DATABASE IF EXISTS ${SCRATCH_DB};" >/dev/null 2>&1 || true; }
 
 fail() { log "FAIL: $1"; exit "${2:-1}"; }
 
 # Newest backup on the host.
 latest="$(ls -1t "${BACKUP_DIR}"/musicstream_*.sql 2>/dev/null | head -n1 || true)"
-[ -n "${latest}" ] || fail "no backup found in ${BACKUP_DIR} (db_backup runs weekly / on boot)" 2
+[ -n "${latest}" ] || fail "no backup found in ${BACKUP_DIR} (db_backup runs daily / on boot)" 2
 log "verifying restore of: ${latest}"
 
 trap cleanup EXIT
@@ -46,12 +46,15 @@ psql_main -c "DROP DATABASE IF EXISTS ${SCRATCH_DB};" >/dev/null 2>&1 || true
 psql_main -c "CREATE DATABASE ${SCRATCH_DB};" >/dev/null 2>&1 || fail "could not create scratch DB ${SCRATCH_DB}" 2
 
 # Restore via stdin (the dump lives on the daemon mount, not this container).
-# Deliberately NO ON_ERROR_STOP: pg_dump is pinned to the server's MAJOR (16), so
-# dumps are native v16 (no v17 SET transaction_timeout), but they still carry the
-# \restrict security directive which the server's older-minor psql warns about and
-# skips harmlessly. The authoritative success check is whether the data landed
-# (the tracks-count assertion below), not psql's handling of that cosmetic.
-docker exec -i "$PG_CONTAINER" psql -U "$PG_USER" -d "$SCRATCH_DB" < "${latest}" >/dev/null 2>&1 || true
+docker exec -i "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$SCRATCH_DB" < "${latest}" >/dev/null 2>&1 \
+  || fail "psql rejected SQL while restoring ${latest}"
+
+# Assert every application and migration table expected in a complete dump.
+for table in alembic_version daemon_runs download_attempts lb_recommendations sources track_sources tracks; do
+  exists="$(docker exec "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U "$PG_USER" -d "$SCRATCH_DB" -tAc \
+    "SELECT to_regclass('public.${table}') IS NOT NULL;" 2>/dev/null | tr -d '[:space:]')"
+  [ "$exists" = "t" ] || fail "expected table ${table} missing after restore"
+done
 
 # Assert the core table restored and is populated.
 n="$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$SCRATCH_DB" -tAc "SELECT count(*) FROM tracks;" 2>/dev/null | tr -d '[:space:]')"

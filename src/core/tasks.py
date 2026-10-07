@@ -2,11 +2,13 @@ import logging
 import os
 import subprocess
 import threading
-from datetime import datetime, timezone
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Optional, Callable, Any
 
-from src.core.config import LOG_DIR, BACKUP_DIR, MAX_BACKUPS, DISABLE_DOWNLOADS, SPOTIFY_CLIENT_ID
+from src.core.config import LOG_DIR, BACKUP_DIR, BACKUP_RETENTION_DAYS, DISABLE_DOWNLOADS, SPOTIFY_CLIENT_ID
 
 logger = logging.getLogger("musicstream.daemon")
 
@@ -14,6 +16,8 @@ logger = logging.getLogger("musicstream.daemon")
 
 _SPOTIFY_TASK_LOCK = threading.Lock()
 _DOWNLOAD_PIPELINE_LOCK = threading.Lock()
+_BACKUP_LOCK = threading.Lock()
+_BACKUP_VERIFY_LOCK = threading.Lock()
 
 
 def _spotify_task_min_token_hours() -> float:
@@ -734,10 +738,23 @@ def _expand_lb_track_artists(lookback_hours: int = 24, max_artists: int = 50) ->
     _run_spotify_task("ListenBrainz artist expansion", _work)
 
 def db_backup() -> Optional[str]:
-    """Run pg_dump and prune old backups."""
+    """Serialize database backups and publish only complete dumps."""
+    if not _BACKUP_LOCK.acquire(blocking=False):
+        logger.info("Database backup skipped: another backup is already running.")
+        return None
+
+    try:
+        return _db_backup_locked()
+    finally:
+        _BACKUP_LOCK.release()
+
+
+def _db_backup_locked() -> Optional[str]:
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = BACKUP_DIR / f"musicstream_{timestamp}.sql"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    unique_id = uuid.uuid4().hex[:8]
+    backup_path = BACKUP_DIR / f"musicstream_{timestamp}_{unique_id}.sql"
+    temp_path = BACKUP_DIR / f".{backup_path.name}.tmp"
 
     database_url = os.environ.get("DATABASE_URL", "")
     if not database_url:
@@ -750,7 +767,7 @@ def db_backup() -> Optional[str]:
     _pg_cmd = [
         "pg_dump", "-h", _u.hostname or "localhost", "-p", str(_u.port or 5432),
         "-U", _u.username or "musicstream", "-d", _u.path.lstrip("/"),
-        "--no-password", "--file", str(backup_path),
+        "--no-password", "--file", str(temp_path),
     ]
 
     logger.info("Running pg_dump → %s", backup_path)
@@ -758,24 +775,150 @@ def db_backup() -> Optional[str]:
         result = subprocess.run(_pg_cmd, env=_pg_env, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
             logger.error("pg_dump failed (exit %d): %s", result.returncode, result.stderr[:500])
-            if backup_path.exists():
-                backup_path.unlink()
             return None
+        if not temp_path.is_file() or temp_path.stat().st_size <= 0:
+            logger.error("pg_dump reported success but produced no usable dump at %s", temp_path)
+            return None
+        os.replace(temp_path, backup_path)
     except Exception as exc:
         logger.error("pg_dump error: %s", exc, exc_info=True)
         return None
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Could not remove incomplete backup %s: %s", temp_path, exc)
 
     _prune_backups()
     return str(backup_path)
 
 def _prune_backups() -> None:
+    cutoff = time.time() - BACKUP_RETENTION_DAYS * 24 * 60 * 60
     try:
-        sql_files = sorted(BACKUP_DIR.glob("musicstream_*.sql"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for old_file in sql_files[MAX_BACKUPS:]:
-            old_file.unlink()
-            logger.info("Pruned old backup: %s", old_file)
+        for backup_file in BACKUP_DIR.glob("musicstream_*.sql"):
+            try:
+                if backup_file.stat().st_mtime < cutoff:
+                    backup_file.unlink()
+                    logger.info("Pruned expired backup: %s", backup_file)
+            except FileNotFoundError:
+                continue
     except Exception as exc:
         logger.warning("Backup pruning failed: %s", exc)
+
+
+_EXPECTED_RESTORE_TABLES = (
+    "alembic_version",
+    "daemon_runs",
+    "download_attempts",
+    "lb_recommendations",
+    "sources",
+    "track_sources",
+    "tracks",
+)
+
+
+def verify_backup_restore() -> bool:
+    """Restore the latest SQL dump into a scratch DB and verify the schema."""
+    if not _BACKUP_VERIFY_LOCK.acquire(blocking=False):
+        logger.info("Backup restore verification skipped: another verification is running.")
+        return False
+
+    scratch_db = f"musicstream_restore_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    created = False
+    try:
+        backups = list(BACKUP_DIR.glob("musicstream_*.sql"))
+        if not backups:
+            logger.error("Backup restore verification failed: no SQL backups found in %s", BACKUP_DIR)
+            return False
+        latest = max(backups, key=lambda path: path.stat().st_mtime)
+        database_url = os.environ.get("DATABASE_URL", "")
+        if not database_url:
+            logger.error("DATABASE_URL not set; cannot verify backup restore")
+            return False
+
+        import urllib.parse as _urlparse
+        parsed = _urlparse.urlparse(database_url)
+        pg_env = {**os.environ, "PGPASSWORD": parsed.password or ""}
+        common = [
+            "psql", "-h", parsed.hostname or "localhost", "-p", str(parsed.port or 5432),
+            "-U", parsed.username or "musicstream", "-d", "postgres", "--no-password",
+            "--set", "ON_ERROR_STOP=1",
+        ]
+
+        def run_psql(args: list[str], *, stdin=None) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [*common, *args], env=pg_env, stdin=stdin,
+                capture_output=True, text=True, timeout=600,
+            )
+
+        create = run_psql(["-c", f"CREATE DATABASE {scratch_db};"])
+        if create.returncode != 0:
+            logger.error("Could not create restore test database: %s", create.stderr[-1000:])
+            return False
+        created = True
+
+        with latest.open("r", encoding="utf-8") as dump:
+            restore = subprocess.run(
+                [
+                    "psql", "-h", parsed.hostname or "localhost", "-p", str(parsed.port or 5432),
+                    "-U", parsed.username or "musicstream", "-d", scratch_db, "--no-password",
+                    "--set", "ON_ERROR_STOP=1",
+                ],
+                env=pg_env, stdin=dump, capture_output=True, text=True, timeout=1800,
+            )
+        if restore.returncode != 0:
+            logger.error("Backup restore failed on SQL error: %s", restore.stderr[-1500:])
+            return False
+
+        table_query = (
+            "SELECT string_agg(table_name, ',' ORDER BY table_name) "
+            "FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'"
+        )
+        tables_result = run_psql(["-d", scratch_db, "-tAc", table_query])
+        if tables_result.returncode != 0:
+            logger.error("Could not inspect restored tables: %s", tables_result.stderr[-1000:])
+            return False
+        restored_tables = set(filter(None, tables_result.stdout.strip().split(",")))
+        missing = sorted(set(_EXPECTED_RESTORE_TABLES) - restored_tables)
+        if missing:
+            logger.error("Backup restore is missing expected tables: %s", ", ".join(missing))
+            return False
+
+        count_result = run_psql(["-d", scratch_db, "-tAc", "SELECT count(*) FROM tracks;"])
+        if count_result.returncode != 0 or not count_result.stdout.strip().isdigit():
+            logger.error("Could not verify restored tracks table: %s", count_result.stderr[-1000:])
+            return False
+        if int(count_result.stdout.strip()) <= 0:
+            logger.error("Backup restore verified schema but tracks table is empty")
+            return False
+
+        logger.info(
+            "Backup restore verified: %s restored %s tracks and all %d expected tables",
+            latest.name, count_result.stdout.strip(), len(_EXPECTED_RESTORE_TABLES),
+        )
+        return True
+    except Exception as exc:
+        logger.error("Backup restore verification failed: %s", exc, exc_info=True)
+        return False
+    finally:
+        if created:
+            try:
+                import urllib.parse as _urlparse
+                parsed = _urlparse.urlparse(os.environ["DATABASE_URL"])
+                pg_env = {**os.environ, "PGPASSWORD": parsed.password or ""}
+                cleanup = subprocess.run(
+                    [
+                        "psql", "-h", parsed.hostname or "localhost", "-p", str(parsed.port or 5432),
+                        "-U", parsed.username or "musicstream", "-d", "postgres", "--no-password",
+                        "--set", "ON_ERROR_STOP=1", "-c", f"DROP DATABASE IF EXISTS {scratch_db};",
+                    ],
+                    env=pg_env, capture_output=True, text=True, timeout=120,
+                )
+                if cleanup.returncode != 0:
+                    logger.error("Could not drop restore test database %s: %s", scratch_db, cleanup.stderr[-1000:])
+            except Exception as exc:
+                logger.error("Could not clean restore test database %s: %s", scratch_db, exc)
+        _BACKUP_VERIFY_LOCK.release()
 
 # ── Wrapper Tasks ─────────────────────────────────────────────────────────────
 

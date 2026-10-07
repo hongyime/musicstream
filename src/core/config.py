@@ -15,7 +15,7 @@ BACKUP_COUNT = 3
 
 # ── Backups ───────────────────────────────────────────────────────────────────
 
-MAX_BACKUPS = 14
+BACKUP_RETENTION_DAYS = 14
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 
@@ -54,4 +54,3 @@ TOKEN_WARN_HOURS = float(os.environ.get("TOKEN_WARN_HOURS", "48"))
 
 # Max tracks requeued per upgrade-pass run (§W3 T20) — trickle, don't stampede.
 UPGRADE_PASS_LIMIT = int(os.environ.get("UPGRADE_PASS_LIMIT", "500"))
-

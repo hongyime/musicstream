@@ -863,6 +863,8 @@ def _register_scheduler_jobs():
     # backup on every startup, a daemon that stays up for days without a
     # restart would otherwise wait a full week for this cron to catch it.
     scheduler.add_job(tasks.db_backup, "cron", hour=5, id="db_backup", replace_existing=True, misfire_grace_time=GRACE)
+    # Verify an actual restore on the first day of each month, after the 05:00 backup.
+    scheduler.add_job(tasks.verify_backup_restore, "cron", day=1, hour=6, id="backup_restore_verify", replace_existing=True, misfire_grace_time=GRACE)
     # §W3 T18/V13: hourly token early-warning probe.
     scheduler.add_job(tasks.probe_spotify_token, "interval", hours=1, id="token_probe", replace_existing=True, misfire_grace_time=GRACE)
     # §W3 T20: weekly quality-upgrade requeue (before the 03:00 daily pipeline
