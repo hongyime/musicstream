@@ -3,25 +3,27 @@ musicstream/ingestion/downloader.py — 5-tier download orchestrator
 
 Implements the full tier chain for downloading tracks:
   Tier 0: librespot serial pre-sweep
-  Tier 1: SpotiFLAC — serialised, lossless provider chain
-  Tier 2: yt-dlp + ytmusicapi (songs→videos→no filter) — MP3 320kbps, ±5s duration check
-  Tier 3: spotDL serial post-sweep — MP3 320kbps, requires Spotify credentials
-  Tier 4: yt-dlp YouTube direct search (ytsearch12) — MP3 320kbps
-  Tier 5: yt-dlp SoundCloud (scsearch8) — MP3 320kbps, uses separate "soundcloud" circuit breaker
+  Tier 1: SpotiFLAC — lossless provider chain
+  Tier 2: yt-dlp + ytmusicapi
+  Tier 5: validated yt-dlp SoundCloud
+  Tier 3: spotDL
+  Tier 4: yt-dlp direct YouTube search (last; skipped after a bot challenge)
 
 After repeated complete content-miss passes: status='failed', log [DOWNLOAD_FAIL].
-MAX_CONCURRENT = 4 parallel workers via ThreadPoolExecutor.
+MAX_CONCURRENT parallel workers via ThreadPoolExecutor.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import socket
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 import inspect
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -234,7 +236,6 @@ _TRANSIENT_FAILURE_REASONS = {
 # Note: Increasing significantly may trigger API rate limits
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_WORKERS", "4"))
 logger.info("Worker concurrency set to: MAX_CONCURRENT=%d", MAX_CONCURRENT)
-SPOTDL_IN_POOL = os.environ.get("SPOTDL_IN_POOL", "false").lower() in ("1", "true", "yes", "on")
 
 # ── P0-2: cooperative drain-on-shutdown ──────────────────────────────────────
 # Lifespan shutdown (daemon.py) calls request_shutdown() on SIGTERM. The three
@@ -728,6 +729,7 @@ class DownloadOrchestrator:
         # `grep "\[42\]" logs/musicstream.log` returns this track's full
         # ingestion timeline.
         from src.logging_context import track_context
+        self._fail_tls.youtube_challenged = False
         with track_context(track.id):
             return self._download_track_inner(track, session, tiers_override)
 
@@ -774,11 +776,10 @@ class DownloadOrchestrator:
             tiers = [
                 ("tier1_spotiflac",        self._tier1_spotiflac),
                 ("tier2_ytdlp_ytm",        self._tier2_ytdlp_ytm),
-                ("tier4_ytdlp_youtube",    self._tier4_ytdlp_youtube),
                 ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),
+                ("tier3_spotdl",           self._tier3_spotdl),
+                ("tier4_ytdlp_youtube",    self._tier4_ytdlp_youtube),
             ]
-            if SPOTDL_IN_POOL:
-                tiers.insert(2, ("tier3_spotdl", self._tier3_spotdl))
 
         # Filter out disabled tiers
         if not self._tier1_enabled:
@@ -786,6 +787,15 @@ class DownloadOrchestrator:
 
         failure_reasons: list[str] = []
         for method_name, tier_fn in tiers:
+            if (
+                getattr(self._fail_tls, "youtube_challenged", False)
+                and method_name in {"tier3_spotdl", "tier4_ytdlp_youtube"}
+            ):
+                logger.info(
+                    "Skipping %s for track %d after a YouTube bot challenge in this pipeline pass",
+                    method_name, track.id,
+                )
+                continue
             try:
                 self._fail_tls.fail_reason = None
                 track.heartbeat_at = _utcnow()
@@ -2029,7 +2039,7 @@ class DownloadOrchestrator:
 
     def _tier5_ytdlp_soundcloud(self, track: Track) -> Optional[str]:
         """
-        Search SoundCloud with scsearch8 using "{title} {artist}".
+        Search SoundCloud and validate title, artist, and duration before use.
         Returns temp file path (MP3 320kbps) or None.
         Always returns None on failure — scsearch is a known flaky extractor
         and should never raise into the tier chain or penalise the YouTube CB.
@@ -2045,22 +2055,20 @@ class DownloadOrchestrator:
             return None
 
         query = f"scsearch8:{track.title} {track.artist}"
-        out_stem = os.path.join(TEMP_DIR, str(uuid.uuid4()))
-        ydl_opts = self._build_mp3_opts(out_stem)
-        cookie_snapshot = ydl_opts.get("cookiefile")
-        ydl_opts["noplaylist"] = False
-        ydl_opts["ignoreerrors"] = True
-        ydl_opts["max_downloads"] = 1
-
         permit = self._provider_limiter_instance().acquire("soundcloud", enforce=False)
         assert permit is not None
+        search_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "extract_flat": "in_playlist",
+            "noplaylist": False,
+            "ignoreerrors": True,
+        }
+        cookie_snapshot = self._attach_cookie_snapshot(search_opts)
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([query])
-        except yt_dlp.utils.MaxDownloadsReached:
-            self._provider_limiter_instance().complete(permit, success=True)
-            permit = None
-            pass  # expected: raised after max_downloads=1 succeeds
+            with yt_dlp.YoutubeDL(search_opts) as ydl:
+                flat = ydl.extract_info(query, download=False)
         except Exception as exc:
             reason = te.CONTENT_MISS if self._is_content_error(exc) else classify_provider_failure(exc)
             self._provider_limiter_instance().complete(
@@ -2076,20 +2084,95 @@ class DownloadOrchestrator:
         finally:
             self._release_cookie_snapshot(cookie_snapshot)
 
-        downloaded = self._find_output_file(out_stem)
-        if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 0:
-            if permit is not None:
-                self._provider_limiter_instance().complete(permit, success=True)
-            self._rate_limiter.record_success("soundcloud")
-            self._throttle.on_success("soundcloud")
-            return downloaded
-
-        if permit is not None:
+        candidates = []
+        for entry in (flat or {}).get("entries") or []:
+            if not entry:
+                continue
+            score = self._score_soundcloud_candidate(entry, track)
+            if score is not None:
+                candidates.append((score, entry))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        if not candidates:
             self._provider_limiter_instance().complete(
                 permit, success=False, failure_reason=te.NO_CANDIDATES,
             )
-        self._note_fail(te.NO_CANDIDATES)
+            self._note_fail(te.NO_CANDIDATES)
+            return None
+
+        last_reason = te.CONTENT_MISS
+        for _score, candidate in candidates:
+            url = candidate.get("webpage_url") or candidate.get("original_url") or candidate.get("url")
+            if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+                continue
+            out_stem = os.path.join(TEMP_DIR, str(uuid.uuid4()))
+            ydl_opts = self._build_mp3_opts(out_stem)
+            download_cookie_snapshot = ydl_opts.get("cookiefile")
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    result = ydl.extract_info(url, download=True)
+                duration = (result or {}).get("duration")
+                if track.duration_ms is not None:
+                    if duration is None or abs(float(duration) - track.duration_ms / 1000.0) > _DURATION_TOLERANCE_S:
+                        logger.info(
+                            "Tier 5 SoundCloud duration mismatch or unavailable for track %d (got %s, expected %.1fs)",
+                            track.id, f"{float(duration):.1f}s" if duration is not None else "unknown",
+                            track.duration_ms / 1000.0,
+                        )
+                        last_reason = te.CONTENT_MISS
+                        continue
+                downloaded = self._find_output_file(out_stem)
+                if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 0:
+                    self._provider_limiter_instance().complete(permit, success=True)
+                    self._rate_limiter.record_success("soundcloud")
+                    self._throttle.on_success("soundcloud")
+                    return downloaded
+            except Exception as exc:
+                last_reason = te.CONTENT_MISS if self._is_content_error(exc) else classify_provider_failure(exc)
+                if last_reason != te.CONTENT_MISS:
+                    self._rate_limiter.record_failure("soundcloud")
+                logger.warning("Tier 5 SoundCloud candidate failed for track %d: %s", track.id, exc)
+            finally:
+                self._release_cookie_snapshot(download_cookie_snapshot)
+
+        self._provider_limiter_instance().complete(permit, success=False, failure_reason=last_reason)
+        self._note_fail(last_reason)
         return None
+
+    @staticmethod
+    def _normalised_match_tokens(value: Optional[str]) -> set[str]:
+        decomposed = unicodedata.normalize("NFKD", value or "")
+        ascii_text = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+        return {token for token in re.findall(r"[a-z0-9]+", ascii_text.lower()) if len(token) > 1}
+
+    def _score_soundcloud_candidate(self, candidate: dict, track: Track) -> Optional[tuple[int, int]]:
+        """Return a title/artist score for a candidate inside the duration limit."""
+        expected_title = self._normalised_match_tokens(track.title)
+        expected_artist = self._normalised_match_tokens(track.artist)
+        actual_title = self._normalised_match_tokens(candidate.get("title"))
+        actual_artist = self._normalised_match_tokens(
+            " ".join(str(candidate.get(key) or "") for key in ("uploader", "artist", "channel"))
+        )
+        if not expected_title or not actual_title:
+            return None
+        title_coverage = len(expected_title & actual_title) / len(expected_title)
+        artist_coverage = (
+            len(expected_artist & (actual_artist | actual_title)) / len(expected_artist)
+            if expected_artist else 1.0
+        )
+        if title_coverage < 0.6 or artist_coverage < 0.5:
+            return None
+
+        duration = candidate.get("duration")
+        if duration is not None and track.duration_ms is not None:
+            try:
+                delta = abs(float(duration) - track.duration_ms / 1000.0)
+            except (TypeError, ValueError):
+                return None
+            if delta > _DURATION_TOLERANCE_S:
+                return None
+        else:
+            delta = _DURATION_TOLERANCE_S
+        return (round(title_coverage * 100 + artist_coverage * 50 - delta), -round(delta))
 
     # ── Attempt recording ──────────────────────────────────────────────────────
 
@@ -2121,6 +2204,8 @@ class DownloadOrchestrator:
         workers isolated from each other.
         """
         self._fail_tls.fail_reason = reason
+        if reason == te.BOT_CHALLENGE:
+            self._fail_tls.youtube_challenged = True
 
     def _record_librespot_timeout(self, track_id: int) -> None:
         """Record a librespot per-track timeout as a rate_limited attempt.

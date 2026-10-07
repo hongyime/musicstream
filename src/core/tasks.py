@@ -621,14 +621,6 @@ def download_pipeline(run_id: Optional[int] = None) -> tuple[int, int]:
         downloaded += lib_dl
         failed += lib_fail
 
-        # Phase 3: spotdl sweep
-        try:
-            with get_session() as session:
-                sdl_dl, sdl_fail = orchestrator.download_pending_spotdl(session)
-            logger.info("spotdl sweep: downloaded=%d failed=%d", sdl_dl, sdl_fail)
-            downloaded += sdl_dl
-        except Exception as exc:
-            logger.error("spotdl sweep failed (non-fatal): %s", exc, exc_info=True)
         _log_burn_rate()
         return downloaded, failed
     except Exception as exc:

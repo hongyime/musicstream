@@ -29,6 +29,7 @@ for _mod in ("yt_dlp", "spotipy", "spotipy.oauth2", "ytmusicapi", "spotdl"):
 
 from src.models import Base, DownloadAttempt, Track, TrackStatus  # noqa: E402
 from src.ingestion.downloader import DownloadOrchestrator, _DEFAULT_CONTENT_FAILURE_PASSES, TEMP_DIR  # noqa: E402
+from src.ingestion import tier_errors as te  # noqa: E402
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -240,6 +241,78 @@ class TestDownloadTrackIsolation:
             result = orch.download_track(track, session)
 
         assert result is False  # must return False, not raise
+
+    def test_pooled_tiers_follow_yield_order(self, session):
+        track = _make_track(session, "spotify:track:pooled_order")
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+        orch._rate_limiter = MagicMock()
+        orch._tier1_enabled = False
+
+        with patch.object(orch, "_tier2_ytdlp_ytm", return_value=None), \
+             patch.object(orch, "_tier5_ytdlp_soundcloud", return_value=None), \
+             patch.object(orch, "_tier3_spotdl", return_value=None), \
+             patch.object(orch, "_tier4_ytdlp_youtube", return_value=None):
+            assert orch.download_track(track, session) is False
+
+        methods = [row.method for row in session.query(DownloadAttempt).filter_by(
+            track_id=track.id, success=False,
+        ).filter(DownloadAttempt.method != "pipeline_pass").all()]
+        assert methods == [
+            "tier2_ytdlp_ytm",
+            "tier5_ytdlp_soundcloud",
+            "tier3_spotdl",
+            "tier4_ytdlp_youtube",
+        ]
+
+    def test_bot_challenge_skips_later_youtube_backends_but_tries_soundcloud(self, session):
+        track = _make_track(session, "spotify:track:challenge_skip")
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+        orch._rate_limiter = MagicMock()
+        orch._tier1_enabled = False
+
+        def _challenge(_track):
+            orch._note_fail(te.BOT_CHALLENGE)
+            return None
+
+        with patch.object(orch, "_tier2_ytdlp_ytm", side_effect=_challenge), \
+             patch.object(orch, "_tier5_ytdlp_soundcloud", return_value=None) as soundcloud, \
+             patch.object(orch, "_tier3_spotdl", return_value=None) as spotdl, \
+             patch.object(orch, "_tier4_ytdlp_youtube", return_value=None) as youtube:
+            assert orch.download_track(track, session) is False
+
+        soundcloud.assert_called_once_with(track)
+        spotdl.assert_not_called()
+        youtube.assert_not_called()
+
+
+class TestSoundCloudCandidateValidation:
+    def test_matching_title_artist_and_duration_are_accepted(self, session):
+        track = _make_track(session, "spotify:track:soundcloud_match")
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+        candidate = {
+            "title": "Artist - Download Test (Official Audio)",
+            "uploader": "Artist",
+            "duration": 183,
+        }
+
+        assert orch._score_soundcloud_candidate(candidate, track) is not None
+
+    def test_wrong_artist_or_duration_is_rejected(self, session):
+        track = _make_track(session, "spotify:track:soundcloud_reject")
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+        wrong_artist = {
+            "title": "Download Test",
+            "uploader": "Someone Else",
+            "duration": 180,
+        }
+        wrong_duration = {
+            "title": "Artist - Download Test",
+            "uploader": "Artist",
+            "duration": 200,
+        }
+
+        assert orch._score_soundcloud_candidate(wrong_artist, track) is None
+        assert orch._score_soundcloud_candidate(wrong_duration, track) is None
 
     def test_transient_provider_failures_stay_pending_and_back_off(self, session, monkeypatch):
         track = _make_track(session, "spotify:track:transient_pending")
