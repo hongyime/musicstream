@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session
 
 from src.exceptions import MusicBrainzError, TaggingError
 from src.models import Track
-from src.rate_limiter import ServiceRateLimiter
+from src.rate_limiter import ServiceRateLimiter, get_adaptive_provider_limiter
 
 # ── Optional heavy imports (graceful degradation) ─────────────────────────────
 
@@ -186,7 +186,9 @@ def _ssrf_safe_get(url: str, *, timeout: int = 15, max_redirects: int = 5):
         if not _ssrf_safe(current):
             logger.warning("SSRF guard rejected %r; aborting fetch chain", current)
             return None
-        resp = requests.get(current, timeout=timeout, allow_redirects=False)
+        resp = get_adaptive_provider_limiter().observe_call(
+            "artwork", requests.get, current, timeout=timeout, allow_redirects=False,
+        )
         if resp.is_redirect or resp.is_permanent_redirect:
             loc = resp.headers.get("Location")
             if not loc:
@@ -283,6 +285,7 @@ class MetadataTagger:
     ) -> None:
         self._acoustid_key = acoustid_api_key or os.environ.get("ACOUSTID_API_KEY", "")
         self._rl = rate_limiter or ServiceRateLimiter()
+        self._provider_limiter = get_adaptive_provider_limiter()
         self._mb_session = requests.Session()
         self._mb_session.headers.update({"User-Agent": MB_USER_AGENT})
         self._sp = None
@@ -353,7 +356,10 @@ class MetadataTagger:
         query = f'track:"{track.title}" artist:"{track.artist}"'
         try:
             self._rl.wait("spotify", attempt=0)
-            resp = sp.search(q=query, type="track", limit=1, market="from_token")
+            resp = self._provider_limiter.observe_call(
+                "spotify_api", sp.search,
+                q=query, type="track", limit=1, market="from_token",
+            )
         except Exception as exc:  # noqa: BLE001
             logger.debug("Spotify backfill search failed for track %d: %s", track.id, exc)
             return
@@ -580,7 +586,10 @@ class MetadataTagger:
         self._rl.wait("musicbrainz", attempt=0)
         url = f"{MB_WS2_BASE}/isrc/{isrc}"
         try:
-            resp = self._mb_session.get(url, params={"inc": "releases", "fmt": "json"}, timeout=10)
+            resp = self._provider_limiter.observe_call(
+                "musicbrainz", self._mb_session.get,
+                url, params={"inc": "releases", "fmt": "json"}, timeout=10,
+            )
         except requests.RequestException as exc:
             raise MusicBrainzError(f"ISRC lookup network error: {exc}") from exc
 
@@ -605,7 +614,8 @@ class MetadataTagger:
         self._rl.wait("musicbrainz", attempt=0)
         url = f"{MB_WS2_BASE}/recording/{recording_id}"
         try:
-            resp = self._mb_session.get(
+            resp = self._provider_limiter.observe_call(
+                "musicbrainz", self._mb_session.get,
                 url,
                 params={"inc": "releases artists", "fmt": "json"},
                 timeout=10,
@@ -626,7 +636,8 @@ class MetadataTagger:
         query = f'recording:"{title}" AND artist:"{artist}"'
         url = f"{MB_WS2_BASE}/recording"
         try:
-            resp = self._mb_session.get(
+            resp = self._provider_limiter.observe_call(
+                "musicbrainz", self._mb_session.get,
                 url,
                 params={"query": query, "limit": 1, "fmt": "json"},
                 timeout=10,
@@ -732,8 +743,10 @@ class MetadataTagger:
 
         self._rl.wait("acoustid", attempt=0)
         try:
-            results = acoustid.lookup(self._acoustid_key, fp_data, duration,
-                                      meta="recordings")
+            results = self._provider_limiter.observe_call(
+                "acoustid", acoustid.lookup,
+                self._acoustid_key, fp_data, duration, meta="recordings",
+            )
         except acoustid.WebServiceError as exc:
             logger.warning("AcoustID lookup failed: %s", exc)
             self._rl.record_failure("acoustid")
@@ -808,7 +821,10 @@ class MetadataTagger:
         if track.cover_art_url:
             try:
                 if _ssrf_safe(track.cover_art_url):
-                    resp = requests.get(track.cover_art_url, timeout=15, allow_redirects=False)
+                    resp = self._provider_limiter.observe_call(
+                        "artwork", requests.get, track.cover_art_url,
+                        timeout=15, allow_redirects=False,
+                    )
                     if resp.status_code == 200 and resp.content:
                         return resp.content
                 else:

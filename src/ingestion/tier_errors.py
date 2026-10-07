@@ -19,7 +19,9 @@ NO_SOURCE_ID      = "no_source_id"         # required spotify_id / spotify_uri a
 CIRCUIT_OPEN      = "circuit_open"         # service circuit breaker tripped
 THROTTLE_SKIP     = "throttle_skip"        # throttle window said "skip this round"
 NO_CANDIDATES     = "no_candidates"        # search returned nothing usable
+CONTENT_MISS      = "content_miss"         # provider answered; selected content was unavailable
 RATE_LIMITED      = "rate_limited"         # 429 / explicit per-account rate limit
+BOT_CHALLENGE     = "bot_challenge"        # YouTube sign-in challenge; provider throttle signal
 
 # ── librespot (Tier 0) specific ──────────────────────────────────────────────
 REGION_UNAVAIL    = "region_unavailable"   # Spotify has no playable variant for the account/market

@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import spotipy
 from spotipy.cache_handler import CacheFileHandler
@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session
 from src.core.config import SPOTIFY_CLIENT_SECRET
 from src.exceptions import SpotifyRateLimitError
 from src.models import Source, SourceType, Track, TrackStatus, track_sources
-from src.rate_limiter import ServiceRateLimiter
+from src.rate_limiter import ServiceRateLimiter, get_adaptive_provider_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,12 @@ class SpotifyScraper:
     def __init__(self, client_id: str) -> None:
         self._client_id = client_id
         self._rate_limiter = ServiceRateLimiter()
+        self._provider_limiter = get_adaptive_provider_limiter()
         self._sp: Optional[spotipy.Spotify] = None
+
+    def _spotify_call(self, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Observe Spotify Web API calls without enforcing the new limiter yet."""
+        return self._provider_limiter.observe_call("spotify_api", callback, *args, **kwargs)
 
     # ── Spotify client (lazy init) ─────────────────────────────────────────────
 
@@ -505,7 +510,7 @@ class SpotifyScraper:
         for i in range(0, len(track_spotify_ids), 50):
             chunk = track_spotify_ids[i:i+50]
             try:
-                tracks_resp = self.sp.tracks(chunk)
+                tracks_resp = self._spotify_call(self.sp.tracks, chunk)
                 self._rate_limiter.record_success("spotify")
             except spotipy.SpotifyException as exc:
                 if exc.http_status == 429:
@@ -589,7 +594,7 @@ class SpotifyScraper:
             attempt = 0
             while True:
                 try:
-                    result = self.sp.current_user_playlists(limit=limit, offset=offset)
+                    result = self._spotify_call(self.sp.current_user_playlists, limit=limit, offset=offset)
                     self._rate_limiter.record_success("spotify")
                     break
                 except spotipy.SpotifyException as exc:
@@ -631,7 +636,7 @@ class SpotifyScraper:
             attempt = 0
             while True:
                 try:
-                    result = self.sp.playlist_tracks(
+                    result = self._spotify_call(self.sp.playlist_tracks,
                         playlist_id,
                         limit=limit,
                         offset=current_offset,
@@ -673,7 +678,7 @@ class SpotifyScraper:
             attempt = 0
             while True:
                 try:
-                    result = self.sp.current_user_saved_tracks(limit=limit, offset=offset)
+                    result = self._spotify_call(self.sp.current_user_saved_tracks, limit=limit, offset=offset)
                     self._rate_limiter.record_success("spotify")
                     break
                 except spotipy.SpotifyException as exc:
@@ -705,7 +710,7 @@ class SpotifyScraper:
             attempt = 0
             while True:
                 try:
-                    result = self.sp.current_user_saved_albums(limit=limit, offset=offset)
+                    result = self._spotify_call(self.sp.current_user_saved_albums, limit=limit, offset=offset)
                     self._rate_limiter.record_success("spotify")
                     break
                 except spotipy.SpotifyException as exc:
@@ -734,7 +739,7 @@ class SpotifyScraper:
             attempt = 0
             while True:
                 try:
-                    result = self.sp.current_user_followed_artists(limit=limit, after=after)
+                    result = self._spotify_call(self.sp.current_user_followed_artists, limit=limit, after=after)
                     self._rate_limiter.record_success("spotify")
                     break
                 except spotipy.SpotifyException as exc:
@@ -773,7 +778,7 @@ class SpotifyScraper:
             attempt = 0
             while True:
                 try:
-                    result = self.sp.artist_albums(
+                    result = self._spotify_call(self.sp.artist_albums,
                         artist_id,
                         album_type=album_type,
                         limit=limit,
@@ -795,7 +800,7 @@ class SpotifyScraper:
             # Fetch full album objects (artist_albums returns simplified)
             for alb in items:
                 try:
-                    full_album = self.sp.album(alb["id"])
+                    full_album = self._spotify_call(self.sp.album, alb["id"])
                     albums.append(full_album)
                     self._rate_limiter.record_success("spotify")
                 except Exception as exc:
@@ -810,7 +815,7 @@ class SpotifyScraper:
         attempt = 0
         while True:
             try:
-                result = self.sp.current_user_recently_played(limit=50)
+                result = self._spotify_call(self.sp.current_user_recently_played, limit=50)
                 self._rate_limiter.record_success("spotify")
                 break
             except spotipy.SpotifyException as exc:
@@ -1089,7 +1094,7 @@ class SpotifyScraper:
         attempt = 0
         while True:
             try:
-                result = self.sp.playlist(
+                result = self._spotify_call(self.sp.playlist,
                     playlist_id,
                     fields="id,name,snapshot_id",
                 )

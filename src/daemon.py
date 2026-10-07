@@ -25,6 +25,7 @@ from spotipy.cache_handler import CacheFileHandler
 from spotipy.oauth2 import SpotifyOAuth, SpotifyPKCE
 
 from src.schemas.responses import ApiResponse, TrackStats
+from src.rate_limiter import get_adaptive_provider_limiter
 from src.ws.manager import manager
 from src.core.config import (
     LOG_DIR, TIMEZONE, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_TOKEN_CACHE, DAEMON_API_TOKEN,
@@ -700,6 +701,8 @@ def _build_deep_health_payload() -> dict[str, Any]:
     except Exception as exc:
         spotify_token = {"present": False, "hours_left": None, "expired": True, "error": str(exc)[:500]}
 
+    provider_limiter = get_adaptive_provider_limiter().compact_snapshot()
+
     degraded = bool(reasons)
     return {
         "status": "degraded" if degraded else "ok",
@@ -710,6 +713,7 @@ def _build_deep_health_payload() -> dict[str, Any]:
         "last_run_fresh": run_fresh,
         "download_liveness": download_liveness,
         "spotify_token": spotify_token,
+        "provider_limiter": provider_limiter,
         "reasons": reasons,
     }
 
@@ -1093,7 +1097,10 @@ def get_metrics():
                     "rate": round(stats["success"] / stats["total"] * 100, 1) if stats["total"] > 0 else 0
                 })
             
-            return ApiResponse(data=data)
+            return ApiResponse(
+                data=data,
+                meta={"provider_limiter": get_adaptive_provider_limiter().snapshot()},
+            )
     except Exception as e:
         return ApiResponse(error=str(e))
 
