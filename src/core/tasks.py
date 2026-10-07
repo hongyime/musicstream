@@ -380,14 +380,17 @@ def get_download_liveness(
         ).scalar() or 0
         success_1h = session.query(func.count(DownloadAttempt.id)).filter(
             DownloadAttempt.success.is_(True),
+            DownloadAttempt.method != "pipeline_pass",
             DownloadAttempt.attempted_at > now - timedelta(hours=1),
         ).scalar() or 0
         success_24h = session.query(func.count(DownloadAttempt.id)).filter(
             DownloadAttempt.success.is_(True),
+            DownloadAttempt.method != "pipeline_pass",
             DownloadAttempt.attempted_at > now - timedelta(hours=24),
         ).scalar() or 0
         last_success_at = session.query(func.max(DownloadAttempt.attempted_at)).filter(
-            DownloadAttempt.success.is_(True)
+            DownloadAttempt.success.is_(True),
+            DownloadAttempt.method != "pipeline_pass",
         ).scalar()
 
     last_success_at = _as_utc(last_success_at)
@@ -436,6 +439,12 @@ def reset_failed_tracks(session) -> int:
                 "status": TrackStatus.PENDING.value,
                 "attempt_count": 0,
                 "last_attempt_at": None,
+                "content_failure_passes": 0,
+                "transient_failure_passes": 0,
+                "next_retry_at": None,
+                "last_pipeline_outcome": None,
+                "last_pipeline_error": None,
+                "last_pipeline_pass_at": None,
                 "claimed_at": None,
                 "heartbeat_at": None,
                 "claim_owner": None,
@@ -475,6 +484,12 @@ def unblock_track(session, track_id: int) -> bool:
     track.status = TrackStatus.PENDING.value
     track.attempt_count = 0
     track.last_attempt_at = None
+    track.content_failure_passes = 0
+    track.transient_failure_passes = 0
+    track.next_retry_at = None
+    track.last_pipeline_outcome = None
+    track.last_pipeline_error = None
+    track.last_pipeline_pass_at = None
     track.claimed_at = None
     track.heartbeat_at = None
     track.claim_owner = None
@@ -544,6 +559,7 @@ def _log_burn_rate() -> None:
             pending = session.query(Track).filter(Track.status == "pending").count()
             dl_1h = session.query(func.count(DownloadAttempt.id)).filter(
                 DownloadAttempt.success.is_(True),
+                DownloadAttempt.method != "pipeline_pass",
                 DownloadAttempt.attempted_at > datetime.now(timezone.utc) - timedelta(hours=1),
             ).scalar() or 0
         if dl_1h > 0:

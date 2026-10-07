@@ -40,6 +40,12 @@ class TestResetFailedTracks:
 
     def test_clears_attempt_count_on_failed(self, session):
         t = _track(session, "spotify:track:rf1", "failed", attempt_count=25)
+        t.content_failure_passes = 6
+        t.transient_failure_passes = 4
+        t.next_retry_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        t.last_pipeline_outcome = "content_miss"
+        t.last_pipeline_error = "no_candidates"
+        t.last_pipeline_pass_at = datetime.now(timezone.utc)
         n = reset_failed_tracks(session)
         session.expire_all()
         rt = session.get(Track, t.id)
@@ -47,6 +53,12 @@ class TestResetFailedTracks:
         assert rt.status == TrackStatus.PENDING.value
         assert (rt.attempt_count or 0) == 0
         assert rt.last_attempt_at is None
+        assert rt.content_failure_passes == 0
+        assert rt.transient_failure_passes == 0
+        assert rt.next_retry_at is None
+        assert rt.last_pipeline_outcome is None
+        assert rt.last_pipeline_error is None
+        assert rt.last_pipeline_pass_at is None
         assert rt.claimed_at is None
         assert rt.heartbeat_at is None
         assert rt.claim_owner is None

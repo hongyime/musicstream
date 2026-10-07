@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -28,7 +28,7 @@ for _mod in ("yt_dlp", "spotipy", "spotipy.oauth2", "ytmusicapi", "spotdl"):
     sys.modules.setdefault(_mod, MagicMock())
 
 from src.models import Base, DownloadAttempt, Track, TrackStatus  # noqa: E402
-from src.ingestion.downloader import DownloadOrchestrator, _GIVE_UP_THRESHOLD, TEMP_DIR  # noqa: E402
+from src.ingestion.downloader import DownloadOrchestrator, _DEFAULT_CONTENT_FAILURE_PASSES, TEMP_DIR  # noqa: E402
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -94,30 +94,32 @@ class TestConstants:
         assert isinstance(DownloadOrchestrator.MAX_CONCURRENT, int)
         assert DownloadOrchestrator.MAX_CONCURRENT >= 1
 
-    def test_give_up_threshold_is_20(self):
-        assert _GIVE_UP_THRESHOLD == 20
+    def test_content_failure_threshold_defaults_to_six_full_passes(self):
+        assert _DEFAULT_CONTENT_FAILURE_PASSES == 6
 
 
 # ── _should_give_up ───────────────────────────────────────────────────────────
 
 class TestShouldGiveUp:
-    def test_below_threshold_returns_false(self, session):
+    def test_tier_attempt_count_does_not_trigger_terminal_failure(self, session):
         track = _make_track(session, "spotify:track:giveup_below")
-        _add_failed_attempts(session, track.id, 8)
+        _add_failed_attempts(session, track.id, 30)
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         assert orch._should_give_up(session, track.id) is False
 
-    def test_at_threshold_returns_true(self, session):
+    def test_content_failure_passes_trigger_terminal_failure(self, session, monkeypatch):
         track = _make_track(session, "spotify:track:giveup_at")
-        _add_failed_attempts(session, track.id, 20)
+        monkeypatch.setenv("CONTENT_FAILURE_PASSES", "3")
+        track.content_failure_passes = 3
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         assert orch._should_give_up(session, track.id) is True
 
-    def test_above_threshold_returns_true(self, session):
+    def test_content_failure_threshold_is_configurable(self, session, monkeypatch):
         track = _make_track(session, "spotify:track:giveup_above")
-        _add_failed_attempts(session, track.id, 30)
+        monkeypatch.setenv("CONTENT_FAILURE_PASSES", "4")
+        track.content_failure_passes = 3
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
-        assert orch._should_give_up(session, track.id) is True
+        assert orch._should_give_up(session, track.id) is False
 
     def test_zero_attempts_returns_false(self, session):
         track = _make_track(session, "spotify:track:giveup_zero")
@@ -212,6 +214,16 @@ class TestBuildMp3Opts:
 # ── download_track() — P8: single failure never stops queue ──────────────────
 
 class TestDownloadTrackIsolation:
+    def test_future_retry_at_prevents_claiming_track(self, session):
+        track = _make_track(session, "spotify:track:deferred_retry")
+        track.next_retry_at = _utcnow() + timedelta(hours=1)
+        session.flush()
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+
+        assert orch.download_track(track, session) is False
+        assert track.status == TrackStatus.PENDING.value
+        assert session.query(DownloadAttempt).filter_by(track_id=track.id).count() == 0
+
     def test_all_tiers_fail_returns_false_not_raises(self, session):
         """P8: a single track failure must never raise an exception."""
         track = _make_track(session, "spotify:track:all_fail")
@@ -229,9 +241,62 @@ class TestDownloadTrackIsolation:
 
         assert result is False  # must return False, not raise
 
+    def test_transient_provider_failures_stay_pending_and_back_off(self, session, monkeypatch):
+        track = _make_track(session, "spotify:track:transient_pending")
+        track.content_failure_passes = 5
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+        orch._rate_limiter = MagicMock()
+        orch._tier1_enabled = False
+        monkeypatch.setenv("TRANSIENT_RETRY_BASE_MINUTES", "15")
+        monkeypatch.setenv("TRANSIENT_RETRY_MAX_MINUTES", "120")
+
+        with patch.object(orch, "_tier2_ytdlp_ytm", side_effect=OSError("provider offline")), \
+             patch.object(orch, "_tier3_spotdl", side_effect=OSError("provider offline")), \
+             patch.object(orch, "_tier4_ytdlp_youtube", side_effect=OSError("provider offline")), \
+             patch.object(orch, "_tier5_ytdlp_soundcloud", side_effect=OSError("provider offline")):
+            result = orch.download_track(track, session)
+
+        assert result is False
+        assert track.status == TrackStatus.PENDING.value
+        assert track.content_failure_passes == 5
+        assert track.transient_failure_passes == 1
+        assert track.last_pipeline_outcome == "transient_failure"
+        assert track.next_retry_at is not None
+        assert 14 * 60 <= (track.next_retry_at - _utcnow()).total_seconds() <= 15 * 60
+        pass_row = session.query(DownloadAttempt).filter_by(
+            track_id=track.id, method="pipeline_pass", success=False,
+        ).one()
+        assert pass_row.error == "provider_error"
+
+    def test_terminal_failure_requires_multiple_content_miss_passes(self, session, monkeypatch):
+        track = _make_track(session, "spotify:track:content_passes")
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+        orch._rate_limiter = MagicMock()
+        orch._tier1_enabled = False
+        monkeypatch.setenv("CONTENT_FAILURE_PASSES", "2")
+
+        with patch.object(orch, "_tier2_ytdlp_ytm", return_value=None), \
+             patch.object(orch, "_tier3_spotdl", return_value=None), \
+             patch.object(orch, "_tier4_ytdlp_youtube", return_value=None), \
+             patch.object(orch, "_tier5_ytdlp_soundcloud", return_value=None):
+            assert orch.download_track(track, session) is False
+            assert track.status == TrackStatus.PENDING.value
+            assert track.content_failure_passes == 1
+            assert orch.download_track(track, session) is False
+
+        assert track.status == TrackStatus.FAILED.value
+        assert track.content_failure_passes == 2
+        pass_rows = session.query(DownloadAttempt).filter_by(
+            track_id=track.id, method="pipeline_pass", success=False,
+        ).count()
+        assert pass_rows == 2
+
     def test_successful_tier_returns_true_and_sets_downloaded(self, session):
         from src.models import TrackStatus as TS
         track = _make_track(session, "spotify:track:tier1_success")
+        track.content_failure_passes = 4
+        track.transient_failure_passes = 2
+        track.next_retry_at = _utcnow()
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         orch._rate_limiter = MagicMock()
         orch._tier1_enabled = False
@@ -247,8 +312,7 @@ class TestDownloadTrackIsolation:
 
         fake_path = "/tmp/abc123_ytm.mp3"
         with patch.object(orch, "_tier5_ytdlp_soundcloud", return_value=None), \
-             patch.object(orch, "_tier2_ytdlp_ytm", return_value=fake_path), \
-             patch.object(orch, "_record_attempt"):
+             patch.object(orch, "_tier2_ytdlp_ytm", return_value=fake_path):
             result = orch.download_track(track, session)
 
         assert result is True
@@ -257,11 +321,18 @@ class TestDownloadTrackIsolation:
         assert track.claimed_at is None
         assert track.heartbeat_at is None
         assert track.claim_owner is None
+        assert track.content_failure_passes == 0
+        assert track.transient_failure_passes == 0
+        assert track.next_retry_at is None
+        pass_row = session.query(DownloadAttempt).filter_by(
+            track_id=track.id, method="pipeline_pass", success=True,
+        ).one()
+        assert pass_row.error is None
 
     def test_status_set_to_failed_after_give_up(self, session):
         track = _make_track(session, "spotify:track:give_up_test")
-        # Pre-load enough failures to cross the give-up threshold (25)
-        _add_failed_attempts(session, track.id, 25)
+        # A complete content miss crosses the configured threshold; tier count is irrelevant.
+        track.content_failure_passes = 5
 
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         orch._rate_limiter = MagicMock()

@@ -126,6 +126,16 @@ class Track(Base):
     attempt_count:   Mapped[int]                = mapped_column(Integer, nullable=False, default=0, server_default="0")
     last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Pipeline-level outcome state is separate from tier-attempt accounting:
+    # provider outages stay pending while repeated complete content misses can
+    # eventually become terminal. Retry timestamps gate transiently failing rows.
+    content_failure_passes: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    transient_failure_passes: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_pipeline_outcome: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    last_pipeline_error: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    last_pipeline_pass_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # Download claim observability/recovery (migration 0004). These fields are
     # nullable so older queued/downloaded rows do not need a backfill.
     claimed_at:     Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

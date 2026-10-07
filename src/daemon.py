@@ -1018,6 +1018,7 @@ def get_burn_rate():
             def _succ_since(hours: int) -> int:
                 return session.query(func.count(DownloadAttempt.id)).filter(
                     DownloadAttempt.success.is_(True),
+                    DownloadAttempt.method != "pipeline_pass",
                     DownloadAttempt.attempted_at > now - timedelta(hours=hours),
                 ).scalar() or 0
 
