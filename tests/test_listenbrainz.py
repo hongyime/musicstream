@@ -257,6 +257,34 @@ class TestRun:
 
         assert fetch_calls == [POLL_COUNT]
 
+    def test_retries_existing_failed_recommendation_in_same_run(self, session):
+        mbid = "mbid-retry-existing"
+        existing = LbRecommendation(
+            recording_mbid=mbid,
+            title="Old title",
+            artist="Old artist",
+            fetched_at=datetime.now(timezone.utc),
+            status="failed",
+            kind="cf",
+        )
+        session.add(existing)
+        session.flush()
+        d = _make_discovery()
+        recommendation = _make_rec(mbid, "Recovered Song", "Recovered Artist")
+
+        with patch.object(d, "_fetch_recommendations", return_value=[recommendation]), patch.object(
+            d,
+            "_fetch_mb_metadata",
+            return_value={"title": "Recovered Song", "artist-credit": [{"name": "Recovered Artist"}]},
+        ):
+            created = d.run(session)
+
+        assert created == 1
+        assert session.query(LbRecommendation).filter_by(recording_mbid=mbid).count() == 1
+        assert existing.status == "ingested"
+        track = session.query(Track).filter_by(spotify_uri=f"mb:{mbid}").one()
+        assert track.title == "Recovered Song"
+
     def test_already_present_mbid_skipped(self, session):
         """Already-present recording_mbid values must be skipped."""
         mbid = "mbid-already-present"

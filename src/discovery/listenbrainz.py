@@ -130,11 +130,6 @@ class ListenBrainzDiscovery:
                 # Re-process pending/skipped/failed recommendations
                 logger.info("Re-processing MBID %s (was %s)", mbid, existing.status)
                 existing.status = "pending"  # Reset to pending for re-processing
-                try:
-                    session.flush()
-                except Exception as exc:
-                    logger.warning("DB flush failed resetting MBID %s status: %s", mbid, exc)
-                continue
 
             # ── Ingest new recommendation ──────────────────────────────────
             try:
@@ -313,17 +308,22 @@ class ListenBrainzDiscovery:
         if not artist:
             artist = rec.get("artist_name") or rec.get("artist_credit_name")
 
-        # ── Create LbRecommendation row ────────────────────────────────────
-        lb_rec = LbRecommendation(
-            recording_mbid=mbid,
-            title=title,
-            artist=artist,
-            score=score,
-            fetched_at=now,
-            status="pending",
-            kind=kind,  # §W3 T22
+        # Reuse a pending/skipped/failed row when this recommendation is retried;
+        # inserting another row would hit the unique recording_mbid constraint.
+        lb_rec = (
+            session.query(LbRecommendation)
+            .filter_by(recording_mbid=mbid)
+            .first()
         )
-        session.add(lb_rec)
+        if lb_rec is None:
+            lb_rec = LbRecommendation(recording_mbid=mbid)
+            session.add(lb_rec)
+        lb_rec.title = title
+        lb_rec.artist = artist
+        lb_rec.score = score
+        lb_rec.fetched_at = now
+        lb_rec.status = "pending"
+        lb_rec.kind = kind  # §W3 T22
 
         try:
             session.flush()  # get lb_rec.id without committing
