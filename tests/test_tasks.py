@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.models import DownloadAttempt, DownloadAttemptAggregate, Track, TrackStatus  # noqa: E402
@@ -159,6 +161,51 @@ class TestResetOrphanedDownloads:
         assert active.status == TrackStatus.PENDING.value
         assert active.heartbeat_at is None
         assert active.claim_owner is None
+
+
+class TestOrphanFileInventory:
+    def test_reports_unowned_audio_and_missing_db_files_without_mutation(
+        self, session, tmp_path, monkeypatch,
+    ):
+        media = tmp_path / "media"
+        media.mkdir()
+        owned = media / "owned.mp3"
+        referenced_pending = media / "pending.flac"
+        orphan = media / "unowned.mp3"
+        quarantined = media / "old.flac.orphan-12345"
+        ignored = media / "notes.txt"
+        for path in (owned, referenced_pending, orphan, quarantined, ignored):
+            path.write_bytes(b"fixture")
+
+        downloaded = _track(session, "spotify:track:inv1", "downloaded", 0)
+        downloaded.file_path = str(owned)
+        missing = _track(session, "spotify:track:inv2", "downloaded", 0)
+        missing.file_path = str(media / "missing.m4a")
+        pending = _track(session, "spotify:track:inv3", "pending", 0)
+        pending.file_path = str(referenced_pending)
+        session.flush()
+
+        @contextmanager
+        def fake_get_session():
+            yield session
+
+        monkeypatch.setattr("src.db.get_session", fake_get_session)
+        inventory = tasks.orphan_file_inventory(media, sample_limit=10)
+
+        assert inventory["orphan_file_count"] == 2
+        assert set(inventory["orphan_file_samples"]) == {str(orphan), str(quarantined)}
+        assert inventory["missing_file_count"] == 1
+        assert inventory["missing_file_samples"] == [{
+            "track_id": missing.id,
+            "status": "downloaded",
+            "file_path": str(media / "missing.m4a"),
+        }]
+        assert inventory["scan_error_count"] == 0
+        assert all(path.is_file() for path in (owned, referenced_pending, orphan, quarantined, ignored))
+
+    def test_refuses_inventory_when_media_root_is_unavailable(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="Media root is unavailable"):
+            tasks.orphan_file_inventory(tmp_path / "missing")
 
 
 class TestDownloadLiveness:

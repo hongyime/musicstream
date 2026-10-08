@@ -25,6 +25,12 @@ except ValueError:
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 
 TIMEZONE = "Asia/Singapore"
+try:
+    ORPHAN_INVENTORY_INTERVAL_DAYS = max(
+        1, int(os.environ.get("ORPHAN_INVENTORY_INTERVAL_DAYS", "7"))
+    )
+except ValueError:
+    ORPHAN_INVENTORY_INTERVAL_DAYS = 7
 
 # ── Spotify ───────────────────────────────────────────────────────────────────
 

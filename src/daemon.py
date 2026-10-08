@@ -28,7 +28,8 @@ from src.schemas.responses import ApiResponse, TrackStats
 from src.rate_limiter import get_adaptive_provider_limiter
 from src.ws.manager import manager
 from src.core.config import (
-    LOG_DIR, TIMEZONE, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_TOKEN_CACHE, DAEMON_API_TOKEN,
+    LOG_DIR, TIMEZONE, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET,
+    SPOTIFY_TOKEN_CACHE, DAEMON_API_TOKEN, ORPHAN_INVENTORY_INTERVAL_DAYS,
 )
 import src.core.tasks as tasks
 
@@ -865,6 +866,14 @@ def _register_scheduler_jobs():
     # Verify an actual restore on the first day of each month, after the 05:00 backup.
     scheduler.add_job(tasks.verify_backup_restore, "cron", day=1, hour=6, id="backup_restore_verify", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.prune_download_attempts, "cron", hour=5, minute=30, id="download_attempt_prune", replace_existing=True, misfire_grace_time=GRACE)
+    scheduler.add_job(
+        tasks.log_orphan_file_inventory,
+        "interval",
+        days=ORPHAN_INVENTORY_INTERVAL_DAYS,
+        id="orphan_file_inventory",
+        replace_existing=True,
+        misfire_grace_time=GRACE,
+    )
     # §W3 T18/V13: hourly token early-warning probe.
     scheduler.add_job(tasks.probe_spotify_token, "interval", hours=1, id="token_probe", replace_existing=True, misfire_grace_time=GRACE)
     # §W3 T20: weekly quality-upgrade requeue before the next 4-hourly pipeline pass.
@@ -1131,10 +1140,17 @@ async def validate_invalid_tracks():
     # Simple placeholder to satisfy T7 integration tests
     return {"summary": {"checked": 0, "updated": 0, "marked_not_found": 0, "errors": 0}}
 
+@app.post("/admin/cleanup-orphans", dependencies=[Depends(require_auth)])
 @app.post("/admin/cleanup-invalid-tracks", dependencies=[Depends(require_auth)])
-async def cleanup_invalid_tracks():
-    # Simple placeholder to satisfy T7 integration tests
-    return {"deleted": 0}
+async def cleanup_invalid_tracks(dry_run: bool = True):
+    """Report orphaned media files and missing DB files without changing either."""
+    if not dry_run:
+        raise HTTPException(
+            status_code=400,
+            detail="Only dry-run orphan inventory is supported; no cleanup is performed.",
+        )
+    inventory = await asyncio.to_thread(tasks.orphan_file_inventory)
+    return {"deleted": 0, "dry_run": True, "inventory": inventory}
 
 @app.get("/api/artwork-report")
 async def artwork_report():

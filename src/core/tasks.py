@@ -1,14 +1,19 @@
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from pathlib import Path
 from typing import Optional, Callable, Any
 
-from src.core.config import LOG_DIR, BACKUP_DIR, BACKUP_RETENTION_DAYS, DISABLE_DOWNLOADS, SPOTIFY_CLIENT_ID
+from src.core.config import (
+    LOG_DIR, BACKUP_DIR, BACKUP_RETENTION_DAYS, DISABLE_DOWNLOADS,
+    MEDIA_DIR, SPOTIFY_CLIENT_ID,
+)
 
 logger = logging.getLogger("musicstream.daemon")
 
@@ -19,6 +24,13 @@ _DOWNLOAD_PIPELINE_LOCK = threading.Lock()
 _BACKUP_LOCK = threading.Lock()
 _BACKUP_VERIFY_LOCK = threading.Lock()
 _DOWNLOAD_ATTEMPT_PRUNE_LOCK = threading.Lock()
+
+_AUDIO_DOWNLOAD_EXTENSIONS = frozenset({
+    ".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wma",
+})
+_QUARANTINED_AUDIO_RE = re.compile(
+    r"\.(?:aac|flac|m4a|mp3|ogg|opus|wav|wma)\.orphan-\d+$", re.IGNORECASE,
+)
 
 
 def _spotify_task_min_token_hours() -> float:
@@ -658,6 +670,112 @@ def listenbrainz_discovery() -> None:
                 logger.warning("m3u weekly export failed (non-fatal, V8): %s", exc)
     except Exception as exc:
         logger.error("ListenBrainz discovery failed: %s", exc, exc_info=True)
+
+
+def orphan_file_inventory(
+    media_dir: str | os.PathLike[str] | None = None,
+    *,
+    sample_limit: int = 25,
+) -> dict[str, Any]:
+    """Report media files without a DB owner and DB paths whose files are missing.
+
+    This routine is read-only. It scans only audio files and the timestamped
+    ``.orphan-<unix timestamp>`` files created by the organiser. A missing or
+    unavailable media root is an error rather than an empty inventory, which
+    avoids reporting every downloaded row as missing when the media mount is down.
+    """
+    from src.db import get_session
+    from src.models import Track
+
+    root = Path(media_dir) if media_dir is not None else Path(MEDIA_DIR)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Media root is unavailable: {root}")
+
+    sample_limit = max(0, int(sample_limit))
+
+    def path_key(value: str | os.PathLike[str]) -> str:
+        return os.path.normcase(os.path.abspath(os.fspath(value)))
+
+    with get_session() as session:
+        rows = session.query(Track.id, Track.status, Track.file_path).filter(
+            Track.file_path.isnot(None), Track.file_path != "",
+        ).all()
+
+    referenced_paths: set[str] = set()
+    missing_file_count = 0
+    missing_file_samples: list[dict[str, Any]] = []
+    for track_id, status, stored_path in rows:
+        stored_path = str(stored_path)
+        referenced_paths.add(path_key(stored_path))
+        if not Path(stored_path).is_file():
+            missing_file_count += 1
+            if len(missing_file_samples) < sample_limit:
+                missing_file_samples.append({
+                    "track_id": track_id,
+                    "status": status,
+                    "file_path": stored_path,
+                })
+
+    orphan_file_count = 0
+    orphan_file_samples: list[str] = []
+    scan_error_count = 0
+    scan_error_samples: list[str] = []
+
+    def record_scan_error(error: OSError) -> None:
+        nonlocal scan_error_count
+        scan_error_count += 1
+        if len(scan_error_samples) < sample_limit:
+            scan_error_samples.append(str(error))
+
+    for directory, subdirectories, filenames in os.walk(
+        root, followlinks=False, onerror=record_scan_error,
+    ):
+        subdirectories[:] = [
+            name for name in subdirectories
+            if not (Path(directory) / name).is_symlink()
+        ]
+        for filename in filenames:
+            path = Path(directory) / filename
+            if not path.is_file():
+                continue
+            lower_name = filename.lower()
+            if path.suffix.lower() not in _AUDIO_DOWNLOAD_EXTENSIONS and not _QUARANTINED_AUDIO_RE.search(lower_name):
+                continue
+            if path_key(path) in referenced_paths:
+                continue
+            orphan_file_count += 1
+            if len(orphan_file_samples) < sample_limit:
+                orphan_file_samples.append(str(path))
+
+    return {
+        "media_root": str(root),
+        "orphan_file_count": orphan_file_count,
+        "orphan_file_samples": orphan_file_samples,
+        "missing_file_count": missing_file_count,
+        "missing_file_samples": missing_file_samples,
+        "scan_error_count": scan_error_count,
+        "scan_error_samples": scan_error_samples,
+    }
+
+
+def log_orphan_file_inventory() -> dict[str, Any] | None:
+    """Run and log a read-only orphan inventory for the scheduler."""
+    try:
+        inventory = orphan_file_inventory()
+    except Exception as exc:
+        logger.warning("Orphan file inventory failed: %s", exc, exc_info=True)
+        return None
+
+    logger.info(
+        "Orphan file inventory (dry-run): orphan_files=%d missing_files=%d "
+        "scan_errors=%d orphan_samples=%s missing_samples=%s",
+        inventory["orphan_file_count"],
+        inventory["missing_file_count"],
+        inventory["scan_error_count"],
+        inventory["orphan_file_samples"],
+        inventory["missing_file_samples"],
+    )
+    return inventory
 
 
 def _expand_lb_track_artists(lookback_hours: int = 24, max_artists: int = 50) -> None:

@@ -18,7 +18,8 @@ P1 ✓ complete. P2 started. W3a (T12–T18) ✓ complete 2026-08-25 — see §W
 
 ```
 api: POST /admin/validate-invalid-tracks → {checked, updated, marked, errors}
-api: POST /admin/cleanup-invalid-tracks → {deleted}   ! dry_run?=1
+api: POST /admin/cleanup-invalid-tracks?dry_run=true → {deleted:0, dry_run:true, inventory}
+api: POST /admin/cleanup-orphans?dry_run=true → same inventory response   ! report-only
 api: GET  /api/artwork-report           → {tracks_with_cover_art_url, tracks_without_cover_art_url, tracks_without_embedded_art, missing_by_album[], missing_by_artist[]}
 api: POST /api/refresh-artwork          → mode=missing|all, limit=n, dry_run?=1
 ```

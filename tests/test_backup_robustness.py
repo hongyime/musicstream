@@ -132,3 +132,21 @@ def test_monthly_restore_verification_is_scheduled():
     assert call.args[1] == "cron"
     assert call.kwargs["day"] == 1
     assert call.kwargs["hour"] == 6
+
+
+def test_orphan_inventory_job_uses_configured_week_interval(monkeypatch):
+    import src.daemon as daemon
+
+    scheduler = MagicMock()
+    monkeypatch.setattr(daemon, "scheduler", scheduler)
+    monkeypatch.setattr(daemon, "ORPHAN_INVENTORY_INTERVAL_DAYS", 3)
+
+    daemon._register_scheduler_jobs()
+
+    call = next(
+        call for call in scheduler.add_job.call_args_list
+        if call.kwargs.get("id") == "orphan_file_inventory"
+    )
+    assert call.args[0] is tasks.log_orphan_file_inventory
+    assert call.args[1] == "interval"
+    assert call.kwargs["days"] == 3

@@ -63,10 +63,28 @@ async def test_validate_invalid_tracks(api_client: AsyncClient) -> None:
     }
 
 @pytest.mark.integration
-async def test_cleanup_invalid_tracks(api_client: AsyncClient) -> None:
-    resp = await api_client.post("/admin/cleanup-invalid-tracks", headers=get_headers())
+async def test_cleanup_invalid_tracks_is_dry_run_orphan_inventory(
+    api_client: AsyncClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from src.core import tasks
+
+    monkeypatch.setattr(tasks, "MEDIA_DIR", tmp_path)
+    resp = await api_client.post(
+        "/admin/cleanup-invalid-tracks?dry_run=true", headers=get_headers(),
+    )
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
-    assert resp.json() == {"deleted": 0}
+    body = resp.json()
+    assert body["deleted"] == 0
+    assert body["dry_run"] is True
+    assert body["inventory"]["orphan_file_count"] == 0
+    assert body["inventory"]["missing_file_count"] == 0
+
+
+async def test_orphan_cleanup_rejects_non_dry_run(api_client: AsyncClient) -> None:
+    resp = await api_client.post(
+        "/admin/cleanup-orphans?dry_run=false", headers=get_headers(),
+    )
+    assert resp.status_code == 400
 
 @pytest.mark.integration
 async def test_artwork_report(api_client: AsyncClient) -> None:
