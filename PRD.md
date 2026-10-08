@@ -619,17 +619,31 @@ GET  /metrics         → Download success rate, fallback usage, per-tier stats
 ```python
 # Pseudo-schedule (all times SGT)
 JOBS = [
-    ("*/15 * * * *",  spotify_incremental_sync),   # Every 15 min
-    ("0 3 * * *",     full_download_pipeline),      # Daily at 03:00
-    ("0 4 * * *",     listenbrainz_discovery),      # Daily at 04:00
-    ("0 5 * * 0",     full_integrity_check),        # Weekly on Sunday
-    ("0 5 * * 0",     db_backup),                   # Weekly + after every full run
+    ("*/15 * * * *",       spotify_incremental_sync),  # Every 15 min
+    ("0 */6 * * *",        spotify_saved_albums_sync), # Every 6 hours
+    ("0 6 * * 0",          spotify_followed_artists_sync),
+    ("0 2 * * *",          spotify_liked_artists_expand),
+    ("0 */4 * * *",        full_download_pipeline),    # Every 4 hours
+    ("interval: 15 min",   requeue_stale_downloads),
+    ("0 4 * * *",          listenbrainz_discovery),    # Daily at 04:00
+    ("0 5 * * 3,0",        full_integrity_check),      # Wednesday and Sunday
+    ("0 5 * * *",          db_backup),                # Daily + on startup
+    ("0 6 1 * *",          verify_backup_restore),     # First day of each month
+    ("30 5 * * *",         prune_download_attempts),
+    ("interval: 1 hour",   probe_spotify_token),
+    ("0 2 * * 6",          upgrade_pass_scheduled),
+    ("0 6 * * 1",          discover_weekly_task),
+    ("0 7 * * *",          update_ytdlp),
+    ("interval: 1 hour",   tracemalloc_dump),
+    ("interval: 7 days",   log_orphan_file_inventory), # Configurable; read-only
 ]
 ```
 
 The 15-minute Spotify sync is lightweight (snapshot_id comparison only) and designed
-to give near-real-time delivery of new saves. The heavy download pipeline runs daily
-to process anything queued from the previous day's syncs.
+to give near-real-time delivery of new saves. The heavy download pipeline runs every
+four hours to process queued tracks. The orphan inventory interval defaults to seven
+days and is configured with `ORPHAN_INVENTORY_INTERVAL_DAYS`; it only reports counts
+and sample paths and does not delete or quarantine files.
 
 ---
 
@@ -737,14 +751,14 @@ container). This directory is git-ignored.
 
 ```
 ./backups/
-├── musicstream_20260422_030015.sql
-├── musicstream_20260415_030012.sql
-└── ... (14 most recent retained)
+├── musicstream_20261008_050015.sql
+├── musicstream_20261007_050012.sql
+└── ... (files older than 14 days are pruned)
 ```
 
 ### 14.3 Automatic Backup
 
-The daemon creates a `pg_dump` snapshot after every successful full pipeline run:
+The daemon creates a `pg_dump` snapshot in parallel on startup and daily at 05:00 SGT:
 
 ```bash
 pg_dump -U musicstream -h postgres musicstream \
@@ -752,7 +766,7 @@ pg_dump -U musicstream -h postgres musicstream \
   -f /app/backups/musicstream_$(date +%Y%m%d_%H%M%S).sql
 ```
 
-After each backup: prune any snapshots beyond the 14 most recent.
+After each backup, snapshots older than the configured 14-day retention are pruned.
 
 ### 14.4 Manual Backup
 

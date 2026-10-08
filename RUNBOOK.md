@@ -24,7 +24,7 @@ cron jobs and break librespot single-flight (which locks the Spotify account 1�
 
 ### Where state lives
 - **Postgres volume** `postgres_data` — tracks, sources, download_attempts, daemon_runs, lb_recommendations (the source of truth).
-- **`./data`** — librespot credential blob, throttle state. **`./logs`** — `musicstream.log`, `errors.log`. **`./backups`** — `pg_dump` snapshots (14 retained).
+- **`./data`** — librespot credential blob, throttle state. **`./logs`** — `musicstream.log`, `errors.log`. **`./backups`** — `pg_dump` snapshots (14-day retention).
 - **Media drive** (`EXTERNAL_MEDIA_DRIVE` → `/media`) — the FLAC/MP3 files.
 - Credentials: `.env`, `cookies.txt`, `spotify_token.json`, `data/librespot_credentials.json` (all gitignored; entrypoint enforces `0600`).
 
@@ -58,9 +58,9 @@ curl http://localhost:9079/api/musicstream/burn-rate    # downloads/hr + project
 curl http://localhost:9079/api/musicstream/metrics      # per-tier success/fail rates
 curl "http://localhost:9079/api/musicstream/tracks?status=downloading&limit=20"  # active rows
 ```
-> `/health/deep` reports `degraded` (scheduler_running=false) during the initial boot
-> download pipeline — the scheduler only starts at startup step 9, after the boot
-> pipeline. That is expected during boot; tune the run-age window via `DEEP_HEALTH_MAX_RUN_AGE_S`.
+> `/health/deep` can report `degraded` before startup step 3 starts APScheduler.
+> The scheduler starts before the later startup sync and download pipeline; tune
+> the run-age window via `DEEP_HEALTH_MAX_RUN_AGE_S` if startup takes unusually long.
 
 ### Monitoring SQL/API checks
 
@@ -114,6 +114,10 @@ TOKEN=$(grep -E '^DAEMON_API_TOKEN=' .env | cut -d= -f2-)
 curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:9079/api/musicstream/sync
 # also: /integrity, /full-backfill, /saved-albums-sync, /followed-artists-sync,
 #       /liked-artists-expand?batch=N, /tracks/reset-failed
+
+# Read-only media/DB orphan inventory (dry-run only; no deletion or quarantine):
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:9079/admin/cleanup-orphans?dry_run=true"
 ```
 
 ---
@@ -195,7 +199,7 @@ and let boot recovery reset in-flight rows before workers start.
 ## 6. Backups
 
 ```bash
-ls -lt backups/*.sql                                    # newest first; 14 retained, pg_dump'd weekly (Sun) + on boot
+ls -lt backups/*.sql                                    # newest first; 14-day retention, pg_dump'd daily at 05:00 + on boot
 bash scripts/verify_backup_restore.sh                   # restore newest into a scratch DB and verify (run monthly)
 ```
 > The daemon's `pg_dump` is v17 while the server is v16, so dumps carry cosmetic v17
@@ -212,9 +216,19 @@ psql -U musicstream -d musicstream < backups/musicstream_<TS>.sql   # ignore the
 
 ## 7. Scheduled jobs (APScheduler, SGT)
 
-`spotify_sync` */15min · `saved_albums_sync` */6h · `followed_artists_sync` Sun 06:00 ·
-`liked_artists_expand` 02:00 · `download_pipeline` 03:00 · `lb_discovery` 04:00 ·
-`integrity_check` Wed/Sun 05:00 · `db_backup` Sun 05:00. (misfire_grace_time=3600.)
+`spotify_sync` every 15min · `saved_albums_sync` every 6h · `followed_artists_sync` Sun 06:00 ·
+`liked_artists_expand` daily 02:00 · `download_pipeline` every 4h (00:00, 04:00, 08:00,
+12:00, 16:00, 20:00) · `stale_download_requeue` every 15min · `lb_discovery` daily 04:00 ·
+`integrity_check` Wed/Sun 05:00 · `db_backup` daily 05:00 · `backup_restore_verify` monthly on
+day 1 at 06:00 · `download_attempt_prune` daily 05:30 · `token_probe` hourly · `upgrade_pass`
+Sat 02:00 · `discover_weekly` Mon 06:00 · `ytdlp_update` daily 07:00 · `tracemalloc_dump` hourly.
+`orphan_file_inventory` runs every `ORPHAN_INVENTORY_INTERVAL_DAYS` days (default 7); set the
+environment variable to another positive number to change the interval. All interval jobs use
+APScheduler intervals from scheduler startup. Cron jobs use Asia/Singapore time. `misfire_grace_time=3600`
+covers delayed jobs while the process is running; the default in-memory store does not replay jobs
+missed while the daemon is stopped.
+The `/admin/cleanup-orphans` endpoint (also available at the legacy
+`/admin/cleanup-invalid-tracks` path) returns the same kind of read-only inventory on demand.
 
 ### Host-scheduled watchdogs
 

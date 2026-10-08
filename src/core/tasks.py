@@ -1059,7 +1059,7 @@ def upgrade_pass(session) -> int:
     return count
 
 def upgrade_pass_scheduled() -> None:
-    """§W3 T20 cron wrapper: requeue + let the nightly pipeline do the work."""
+    """§W3 T20 cron wrapper: requeue for the next scheduled pipeline pass."""
     try:
         from src.db import get_session
         with get_session() as session:

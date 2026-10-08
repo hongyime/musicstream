@@ -13,7 +13,7 @@ New tracks added to Spotify are downloaded and organized on disk within ~15 minu
 - **File integrity checker**: SHA-256 hash verification; missing/corrupt files auto-requeued
 - **Music discovery**: ListenBrainz CF recommendations ingested daily into your library
 - **HTTP control plane**: `/sync`, `/integrity`, `/discover`, `/health`, `/metrics` on port 9079
-- **Automated backups**: `pg_dump` fires in parallel on every daemon startup (non-blocking) plus a daily 5am cron backstop, 14 snapshots retained
+- **Automated backups**: `pg_dump` fires in parallel on every daemon startup (non-blocking) plus a daily 5am cron backstop, with 14-day retention
 
 ## Tech Stack
 | Layer | Technology |
@@ -229,7 +229,7 @@ This prevents YouTube/Spotify API rate limits.
 - **6 workers**: ~30 tracks per run  
 - **8 workers**: ~40 tracks per run
 
-**Full library sync**: 9,636 tracks ÷ 30 = **321 runs** (5-7 days with daily runs)
+**Full library sync**: 9,636 tracks ÷ 30 = **321 runs** (about 54 days at six scheduled runs per day; actual throughput varies)
 
 ---
 

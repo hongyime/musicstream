@@ -387,7 +387,7 @@ async def _background_startup():
         logger.info("Step 4/9: Skipping legacy banner (UI-only now)")
 
         if os.environ.get("SKIP_STARTUP_INTEGRITY", "true").lower() in ("1", "true", "yes", "on"):
-            logger.info("Step 5/9: Integrity check SKIPPED on startup (runs Sun 05:00 via cron). Set SKIP_STARTUP_INTEGRITY=false to re-enable.")
+            logger.info("Step 5/9: Integrity check SKIPPED on startup (runs Wed/Sun 05:00 via cron). Set SKIP_STARTUP_INTEGRITY=false to re-enable.")
         else:
             logger.info("Step 5/9: Running integrity check…")
             await asyncio.to_thread(tasks.integrity_check)
@@ -402,10 +402,10 @@ async def _background_startup():
         # a long download_pipeline() (can be hours when there's a backlog) must
         # not gate the backup. Previously backup ran sequentially AFTER download
         # pipeline finished — if the daemon restarted before that (Docker/host
-        # instability, redeploys) the startup backup never fired, and the lone
-        # weekly cron backstop left up to 7 days of exposure if a restart also
-        # happened to straddle that window. pg_dump reads an MVCC snapshot, so
-        # running it concurrently with active downloads writing rows is safe.
+        # instability, redeploys) the startup backup never fired. The daily
+        # 05:00 cron backstop now limits exposure to under a day. pg_dump reads
+        # an MVCC snapshot, so running it concurrently with active downloads
+        # writing rows is safe.
         _backup_task = asyncio.create_task(asyncio.to_thread(tasks.db_backup))
         _background_tasks.add(_backup_task)
         _backup_task.add_done_callback(_background_tasks.discard)
@@ -844,21 +844,16 @@ def _tracemalloc_dump() -> None:
 
 
 def _register_scheduler_jobs():
-    # misfire_grace_time=3600 — if the daemon was down at the scheduled
-    # tick (e.g. we recreated the container past 04:00 SGT), APScheduler
-    # will still fire the job on next startup as long as we're within an
-    # hour of the scheduled time.  Without this, missed ticks are silently
-    # dropped — that's why lb_discovery hadn't run for 7 days.
+    # The default in-memory job store does not replay ticks missed while the
+    # process is stopped. misfire_grace_time=3600 only covers delayed execution
+    # while this scheduler process is still alive.
     GRACE = 3600
     scheduler.add_job(tasks.spotify_incremental_sync, "cron", minute="*/15", id="spotify_sync", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.spotify_saved_albums_sync, "cron", hour="*/6", id="saved_albums_sync", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.spotify_followed_artists_sync, "cron", day_of_week="sun", hour=6, id="followed_artists_sync", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.spotify_liked_artists_expand, "cron", hour=2, id="liked_artists_expand", replace_existing=True, misfire_grace_time=GRACE)  # LIKED_ARTISTS_EXPAND_V1
-    # 2026-09-18: pipeline runs 4x/day (03:00, 07:00, 11:00, 15:00, 19:00, 23:00 SGT)
-    # instead of once daily.  DB shows only ~60 attempts/24h with the daily
-    # schedule because Phase 1 (librespot serial + 10s pace) burns most of the
-    # cycle rate-limited.  With LIBRESPOT_SWEEP_CONCURRENT=true + shorter
-    # librespot budget, 4-hourly runs let the yt-dlp batch process real volume.
+    # Runs every 4 hours (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 SGT),
+    # allowing the yt-dlp batch to process volume between librespot sweeps.
     scheduler.add_job(tasks.full_download_pipeline, "cron", hour="*/4", id="download_pipeline", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.requeue_stale_downloads, "interval", minutes=15, id="stale_download_requeue", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.listenbrainz_discovery, "cron", hour=4, id="lb_discovery", replace_existing=True, misfire_grace_time=GRACE)
@@ -872,8 +867,7 @@ def _register_scheduler_jobs():
     scheduler.add_job(tasks.prune_download_attempts, "cron", hour=5, minute=30, id="download_attempt_prune", replace_existing=True, misfire_grace_time=GRACE)
     # §W3 T18/V13: hourly token early-warning probe.
     scheduler.add_job(tasks.probe_spotify_token, "interval", hours=1, id="token_probe", replace_existing=True, misfire_grace_time=GRACE)
-    # §W3 T20: weekly quality-upgrade requeue (before the 03:00 daily pipeline
-    # so requeued tracks download the same night).
+    # §W3 T20: weekly quality-upgrade requeue before the next 4-hourly pipeline pass.
     scheduler.add_job(tasks.upgrade_pass_scheduled, "cron", day_of_week="sat", hour=2, id="upgrade_pass", replace_existing=True, misfire_grace_time=GRACE)
     # §W3 T23: troi generates weekly playlists on Mondays.
     scheduler.add_job(tasks.discover_weekly_task, "cron", day_of_week="mon", hour=6, id="discover_weekly", replace_existing=True, misfire_grace_time=GRACE)
