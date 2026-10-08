@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -65,6 +66,39 @@ async def test_manual_spotify_sync_returns_job_without_waiting(daemon_module, mo
     assert response.data["status_url"] == f"/api/musicstream/jobs/{job_id}"
     await asyncio.wait_for(record["task"], timeout=2)
     assert ran == [True]
+
+
+@pytest.mark.asyncio
+async def test_lb_discovery_self_heal_loop_calls_check_hourly(daemon_module, monkeypatch):
+    checks = []
+
+    async def sleep_then_cancel(seconds):
+        assert seconds == 3600
+        if checks:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(daemon_module.asyncio, "sleep", sleep_then_cancel)
+    monkeypatch.setattr(
+        daemon_module,
+        "_self_heal_lb_discovery_if_overdue",
+        lambda: checks.append("checked"),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await daemon_module._lb_discovery_self_heal_loop()
+
+    assert checks == ["checked"]
+
+
+@pytest.mark.asyncio
+async def test_lb_discovery_self_heal_dispatches_overdue_run(daemon_module, monkeypatch):
+    dispatched = Event()
+    monkeypatch.setattr(daemon_module, "_lb_discovery_overdue", lambda: True)
+    monkeypatch.setattr(daemon_module.tasks, "listenbrainz_discovery", dispatched.set)
+
+    daemon_module._self_heal_lb_discovery_if_overdue()
+
+    assert await asyncio.to_thread(dispatched.wait, 2)
 
 
 def test_write_health_snapshot_creates_timeline_and_latest(daemon_module, tmp_path, monkeypatch):

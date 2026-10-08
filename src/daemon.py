@@ -374,6 +374,10 @@ async def _background_startup():
         _background_tasks.add(_snapshot_task)
         _snapshot_task.add_done_callback(_background_tasks.discard)
 
+        _lb_heal_task = asyncio.create_task(_lb_discovery_self_heal_loop())
+        _background_tasks.add(_lb_heal_task)
+        _lb_heal_task.add_done_callback(_background_tasks.discard)
+
         logger.info("Scheduler running; startup maintenance continues in background.")
 
         # Wait for internet before doing anything that might require it (sync, backfill, discovery).
@@ -901,17 +905,28 @@ def _lb_discovery_overdue() -> bool:
 
 def _self_heal_lb_discovery_if_overdue():
     """
-    Defensive backfill: if the daemon has been restarted enough times that
-    APScheduler missed the daily 04:00 lb_discovery tick AND misfire_grace_time
-    didn't catch it (e.g. the daemon was down for >1h past the scheduled tick),
-    fire the discovery job once on startup so we don't silently fall behind.
-    Runs on a thread so daemon startup isn't blocked by MusicBrainz's 1 req/s.
+    Defensive backfill for a missed daily 04:00 lb_discovery run.
+
+    The in-memory scheduler cannot replay ticks missed while the process was
+    stopped. The hourly watchdog calls this in the asyncio main loop; discovery
+    itself runs on a worker thread so MusicBrainz's 1 req/s does not block it.
     """
     if not _lb_discovery_overdue():
         logger.info("LB discovery up-to-date; no self-heal needed.")
         return
     logger.warning("LB discovery overdue (>24h since last fetched_at); self-healing in background.")
     asyncio.get_running_loop().run_in_executor(None, tasks.listenbrainz_discovery)
+
+
+async def _lb_discovery_self_heal_loop() -> None:
+    """Check hourly for a missed LB discovery run and launch its backfill."""
+    logger.info("ListenBrainz discovery self-heal watchdog started (hourly checks).")
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            _self_heal_lb_discovery_if_overdue()
+        except Exception as exc:
+            logger.warning("LB discovery self-heal check failed: %s", exc, exc_info=True)
 
 # ── API Routes ────────────────────────────────────────────────────────────────
 
