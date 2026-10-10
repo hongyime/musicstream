@@ -1,0 +1,33 @@
+musicstream-daemon 0.0.0.0:9079->9079/tcp, [::]:9079->9079/tcp
+musicstream-postgres 127.0.0.1:5432->5432/tcp
+unifiedanalyzer_scheduler 8002/tcp
+unifiedcollector_collector_website 
+unifiedcollector_collector_lowrisk 
+unifiedcollector_collector_youtube 
+unifiedcollector_collector_telegram 
+unifiedcollector_scheduler 
+unifiedcollector_dashboard 0.0.0.0:8700->8700/tcp, [::]:8700->8700/tcp, 0.0.0.0:8001->8700/tcp, [::]:8001->8700/tcp
+unifiedcollector_ig_ingest 0.0.0.0:8765->8765/tcp, [::]:8765->8765/tcp
+unifiedanalyzer_analyzer 0.0.0.0:8002->8002/tcp, [::]:8002->8002/tcp
+unifiedcollector_spiderfoot 
+unifiedanalyzer_stream_alert_worker 8002/tcp
+unifiedcollector_collector_instagram 
+unifiedcollector_collector 
+unifiedcollector_realtime_feed 
+unifiedcollector_collector_beeper 
+unifiedcollector_collector_whatsapp 
+unifiedcollector_backup 5432/tcp
+unifiedcollector_collector_lemon8 
+unifiedcollector_wa_bridge_1 0.0.0.0:3011->3001/tcp, [::]:3011->3001/tcp
+unifiedcollector_wa_bridge_2 0.0.0.0:3012->3001/tcp, [::]:3012->3001/tcp
+unifiedcollector_collector_tiktok 
+unifiedcollector_watchdog 
+unifiedcollector_browser_cookie_vault 0.0.0.0:8790->8790/tcp, [::]:8790->8790/tcp
+unifiedcollector_onboard_bot 
+unifiedanalyzer_face_worker 8002/tcp
+unifiedcollector_collector_instagram_dm 
+pihole 0.0.0.0:53->53/tcp, [::]:53->53/tcp, 0.0.0.0:80->80/tcp, 0.0.0.0:53->53/udp, [::]:80->80/tcp, [::]:53->53/udp
+unifiedcollector_rabbitmq 4369/tcp, 5671-5672/tcp, 15691-15692/tcp, 25672/tcp
+unifiedcollector_redis 6379/tcp
+unifiedcollector_postgres 0.0.0.0:5500->5432/tcp, [::]:5500->5432/tcp
+nebula-sync 
