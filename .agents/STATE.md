@@ -1,12 +1,33 @@
 # STATE
+## Current task - Compose health checks (2026-10-08)
+- Working on `feature/compose-healthchecks` from `main` at `8c94504`. The Compose audit found three services: PostgreSQL (`pg_isready`), daemon (HTTP `/health`), and the PO-token provider (no check). Added a Node HTTP `/ping` response check to the provider; `docker compose config` passes.
+- Commit `29aab0f` contains only `docker-compose.yml`; it was fast-forward merged and pushed to `origin/main`. Local `main`, feature branch, and remote `main` are at `29aab0ff84df86c05fe1f7361ed3cdbaaed5d013`. Post-deploy: all three services healthy, `/health` and `/health/deep` return 200, scheduler is running, 5 downloads are active, and zero are stale. PostgreSQL and daemon container IDs are unchanged. `docker compose config --quiet` exits 0 with no warnings.
+- Preserve existing uncommitted `.agents` edits, `.agents/handoffs/`, `docker_ports.txt`, and the ignored Compose override; only `docker-compose.yml` is intended for the feature commit.
 
-## Current task — 2026-10-06
-- Rebuilt `musicstream-daemon` from the current Dockerfile and recreated it. Production image reports `yt-dlp 2026.08.19` and excludes pytest; frontend build completed.
-- Musicstream containers use CPUs `0-7`; daemon memory cap is 2 GiB and PostgreSQL 1 GiB. Existing WSL settings expose all 8 CPUs and enough memory for these caps.
-- Database volume `musicstream_postgres_data` remains mounted. It is the only volume labeled for this Compose project; no unused Musicstream volume was found. Unrelated detached Docker volumes were left untouched.
-- Live verification on 2026-10-06: daemon and PostgreSQL healthy; `/health/deep` reports `status=ok`, database and scheduler healthy, downloads enabled, 4 downloading, zero stale, and 6,422 successes/24h. New MP3 output was verified on the configured host media drive; stored Spotify authentication works without interactive login.
-- Docker Desktop has `AutoStart=true` and a Windows logon Run entry; Compose containers use `restart: unless-stopped`. The self-heal loop is currently running and checking every 5 minutes, but no persistent `SelfHeal` scheduled task or Startup-folder launcher is installed, so that watchdog itself is not guaranteed to relaunch after sign-out/reboot.
-- Runtime/resource changes and handoff were pushed to `origin/main` as `b66c19e`; untracked `docker_ports.txt` and the gitignored local Compose override were preserved.
+## Current task - small fixes bundle (2026-10-08)
+- Created `feature/small-fixes` from `main` at `d29e498` and completed the requested fixes. Preserved the pre-existing handoff edits, `docker_ports.txt`, and ignored Compose override.
+- Implemented hourly ListenBrainz self-heal checks, corrected scheduler schedule descriptions, and added read-only orphan inventory on the admin endpoint plus a configurable weekly logging job. Full suite: 409 passed, 1 skipped, 9 subtests passed. Commits: `4dc0924`, `7653949`, `8c94504`. Deployed with the requested `docker compose up -d`; it left the bind-mounted daemon running, so `docker compose up -d --force-recreate daemon` was used to load the changed code. Post-deploy: daemon and PostgreSQL healthy, `/health` and `/health/deep` ok, scheduler running, 4 downloads active, 187 successes/hour, limiter enforcing; OpenAPI lists both orphan cleanup paths; PostgreSQL container ID/start time unchanged. Fast-forward merged to `main` and pushed `origin/main`; local and remote `main` both point to `8c94504d291cbc9c5f860b25eedc21dec5ab726c`.
+
+## Current task - robustness batch (2026-10-08)
+- Working on feature/robustness-batch from main at 7e1c5a2. Items 2-9 are implemented and committed through d29e498.
+- Full suite: 403 passed, 1 skipped, 9 subtests passed. Deployed: /health and /health/deep ok, scheduler running, 6 downloading, 213 successes/hour, limiter enforcing, daemon 1.032 GiB/2 GiB. PO-token generation via the sidecar and metadata extraction succeeded. PostgreSQL container ID/start time are unchanged. Fast-forward merge and origin/main push completed at d29e498. The supplied request describes items 2-9 only; item 10 was not specified.
+
+
+## Implementation progress — 2026-10-07
+- Deployed commit `617dd41` on `feature/adaptive-provider-limiter`; full suite: 382 passed, 1 skipped. The one approved daemon restart completed; health is ok, scheduler running, 7 downloads active, 377 MiB / 2 GiB, limiter remains disabled in shadow mode. Postgres was not restarted.
+
+## Current task — adaptive provider limiter (2026-10-07)
+- Working on `feature/adaptive-provider-limiter`, created from `main` at `2d53e50`.
+- Live pre-change baseline: daemon healthy on port 9079 (about 3 hours uptime), Postgres healthy (about 47 hours); `/health/deep` is `ok`, scheduler running, 4 downloads active, 122 successes in the last hour.
+- Implementing a process-wide rolling provider limiter in shadow mode by default. Only YouTube enforcement will be wired in this pass; deployment is approved as one daemon-only restart after commit and full tests.
+
+## Runtime verification — 2026-10-07 (prior handoff)
+- Verified at 06:22 SGT: daemon and PostgreSQL healthy; `/health/deep` is `ok`, downloads enabled, 4 active, zero stale; last success 15 seconds ago.
+- Database progress: 535,368 total; 152,674 downloaded (28.52%); 382,635 pending; 55 failed. Success rate was 48 in the last hour and 3,365 in the last 24 hours; ETA at the rolling 24-hour average is about 114 days and will vary.
+- Confirmed the five newest downloaded database paths exist as MP3 files under `Y:\music`; the daemon's `/media` bind mount points to that drive.
+- Docker Desktop `AutoStart=true` and Compose containers use `restart: unless-stopped`. Task Scheduler registration returned Access Denied, so installed both source-matching Musicstream startup wrappers in the current user's Startup folder as the supported fallback.
+- Verified stored Spotify refresh credentials by running the application's refresh probe: silent refresh succeeded, health is clean, and no Spotify login is needed now. YouTube cookie file is mounted with unexpired cookies, but some YouTube requests still hit Google's bot challenge; other provider tiers continue succeeding.
+- Preserve untracked `docker_ports.txt` and the gitignored local Compose override. Runtime/resource commits already pushed to `origin/main` before this verification.
 
 ## 2026-09-22 — restore outage and resolve health timeouts (completed 2026-09-23)
 - User requested resolution of remaining operational failures; all work is text-only (no images or screenshots sent to models/agents).
@@ -89,12 +110,12 @@
 <!-- MOLT_AUTO_START -->
 ## Auto State
 
-- Updated: 2026-10-06 06:36:59 +08:00
+- Updated: 2026-10-08 12:33:58 +08:00
 - Machine: PRAWN-L390
 - Harness: codex
 - Event: session-start
 - Branch: main
-- HEAD: a7d4e5b
+- HEAD: 8c94504
 - Dirty files: 2
 - Resume hint: Read .agents/STATE.md, then the latest file in .agents/handoffs/ if present.
 <!-- MOLT_AUTO_END -->
