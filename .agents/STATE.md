@@ -1,4 +1,10 @@
 # STATE
+## Current task - tune YouTube limiter concurrency (2026-10-11)
+- User requested testing higher throughput. Tuned local `.env` with `PROVIDER_LIMITER_YOUTUBE_MAX_INFLIGHT=3` (up from 2) to test increased YouTube download throughput while keeping other limits intact.
+- Recreated daemon container (`docker compose up -d --force-recreate daemon`). Preserved `postgres` and `yt-pot-provider` containers without restart.
+- Post-deploy verification: daemon healthy, `/health` and `/health/deep` return 200 OK with `max_inflight: 3` active on YouTube provider, scheduler running, and downloads actively processing.
+- Database progress: 669,073 total tracks; 160,468 downloaded (23.98%); 508,529 pending; 57 failed; active downloads in progress. Storage verified at `/media/ultra-touch/music`.
+
 ## Current task - Compose health checks (2026-10-08)
 - Working on `feature/compose-healthchecks` from `main` at `8c94504`. The Compose audit found three services: PostgreSQL (`pg_isready`), daemon (HTTP `/health`), and the PO-token provider (no check). Added a Node HTTP `/ping` response check to the provider; `docker compose config` passes.
 - Commit `29aab0f` contains only `docker-compose.yml`; it was fast-forward merged and pushed to `origin/main`. Local `main`, feature branch, and remote `main` are at `29aab0ff84df86c05fe1f7361ed3cdbaaed5d013`. Post-deploy: all three services healthy, `/health` and `/health/deep` return 200, scheduler is running, 5 downloads are active, and zero are stale. PostgreSQL and daemon container IDs are unchanged. `docker compose config --quiet` exits 0 with no warnings.
