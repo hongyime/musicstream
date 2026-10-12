@@ -205,6 +205,25 @@ def _yt_dlp_extractor_args() -> dict[str, dict[str, list[str]]]:
     return args
 
 
+class _YoutubeCookieWarningLogger:
+    """Capture yt-dlp's signal that a YouTube cookie snapshot was rotated."""
+
+    _INVALID_COOKIE_WARNING = "the provided youtube account cookies are no longer valid"
+
+    def __init__(self) -> None:
+        self.invalid_youtube_cookies = False
+
+    def warning(self, message: object, *_args, **_kwargs) -> None:
+        if self._INVALID_COOKIE_WARNING in str(message).casefold():
+            self.invalid_youtube_cookies = True
+
+    def debug(self, *_args, **_kwargs) -> None:
+        pass
+
+    def error(self, *_args, **_kwargs) -> None:
+        pass
+
+
 def _content_failure_threshold() -> int:
     try:
         return max(1, int(os.environ.get("CONTENT_FAILURE_PASSES", str(_DEFAULT_CONTENT_FAILURE_PASSES))))
@@ -351,6 +370,8 @@ class DownloadOrchestrator:
         # yt-dlp cookie-jar updates cannot race through a shared file.
         self._tmp_cookie_files: set[str] = set()
         self._cookie_snapshot_lock = threading.Lock()
+        self._cookie_snapshot_sources: dict[str, tuple[str, int, int, int, int]] = {}
+        self._stale_cookie_sources: dict[str, tuple[str, int, int, int, int]] = {}
 
         # Lazy-init tagger and organiser from env vars.
         # Imported here to avoid circular imports at module level.
@@ -1450,8 +1471,9 @@ class DownloadOrchestrator:
             url = f"https://www.youtube.com/watch?v={video_id}"
 
             try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
+                info = self._run_ytdlp_with_cookie_fallback(
+                    ydl_opts, lambda ydl: ydl.extract_info(url, download=True),
+                )
 
                 downloaded = self._find_output_file(out_stem)
                 if not downloaded or not os.path.exists(downloaded):
@@ -1904,8 +1926,9 @@ class DownloadOrchestrator:
             }
             cookie_snapshot = self._attach_cookie_snapshot(flat_opts)
             try:
-                with yt_dlp.YoutubeDL(flat_opts) as ydl:
-                    flat = ydl.extract_info(query, download=False)
+                flat = self._run_ytdlp_with_cookie_fallback(
+                    flat_opts, lambda ydl: ydl.extract_info(query, download=False),
+                )
             except Exception as exc:
                 bot_challenge = is_youtube_bot_challenge(exc)
                 if self._is_youtube_session_rate_limited(exc):
@@ -1997,8 +2020,9 @@ class DownloadOrchestrator:
             ydl_opts = self._build_mp3_opts(out_stem)
             cookie_snapshot = ydl_opts.get("cookiefile")
             try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
+                self._run_ytdlp_with_cookie_fallback(
+                    ydl_opts, lambda ydl: ydl.download([url]),
+                )
             except Exception as exc:
                 reason = te.CONTENT_MISS if self._is_content_error(exc) else classify_provider_failure(exc)
                 bot_challenge = is_youtube_bot_challenge(exc)
@@ -2082,8 +2106,9 @@ class DownloadOrchestrator:
         }
         cookie_snapshot = self._attach_cookie_snapshot(search_opts)
         try:
-            with yt_dlp.YoutubeDL(search_opts) as ydl:
-                flat = ydl.extract_info(query, download=False)
+            flat = self._run_ytdlp_with_cookie_fallback(
+                search_opts, lambda ydl: ydl.extract_info(query, download=False),
+            )
         except Exception as exc:
             reason = te.CONTENT_MISS if self._is_content_error(exc) else classify_provider_failure(exc)
             self._provider_limiter_instance().complete(
@@ -2123,8 +2148,9 @@ class DownloadOrchestrator:
             ydl_opts = self._build_mp3_opts(out_stem)
             download_cookie_snapshot = ydl_opts.get("cookiefile")
             try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    result = ydl.extract_info(url, download=True)
+                result = self._run_ytdlp_with_cookie_fallback(
+                    ydl_opts, lambda ydl: ydl.extract_info(url, download=True),
+                )
                 duration = (result or {}).get("duration")
                 if track.duration_ms is not None:
                     if duration is None or abs(float(duration) - track.duration_ms / 1000.0) > _DURATION_TOLERANCE_S:
@@ -2298,6 +2324,72 @@ class DownloadOrchestrator:
         self._attach_cookie_snapshot(opts)
         return opts
 
+    def _run_ytdlp_with_cookie_fallback(self, opts: dict, operation):
+        """Run yt-dlp and retry anonymously if YouTube rejects its cookie snapshot."""
+        cookie_snapshot = opts.get("cookiefile")
+        warning_logger = _YoutubeCookieWarningLogger() if cookie_snapshot else None
+        invocation_opts = dict(opts)
+        if warning_logger:
+            # yt-dlp forwards report_warning to logger even with no_warnings
+            # enabled; the adapter captures this one warning and drops others.
+            invocation_opts["logger"] = warning_logger
+
+        def invoke(options: dict):
+            with yt_dlp.YoutubeDL(options) as ydl:
+                return operation(ydl)
+
+        first_error = None
+        try:
+            result = invoke(invocation_opts)
+        except Exception as exc:
+            if not warning_logger or not warning_logger.invalid_youtube_cookies:
+                raise
+            first_error = exc
+
+        if warning_logger and warning_logger.invalid_youtube_cookies:
+            self._mark_cookie_snapshot_invalid(cookie_snapshot)
+            if first_error is not None or result is None:
+                logger.warning(
+                    "yt-dlp reports the YouTube account cookies are no longer valid; "
+                    "retrying this request without cookies. The source cookies.txt was left unchanged."
+                )
+                anonymous_opts = dict(opts)
+                anonymous_opts.pop("cookiefile", None)
+                return invoke(anonymous_opts)
+            logger.warning(
+                "yt-dlp reports the YouTube account cookies are no longer valid; "
+                "omitting the unchanged source cookies.txt on later requests."
+            )
+
+        return result
+
+    @staticmethod
+    def _cookie_source_signature(path: str, stat_result: os.stat_result) -> tuple[str, int, int, int, int]:
+        return (
+            os.path.abspath(path),
+            stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+            stat_result.st_size,
+            stat_result.st_ino,
+        )
+
+    def _mark_cookie_snapshot_invalid(self, snapshot_path: Optional[str]) -> None:
+        if not snapshot_path:
+            return
+        lock = getattr(self, "_cookie_snapshot_lock", None)
+        if lock is None:
+            lock = self._cookie_snapshot_lock = threading.Lock()
+        snapshot_sources = getattr(self, "_cookie_snapshot_sources", None)
+        if snapshot_sources is None:
+            snapshot_sources = self._cookie_snapshot_sources = {}
+        stale_sources = getattr(self, "_stale_cookie_sources", None)
+        if stale_sources is None:
+            stale_sources = self._stale_cookie_sources = {}
+        with lock:
+            signature = snapshot_sources.get(snapshot_path)
+            if signature:
+                stale_sources[signature[0]] = signature
+
     def _find_output_file(self, out_stem: str) -> Optional[str]:
         """Find the downloaded file matching the stem (any audio extension)."""
         for ext in ("mp3", "m4a", "opus", "webm", "flac", "ogg"):
@@ -2313,7 +2405,9 @@ class DownloadOrchestrator:
         replaces or edits cookies.txt during the copy, retry against the new
         mtime/size instead of handing yt-dlp a potentially torn jar. A fresh
         copy per call also prevents concurrent yt-dlp writers from sharing a
-        cookie jar. Missing or unreadable cookies degrade to anonymous access.
+        cookie jar. If yt-dlp reports rotated YouTube auth cookies, failed
+        requests retry anonymously and the unchanged source jar is skipped on
+        later calls. Missing or unreadable cookies degrade to anonymous access.
         """
         lock = getattr(self, "_cookie_snapshot_lock", None)
         if lock is None:  # Keep __new__-constructed test instances supported.
@@ -2321,6 +2415,12 @@ class DownloadOrchestrator:
         files = getattr(self, "_tmp_cookie_files", None)
         if files is None:
             files = self._tmp_cookie_files = set()
+        snapshot_sources = getattr(self, "_cookie_snapshot_sources", None)
+        if snapshot_sources is None:
+            snapshot_sources = self._cookie_snapshot_sources = {}
+        stale_sources = getattr(self, "_stale_cookie_sources", None)
+        if stale_sources is None:
+            stale_sources = self._stale_cookie_sources = {}
 
         with lock:
             for _ in range(2):
@@ -2329,14 +2429,23 @@ class DownloadOrchestrator:
                     before = os.stat(cookies_src)
                     if before.st_size <= 0:
                         return None
+                    source_signature = self._cookie_source_signature(cookies_src, before)
+                    stale_signature = stale_sources.get(source_signature[0])
+                    if stale_signature == source_signature:
+                        logger.info(
+                            "Omitting cookies.txt for yt-dlp because YouTube reported that its account cookies are invalid"
+                        )
+                        return None
+                    if stale_signature is not None:
+                        stale_sources.pop(source_signature[0], None)
                     os.makedirs(TEMP_DIR, exist_ok=True)
                     tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False, dir=TEMP_DIR)
                     tmp_path = tmp.name
                     tmp.close()
                     shutil.copyfile(cookies_src, tmp_path)
                     after = os.stat(cookies_src)
-                    before_signature = (before.st_mtime_ns, before.st_ctime_ns, before.st_size, before.st_ino)
-                    after_signature = (after.st_mtime_ns, after.st_ctime_ns, after.st_size, after.st_ino)
+                    before_signature = source_signature
+                    after_signature = self._cookie_source_signature(cookies_src, after)
                     if before_signature != after_signature:
                         os.unlink(tmp_path)
                         continue
@@ -2345,6 +2454,7 @@ class DownloadOrchestrator:
                     except OSError:
                         pass
                     files.add(tmp_path)
+                    snapshot_sources[tmp_path] = source_signature
                     opts["cookiefile"] = tmp_path
                     return tmp_path
                 except OSError as exc:
@@ -2365,6 +2475,7 @@ class DownloadOrchestrator:
         lock = getattr(self, "_cookie_snapshot_lock", None)
         if lock is None:
             lock = self._cookie_snapshot_lock = threading.Lock()
+        snapshot_sources = getattr(self, "_cookie_snapshot_sources", {})
         with lock:
             try:
                 os.unlink(path)
@@ -2374,12 +2485,14 @@ class DownloadOrchestrator:
                 logger.debug("Could not remove private cookie snapshot %r: %s", path, exc)
             finally:
                 files.discard(path)
+                snapshot_sources.pop(path, None)
 
     def cleanup_temp_cookies(self) -> None:
         """Remove any tracked temp cookie copies. Safe to call repeatedly."""
         lock = getattr(self, "_cookie_snapshot_lock", None)
         if lock is None:
             lock = self._cookie_snapshot_lock = threading.Lock()
+        snapshot_sources = getattr(self, "_cookie_snapshot_sources", {})
         with lock:
             for path in list(getattr(self, "_tmp_cookie_files", set())):
                 try:
@@ -2390,6 +2503,7 @@ class DownloadOrchestrator:
                     logger.debug("Could not remove temp cookies %r: %s", path, exc)
                 finally:
                     self._tmp_cookie_files.discard(path)
+                    snapshot_sources.pop(path, None)
 
     def __del__(self) -> None:
         # Best-effort cleanup at GC time. __del__ is unreliable so we don't

@@ -604,7 +604,7 @@ class TestBug1YouTubeFormatSelectorExploration:
 # They should PASS on UNFIXED code to establish baseline behavior to preserve.
 
 try:
-    from hypothesis import given, strategies as st, settings, HealthCheck
+    from hypothesis import given, strategies as st, settings
     HYPOTHESIS_AVAILABLE = True
 except ImportError:
     HYPOTHESIS_AVAILABLE = False
@@ -861,6 +861,64 @@ class TestProperty2PreservationYouTubeDownloads:
         orch.cleanup_temp_cookies()
         assert all(not Path(path).exists() for path in snapshots + [replacement])
         assert source.read_text(encoding="utf-8") == "replacement-cookie-jar"
+
+    def test_invalid_cookie_warning_retries_without_cookie_snapshot(self, tmp_path, monkeypatch):
+        from src.ingestion import downloader as downloader_module
+
+        monkeypatch.setattr(downloader_module, "TEMP_DIR", str(tmp_path / "snapshots"))
+        cookie_source = tmp_path / "cookies.txt"
+        cookie_contents = b"# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tLOGIN_INFO\tredacted\n"
+        cookie_source.write_bytes(cookie_contents)
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+        options = {}
+        snapshot = orch._attach_cookie_snapshot(options, str(cookie_source))
+        assert snapshot is not None
+
+        invocations = []
+
+        class FakeYoutubeDL:
+            def __init__(self, ydl_options):
+                self.options = dict(ydl_options)
+                invocations.append(self.options)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def extract_info(self, *_args, **_kwargs):
+                if self.options.get("cookiefile"):
+                    self.options["logger"].warning(
+                        "The provided YouTube account cookies are no longer valid. "
+                        "They have likely been rotated in the browser as a security measure."
+                    )
+                    raise RuntimeError("YouTube bot challenge")
+                return {"id": "anonymous-retry"}
+
+        monkeypatch.setattr(downloader_module.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+        result = orch._run_ytdlp_with_cookie_fallback(
+            options, lambda ydl: ydl.extract_info("https://www.youtube.com/watch?v=test")
+        )
+
+        assert result == {"id": "anonymous-retry"}
+        assert len(invocations) == 2
+        assert "cookiefile" in invocations[0]
+        assert "cookiefile" not in invocations[1]
+        assert options["cookiefile"] == snapshot
+
+        next_options = {}
+        assert orch._attach_cookie_snapshot(next_options, str(cookie_source)) is None
+        assert "cookiefile" not in next_options
+        assert cookie_source.read_bytes() == cookie_contents
+        orch._release_cookie_snapshot(snapshot)
+
+        cookie_source.write_bytes(cookie_contents + b"# refreshed\n")
+        refreshed_options = {}
+        refreshed_snapshot = orch._attach_cookie_snapshot(refreshed_options, str(cookie_source))
+        assert refreshed_snapshot is not None
+        assert refreshed_options["cookiefile"] == refreshed_snapshot
+        orch._release_cookie_snapshot(refreshed_snapshot)
     
     @given(stem=st.sampled_from(["/tmp/test", "/tmp/video", "/tmp/audio123"]))
     @settings(max_examples=10)
