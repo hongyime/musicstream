@@ -1216,3 +1216,10 @@ class TestLibrespotKillSuppression:
         orch.download_track(track, session, tiers_override=[("tier0_librespot", fake_tier)])
         attempt = session.query(DownloadAttempt).filter_by(track_id=track.id).one()
         assert attempt.error == tier_errors.REGION_UNAVAIL
+
+
+class TestYtDlpRemoteComponents:
+    def test_remote_ejs_component_is_enabled(self):
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+        opts = orch._build_mp3_opts("/tmp/stem")
+        assert opts["remote_components"] == ["ejs:github"]

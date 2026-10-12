@@ -2318,6 +2318,7 @@ class DownloadOrchestrator:
             # The Python API requires an ImpersonateTarget; the CLI parses the
             # equivalent string before passing it to YoutubeDL.
             "impersonate": ImpersonateTarget.from_str("chrome"),
+            "remote_components": ["ejs:github"],
             "extractor_args": _yt_dlp_extractor_args(),
         }
 
