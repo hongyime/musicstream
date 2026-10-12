@@ -194,7 +194,9 @@ _DEFAULT_TRANSIENT_RETRY_MAX_MINUTES = 1440
 def _yt_dlp_extractor_args() -> dict[str, dict[str, list[str]]]:
     """Shared YouTube extractor configuration, including the optional PO-token service."""
     args: dict[str, dict[str, list[str] | str]] = {
-        "youtube": {"player_client": ["android", "web"]},
+        # bgutil-ytdlp-pot-provider 2.x only supports WEBPO_CLIENTS; keep
+        # YouTube player requests on clients for which it can mint PO tokens.
+        "youtube": {"player_client": ["web", "mweb"]},
     }
     provider_url = os.environ.get("YTDLP_POT_PROVIDER_URL", "").strip()
     if provider_url:

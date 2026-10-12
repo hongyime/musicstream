@@ -11,7 +11,6 @@ Covers:
 """
 from __future__ import annotations
 
-import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -28,7 +27,11 @@ for _mod in ("yt_dlp", "spotipy", "spotipy.oauth2", "ytmusicapi", "spotdl"):
     sys.modules.setdefault(_mod, MagicMock())
 
 from src.models import Base, DownloadAttempt, Track, TrackStatus  # noqa: E402
-from src.ingestion.downloader import DownloadOrchestrator, _DEFAULT_CONTENT_FAILURE_PASSES, TEMP_DIR  # noqa: E402
+from src.ingestion.downloader import (  # noqa: E402
+    DownloadOrchestrator,
+    _DEFAULT_CONTENT_FAILURE_PASSES,
+    _yt_dlp_extractor_args,
+)
 from src.ingestion import tier_errors as te  # noqa: E402
 
 
@@ -97,6 +100,12 @@ class TestConstants:
 
     def test_content_failure_threshold_defaults_to_six_full_passes(self):
         assert _DEFAULT_CONTENT_FAILURE_PASSES == 6
+
+    def test_player_clients_use_bgutil_webpo_clients(self, monkeypatch):
+        monkeypatch.setenv("YTDLP_POT_PROVIDER_URL", "http://pot.test:4416")
+        args = _yt_dlp_extractor_args()
+        assert args["youtube"]["player_client"] == ["web", "mweb"]
+        assert args["youtubepot-bgutilhttp"]["base_url"] == ["http://pot.test:4416"]
 
 
 # ── _should_give_up ───────────────────────────────────────────────────────────
