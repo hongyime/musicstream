@@ -21,9 +21,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from yt_dlp import YoutubeDL
+from yt_dlp.networking.impersonate import ImpersonateTarget
 
-# Mock yt_dlp, spotipy, ytmusicapi, spotdl before importing downloader
-for _mod in ("yt_dlp", "spotipy", "spotipy.oauth2", "ytmusicapi", "spotdl"):
+# Mock optional integrations before importing downloader.
+for _mod in ("spotipy", "spotipy.oauth2", "ytmusicapi", "spotdl"):
     sys.modules.setdefault(_mod, MagicMock())
 
 from src.models import Base, DownloadAttempt, Track, TrackStatus  # noqa: E402
@@ -215,6 +217,13 @@ class TestBuildMp3Opts:
     def test_noplaylist_is_true(self):
         opts = self.orch._build_mp3_opts("/tmp/stem")
         assert opts["noplaylist"] is True
+
+    def test_chrome_impersonation_is_enabled(self):
+        opts = self.orch._build_mp3_opts("/tmp/stem")
+        expected = ImpersonateTarget.from_str("chrome")
+        assert opts["impersonate"] == expected
+        with YoutubeDL({"quiet": True, "impersonate": opts["impersonate"]}):
+            pass
 
     def test_output_template_uses_stem(self):
         opts = self.orch._build_mp3_opts("/tmp/mystem")

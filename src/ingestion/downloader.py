@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import yt_dlp  # type: ignore[import-untyped]
+from yt_dlp.networking.impersonate import ImpersonateTarget
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
@@ -2287,9 +2288,10 @@ class DownloadOrchestrator:
             # Add per-request sleep at the yt-dlp level (on top of our throttle).
             # This slows down info extraction HTTP calls and reduces 429 likelihood.
             "sleep_interval_requests": 1,
-            # Android player client returns pre-signed format URLs that bypass
-            # YouTube's JS nsig decryption challenge — no JS runtime required.
-            # Without this, modern music content returns "format not available".
+            # Use curl_cffi's Chrome TLS fingerprint for YouTube requests.
+            # The Python API requires an ImpersonateTarget; the CLI parses the
+            # equivalent string before passing it to YoutubeDL.
+            "impersonate": ImpersonateTarget.from_str("chrome"),
             "extractor_args": _yt_dlp_extractor_args(),
         }
 
