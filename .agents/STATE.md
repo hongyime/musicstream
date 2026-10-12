@@ -1,4 +1,9 @@
 # STATE
+## Current task - YouTube Palladium hardening (2026-10-12)
+- Implemented the four fixes on `feature/youtube-palladium-hardening`, based on `main` at `f6d9e0e`: `06d8c92` (WEB/MWEB PO-token clients), `4cb6854` (typed Chrome impersonation), `3e89f32` (rotated-cookie anonymous fallback and unchanged-source suppression), and `fcd2260` (remote EJS components). Cookies source file was left unchanged.
+- Verification: 413 passed, 1 skipped, 9 subtests passed; Ruff clean. Rebuilt and recreated only the daemon. Live `/health` and `/health/deep` returned 200; scheduler running; 7 downloads active; limiter enabled in enforce mode; last successful download 64 seconds before probe. Postgres container ID stayed `8c0ca3f28932`.
+- Deployed daemon reports yt-dlp 2026.08.19, curl_cffi 0.15.0, clients `web,mweb`, and healthy status. A no-cookie metadata-only invocation with `fetch_pot=always` logged a retrieved PO token for the WEB client and completed extraction. Ready for fast-forward merge and push.
+
 ## Current task - tune YouTube limiter concurrency (2026-10-11)
 - User requested testing higher throughput. Tuned local `.env` with `PROVIDER_LIMITER_YOUTUBE_MAX_INFLIGHT=3` (up from 2) to test increased YouTube download throughput while keeping other limits intact.
 - Recreated daemon container (`docker compose up -d --force-recreate daemon`). Preserved `postgres` and `yt-pot-provider` containers without restart.
