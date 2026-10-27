@@ -203,6 +203,12 @@ class IntegrityChecker:
                 )
                 # Do NOT mutate file_sha256 — keep original for forensics.
                 track.status = "pending"
+                try:
+                    import os
+                    os.remove(file_path)
+                except OSError as exc:
+                    logger.warning("Could not remove corrupt file for track %d: %s", track.id, exc)
+                track.file_path = None
                 track.last_checked_at = now
                 session.add(track)
                 result.corrupt += 1

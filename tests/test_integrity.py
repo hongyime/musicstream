@@ -107,8 +107,8 @@ class TestIntegrityCheckerRun:
         assert track.file_path is None
         assert track.file_sha256 is None
 
-    def test_corrupt_file_resets_to_pending(self, session):
-        """P9: hash mismatch → status=pending."""
+    def test_corrupt_file_is_deleted_and_requeued(self, session):
+        """P9: hash mismatch cannot leave a stale path or orphan behind."""
         with tempfile.NamedTemporaryFile(delete=False, suffix=".flac") as f:
             f.write(b"original content")
             path = f.name
@@ -125,12 +125,9 @@ class TestIntegrityCheckerRun:
 
             assert result.corrupt >= 1
             assert track.status == TrackStatus.PENDING.value
-            # Corrupt branch intentionally PRESERVES file_path + file_sha256 as
-            # forensic evidence (checker.py: "keep original for forensics"),
-            # unlike the missing-file branch which clears them. The track still
-            # re-enters the queue via status=pending and re-downloads next cycle.
-            assert track.file_path is not None
+            assert track.file_path is None
             assert track.file_sha256 is not None
+            assert not os.path.exists(path)
         finally:
             if os.path.exists(path):
                 os.unlink(path)

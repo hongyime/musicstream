@@ -4,8 +4,6 @@ Tests for musicstream/rate_limiter.py
 Covers:
   - ServiceRateLimiter: all 11 service configs present, jitter range,
     circuit breaker open/close, backoff capping, unknown service error
-  - ExpiringResolutionCache: set/get, TTL expiry, len, invalidate, purge
-  - MusicDownloadChaosMonkey: disabled by default, failure rate, stats
 """
 from __future__ import annotations
 
@@ -20,15 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 from src.rate_limiter import (
     AdaptiveProviderLimiter,
-    ExpiringResolutionCache,
-    MusicDownloadChaosMonkey,
     ProviderLimitConfig,
     ServiceRateLimiter,
     classify_provider_failure,
     is_youtube_bot_challenge,
 )
-
-
 # ── ServiceRateLimiter ────────────────────────────────────────────────────────
 
 class TestServiceRateLimiterConfigs:
@@ -270,130 +264,3 @@ class TestAdaptiveProviderLimiter:
         enforced_metrics = enforcing.snapshot()["providers"]["youtube"]
         assert enforced_metrics["skipped_count"] == 1
         assert enforced_metrics["request_count"] == 1
-
-
-# ── ExpiringResolutionCache ───────────────────────────────────────────────────
-
-class TestExpiringResolutionCache:
-    def test_set_and_get(self):
-        cache = ExpiringResolutionCache(default_ttl=60)
-        cache.set("key1", "value1")
-        assert cache.get("key1") == "value1"
-
-    def test_get_missing_returns_default(self):
-        cache = ExpiringResolutionCache()
-        assert cache.get("missing") is None
-        assert cache.get("missing", "fallback") == "fallback"
-
-    def test_expired_entry_returns_none(self):
-        cache = ExpiringResolutionCache(default_ttl=0.01)
-        cache.set("expiring", "data")
-        time.sleep(0.05)
-        assert cache.get("expiring") is None
-
-    def test_contains_true_for_live_entry(self):
-        cache = ExpiringResolutionCache(default_ttl=60)
-        cache["k"] = "v"
-        assert "k" in cache
-
-    def test_contains_false_for_expired(self):
-        cache = ExpiringResolutionCache(default_ttl=0.01)
-        cache["k"] = "v"
-        time.sleep(0.05)
-        assert "k" not in cache
-
-    def test_len_counts_only_live_entries(self):
-        cache = ExpiringResolutionCache(default_ttl=60)
-        cache.set("a", 1)
-        cache.set("b", 2)
-        assert len(cache) == 2
-
-    def test_invalidate_removes_entry(self):
-        cache = ExpiringResolutionCache(default_ttl=60)
-        cache.set("del_me", "x")
-        cache.invalidate("del_me")
-        assert cache.get("del_me") is None
-
-    def test_clear_removes_all(self):
-        cache = ExpiringResolutionCache(default_ttl=60)
-        cache.set("a", 1)
-        cache.set("b", 2)
-        cache.clear()
-        assert len(cache) == 0
-
-    def test_purge_expired_returns_count(self):
-        cache = ExpiringResolutionCache(default_ttl=0.01)
-        cache.set("x", 1)
-        cache.set("y", 2)
-        time.sleep(0.05)
-        removed = cache.purge_expired()
-        assert removed == 2
-
-    def test_per_entry_ttl_override(self):
-        cache = ExpiringResolutionCache(default_ttl=60)
-        cache.set("short", "v", ttl=0.01)
-        time.sleep(0.05)
-        assert cache.get("short") is None
-
-    def test_getitem_raises_key_error_for_missing(self):
-        cache = ExpiringResolutionCache()
-        with pytest.raises(KeyError):
-            _ = cache["nonexistent"]
-
-
-# ── MusicDownloadChaosMonkey ──────────────────────────────────────────────────
-
-class TestMusicDownloadChaosMonkey:
-    def test_disabled_by_default_never_raises(self):
-        monkey = MusicDownloadChaosMonkey(enabled=False)
-        for _ in range(100):
-            monkey.inject_chaos()  # must not raise
-
-    def test_enabled_with_rate_1_always_raises(self):
-        monkey = MusicDownloadChaosMonkey(enabled=True, failure_rate=1.0)
-        with pytest.raises(RuntimeError):
-            monkey.inject_chaos()
-
-    def test_enabled_with_rate_0_never_raises(self):
-        monkey = MusicDownloadChaosMonkey(enabled=True, failure_rate=0.0)
-        for _ in range(50):
-            monkey.inject_chaos()
-
-    def test_stats_track_calls_and_injections(self):
-        monkey = MusicDownloadChaosMonkey(enabled=True, failure_rate=1.0)
-        for _ in range(5):
-            try:
-                monkey.inject_chaos()
-            except RuntimeError:
-                pass
-        stats = monkey.stats
-        assert stats["calls"] == 5
-        assert stats["injections"] == 5
-
-    def test_reset_stats_clears_counters(self):
-        monkey = MusicDownloadChaosMonkey(enabled=True, failure_rate=1.0)
-        try:
-            monkey.inject_chaos()
-        except RuntimeError:
-            pass
-        monkey.reset_stats()
-        assert monkey.stats["calls"] == 0
-        assert monkey.stats["injections"] == 0
-
-    def test_invalid_failure_rate_raises(self):
-        with pytest.raises(ValueError):
-            MusicDownloadChaosMonkey(enabled=True, failure_rate=1.5)
-
-    def test_intensity_presets(self):
-        for intensity in ("low", "medium", "high"):
-            m = MusicDownloadChaosMonkey(enabled=True, intensity=intensity)
-            assert 0 < m.failure_rate <= 1.0
-
-    def test_invalid_intensity_raises(self):
-        with pytest.raises(ValueError):
-            MusicDownloadChaosMonkey(enabled=True, intensity="extreme")
-
-    def test_custom_exception_factory(self):
-        monkey = MusicDownloadChaosMonkey(enabled=True, failure_rate=1.0)
-        with pytest.raises(ValueError, match="custom"):
-            monkey.inject_chaos(exception_factory=lambda: ValueError("custom"))

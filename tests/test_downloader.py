@@ -1051,8 +1051,6 @@ class TestTier0FailureReasons:
 
     def _orch(self):
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
-        orch._rate_limiter = MagicMock()
-        orch._rate_limiter.is_healthy.return_value = True
         orch._fail_tls.fail_reason = None
         return orch
 
@@ -1064,16 +1062,6 @@ class TestTier0FailureReasons:
         with patch.object(dl, "LIBRESPOT_AVAILABLE", False):
             assert orch._tier0_librespot(track) is None
         assert orch._fail_tls.fail_reason == tier_errors.NOT_AVAILABLE
-
-    def test_circuit_open(self, session):
-        import src.ingestion.downloader as dl
-        from src.ingestion import tier_errors
-        track = _make_track(session, "spotify:track:t0_circuit")
-        orch = self._orch()
-        orch._rate_limiter.is_healthy.return_value = False
-        with patch.object(dl, "LIBRESPOT_AVAILABLE", True):
-            assert orch._tier0_librespot(track) is None
-        assert orch._fail_tls.fail_reason == tier_errors.CIRCUIT_OPEN
 
     def test_no_source_id(self, session):
         import src.ingestion.downloader as dl

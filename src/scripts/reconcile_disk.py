@@ -58,54 +58,13 @@ _REPO_ROOT = _HERE.parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from src.models import Track  # noqa: E402
 from src.db import get_session, init_db  # noqa: E402
+from src.ingestion.organiser import FileOrganiser  # noqa: E402
+from src.models import Track  # noqa: E402
 
 logger = logging.getLogger("reconcile_disk")
 
-# ── Sanitisation rules (mirror src/ingestion/organiser.py exactly) ────────────
-_FORBIDDEN_RE = re.compile(r'[<>:"/\\|?*]')
-_WINDOWS_RESERVED = {
-    "CON", "PRN", "AUX", "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
-}
 _AUDIO_EXTS = (".flac", ".mp3", ".m4a", ".ogg", ".opus")
-
-
-def _sanitize(name: str) -> str:
-    """Byte-for-byte copy of FileOrganiser._sanitize()."""
-    s = _FORBIDDEN_RE.sub("_", name)
-    s = s[:200]
-    s = s.strip(". ")
-    stem = s.split(".", 1)[0]
-    if stem.upper() in _WINDOWS_RESERVED:
-        s = f"_{stem}_" + s[len(stem):]
-    return s
-
-
-def _build_path(track: Track, media_root: str, fmt: Optional[str] = None) -> str:
-    """Mirror of FileOrganiser._build_path() for one (track, format) pair."""
-    fmt = fmt or track.format or "mp3"
-    ext = f".{fmt}"
-
-    album_artist = track.album_artist or track.artist or "Unknown Artist"
-    artist_folder = _sanitize(album_artist)
-
-    album = track.album or "Unknown Album"
-    if track.year:
-        album_folder = _sanitize(f"{album} ({track.year})")
-    else:
-        album_folder = _sanitize(album)
-
-    title = track.title or "Unknown Title"
-    if track.track_number is not None:
-        nn = str(track.track_number).zfill(2)
-        filename = _sanitize(f"{nn} - {title}") + ext
-    else:
-        filename = _sanitize(title) + ext
-
-    return os.path.join(media_root, artist_folder, album_folder, filename)
 
 
 def _candidate_paths(track: Track, media_root: str) -> list[tuple[str, str]]:
@@ -117,11 +76,12 @@ def _candidate_paths(track: Track, media_root: str) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     formats = [track.format] if track.format else []
     formats.extend(["flac", "mp3", "m4a", "ogg", "opus"])
+    organiser = FileOrganiser(media_drive=media_root)
     for fmt in formats:
         if not fmt or fmt in seen:
             continue
         seen.add(fmt)
-        out.append((fmt, _build_path(track, media_root, fmt)))
+        out.append((fmt, organiser._build_path(track, f".{fmt}")))
     return out
 
 
@@ -225,7 +185,7 @@ def reconcile(media_root: str, apply_changes: bool, limit: Optional[int],
                 title = track.title or ""
                 # Try canonical-sanitised artist folder and the raw artist string
                 key_candidates = {
-                    (_normalise_for_match(_sanitize(artist)), _normalise_for_match(title)),
+                    (_normalise_for_match(FileOrganiser(media_drive=media_root)._sanitize(artist)), _normalise_for_match(title)),
                     (_normalise_for_match(artist), _normalise_for_match(title)),
                 }
                 for key in key_candidates:

@@ -115,25 +115,22 @@ class ListenBrainzDiscovery:
                 logger.debug("Skipping recommendation with no recording_mbid: %r", rec)
                 continue
 
-            # ── Skip already-present MBIDs ─────────────────────────────────
-            existing = (
-                session.query(LbRecommendation)
-                .filter_by(recording_mbid=mbid)
-                .first()
-            )
-            if existing:
-                # Only skip if already successfully ingested - allow retry for pending/skipped/failed
-                if existing.status == "ingested":
-                    logger.debug("Skipping already-ingested MBID %s", mbid)
-                    continue
-                
-                # Re-process pending/skipped/failed recommendations
-                logger.info("Re-processing MBID %s (was %s)", mbid, existing.status)
-                existing.status = "pending"  # Reset to pending for re-processing
-
-            # ── Ingest new recommendation ──────────────────────────────────
             try:
-                ingested = self._ingest_recommendation(rec, session)
+                # A bad recommendation must not poison the whole daily batch.
+                # Savepoint rollback also leaves the outer get_session() transaction usable.
+                with session.begin_nested():
+                    existing = (
+                        session.query(LbRecommendation)
+                        .filter_by(recording_mbid=mbid)
+                        .first()
+                    )
+                    if existing:
+                        if existing.status == "ingested":
+                            logger.debug("Skipping already-ingested MBID %s", mbid)
+                            continue
+                        logger.info("Re-processing MBID %s (was %s)", mbid, existing.status)
+                        existing.status = "pending"
+                    ingested = self._ingest_recommendation(rec, session)
                 if ingested:
                     new_tracks += 1
             except Exception as exc:
@@ -325,12 +322,7 @@ class ListenBrainzDiscovery:
         lb_rec.status = "pending"
         lb_rec.kind = kind  # §W3 T22
 
-        try:
-            session.flush()  # get lb_rec.id without committing
-        except Exception as exc:
-            logger.error("Failed to insert LbRecommendation for MBID %s: %s", mbid, exc)
-            session.rollback()
-            return False
+        session.flush()  # get lb_rec.id without committing
 
         # ── Bail out if we have no usable metadata ─────────────────────────
         if not title or not artist:
@@ -339,10 +331,7 @@ class ListenBrainzDiscovery:
                 mbid, title, artist,
             )
             lb_rec.status = "failed"
-            try:
-                session.flush()
-            except Exception:
-                pass
+            session.flush()
             return False
 
         # ── Create Track row ───────────────────────────────────────────────
@@ -367,10 +356,7 @@ class ListenBrainzDiscovery:
             # Always update MBID if we have it
             existing_track.mb_recording_id = mbid
             
-            try:
-                session.flush()
-            except Exception as exc:
-                logger.warning("DB flush failed linking existing track for MBID %s: %s", mbid, exc)
+            session.flush()
             return False  # not a *new* track
 
         track = Track(
@@ -383,25 +369,13 @@ class ListenBrainzDiscovery:
         )
         session.add(track)
 
-        try:
-            session.flush()  # get track.id
-        except Exception as exc:
-            logger.error("Failed to insert Track for MBID %s: %s", mbid, exc)
-            lb_rec.status = "failed"
-            try:
-                session.flush()
-            except Exception:
-                pass
-            return False
+        session.flush()  # get track.id
 
         # ── Link recommendation → track ────────────────────────────────────
         lb_rec.track_id = track.id
         lb_rec.status   = "ingested"
 
-        try:
-            session.flush()
-        except Exception as exc:
-            logger.warning("DB flush failed after linking track for MBID %s: %s", mbid, exc)
+        session.flush()
 
         logger.info(
             "Ingested LB recommendation: MBID=%s title=%r artist=%r track_id=%d",

@@ -51,6 +51,7 @@ services:
     # Keep the HTTP token service inside the Compose network; it has no host port.
     image: brainicism/bgutil-ytdlp-pot-provider:2.0.2
     container_name: musicstream-yt-pot-provider
+    mem_limit: 256m
     expose:
       - "4416"
     init: true
@@ -131,7 +132,7 @@ services:
       # how to generate a strong value.  DAEMON_DEV_NOAUTH=*** opt-in
       # bypass for local dev only — never set in production.
       - DAEMON_API_TOKEN=${DAEMON_API_TOKEN}
-      - DAEMON_DEV_NOAUTH=***
+      - DAEMON_DEV_NOAUTH=${DAEMON_DEV_NOAUTH:-}
       - YTDLP_POT_PROVIDER_URL=http://yt-pot-provider:4416
       # Audit #13: persisted throttle state (rate-limiter backoff history)
       # so a daemon restart doesn't reset cooldowns and re-trigger 429s.

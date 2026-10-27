@@ -113,3 +113,29 @@ def test_windows_path_normalization_regression(tmp_path, monkeypatch):
 
     from src.discovery.m3u_export import _to_host_path
     assert _to_host_path("/media/sombr/x.mp3") == "Y:/music/sombr/x.mp3"
+
+
+def test_weekly_export_uses_iso_year_at_new_year_boundary(tmp_path, session, monkeypatch):
+    import src.discovery.m3u_export as m3u
+    from datetime import datetime
+    from src.models import LbRecommendation
+
+    track = _downloaded(session, "spotify:track:iso", "Song", "Artist", str(tmp_path / "iso.mp3"))
+    session.add(LbRecommendation(
+        recording_mbid="iso-week", track_id=track.id, status="ingested",
+        fetched_at=datetime(2020, 12, 28, tzinfo=__import__("datetime").timezone.utc),
+    ))
+    session.flush()
+
+    class BoundaryDateTime:
+        @staticmethod
+        def now():
+            return datetime(2021, 1, 1)
+
+        @staticmethod
+        def fromisocalendar(year, week, day):
+            assert (year, week, day) == (2020, 53, 1)
+            return datetime.fromisocalendar(year, week, day)
+
+    monkeypatch.setattr(m3u, "dt", BoundaryDateTime)
+    assert m3u.export_weekly_discovery(session, str(tmp_path)) is not None

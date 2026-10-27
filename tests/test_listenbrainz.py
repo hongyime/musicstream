@@ -216,6 +216,30 @@ class TestIngestRecommendation:
 # ── run() — backfill vs poll ──────────────────────────────────────────────────
 
 class TestRun:
+    def test_failed_recommendation_rolls_back_only_its_savepoint(self, session):
+        d = _make_discovery()
+        good = _make_rec("mbid-savepoint-good", "Good", "Artist")
+        bad = _make_rec("mbid-savepoint-bad", "Bad", "Artist")
+        original = d._ingest_recommendation
+
+        def ingest(rec, db_session):
+            if rec["recording_mbid"] == bad["recording_mbid"]:
+                db_session.add(Track(
+                    spotify_uri="mb:mbid-savepoint-good",
+                    title="duplicate", artist="Artist", status="pending",
+                    cover_art_source="none",
+                ))
+                db_session.flush()
+            return original(rec, db_session)
+
+        with patch.object(d, "_fetch_recommendations", return_value=[good, bad]), patch.object(
+            d, "_fetch_mb_metadata", return_value={"title": "Song", "artist-credit": [{"name": "Artist"}]},
+        ), patch.object(d, "_ingest_recommendation", side_effect=ingest):
+            assert d.run(session) == 1
+
+        assert session.query(Track).filter_by(spotify_uri="mb:mbid-savepoint-good").count() == 1
+        assert session.query(LbRecommendation).filter_by(recording_mbid="mbid-savepoint-good").one().status == "ingested"
+
     def test_backfill_when_table_empty(self, session):
         """Empty lb_recommendations table → fetch BACKFILL_COUNT (200)."""
         # Ensure table is empty

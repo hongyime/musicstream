@@ -21,7 +21,7 @@ from src.models import Base, Track, Source, DownloadAttempt
 # against a live daemon), not pytest unit tests — one imports a removed symbol,
 # one is a print-based smoke script. Exclude them so automated collection of
 # the real unit tests is not blocked.
-collect_ignore = ["test_download.py", "test_refresh_artwork.py", "test_invalid_data_endpoints.py"]
+collect_ignore = ["test_download.py"]
 
 # ── Hypothesis stability ──────────────────────────────────────────────────────
 # Disable the per-example deadline so property tests don't flake on a loaded
@@ -194,6 +194,7 @@ def reset_environment_variables():
         "MAX_CONCURRENT_WORKERS",
         "DISABLE_DOWNLOADS",
         "DAEMON_API_TOKEN",
+        "DAEMON_DEV_NOAUTH",
         "SPOTIFY_CLIENT_ID",
         "SPOTIFY_TOKEN_CACHE",
         "LISTENBRAINZ_USERNAME",

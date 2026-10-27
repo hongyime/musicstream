@@ -94,8 +94,8 @@ def export_weekly_discovery(session, export_dir: Optional[str] = None) -> Option
     from src.models import LbRecommendation, Track, TrackStatus
 
     now = dt.now()
-    year, week = now.year, now.isocalendar()[1]
-    week_start = dt.fromisocalendar(year, week, 1).replace(tzinfo=timezone.utc)
+    iso_year, week, _ = now.isocalendar()
+    week_start = dt.fromisocalendar(iso_year, week, 1).replace(tzinfo=timezone.utc)
     week_end = week_start + timedelta(days=7)
 
     rows = (
@@ -117,7 +117,7 @@ def export_weekly_discovery(session, export_dir: Optional[str] = None) -> Option
         for t in rows
         if t.file_path
     ]
-    return export_playlist(f"Discovered Y{year} W{week}", entries, export_dir=export_dir)
+    return export_playlist(f"Discovered Y{iso_year} W{week}", entries, export_dir=export_dir)
 
 
 def backfill_all_playlists(session, export_dir: Optional[str] = None) -> list[Path]:

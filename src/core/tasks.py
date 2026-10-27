@@ -33,6 +33,30 @@ _QUARANTINED_AUDIO_RE = re.compile(
 )
 
 
+def cleanup_stale_temp_files(max_age_hours: int = 2) -> int:
+    """Delete abandoned regular files from the private download work directory."""
+    from src.ingestion.downloader import TEMP_DIR
+
+    cutoff = time.time() - max_age_hours * 3600
+    removed = 0
+    try:
+        for path in Path(TEMP_DIR).iterdir():
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except OSError as exc:
+                logger.warning("Could not remove stale temp file %s: %s", path, exc)
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        logger.warning("Could not scan temp directory %s: %s", TEMP_DIR, exc)
+        return 0
+    if removed:
+        logger.info("Removed %d stale temp file(s).", removed)
+    return removed
+
+
 def _spotify_task_min_token_hours() -> float:
     try:
         return max(0.0, float(os.environ.get("SPOTIFY_TASK_MIN_TOKEN_HOURS", "0.5")))

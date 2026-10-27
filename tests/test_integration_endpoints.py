@@ -117,6 +117,15 @@ async def test_refresh_artwork_rejects_invalid_input(
     assert response.status_code == 400
 
 
+@pytest.mark.parametrize("route", [
+    "/api/musicstream/health/timeline?limit=500000",
+    "/api/musicstream/tracks?limit=500000",
+])
+async def test_public_list_limits_are_capped(api_client: AsyncClient, route: str) -> None:
+    response = await api_client.get(route)
+    assert response.status_code == 200
+
+
 @pytest.mark.parametrize(
     "authorization, status", [(None, 401), ("Bearer wrong", 403), ("invalid", 401)],
 )

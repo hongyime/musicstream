@@ -39,8 +39,6 @@ from src.exceptions import DownloadError, OrganiserError, TaggingError
 from src.models import DownloadAttempt, Track, TrackStatus
 from src.rate_limiter import (
     AdaptiveProviderLimiter,
-    ServiceRateLimiter,
-    ServiceThrottle,
     classify_provider_failure,
     extract_retry_after,
     get_adaptive_provider_limiter,
@@ -352,16 +350,6 @@ class DownloadOrchestrator:
         provider_label = ",".join(self._spotiflac_services) if self._spotiflac_services else "<none>"
         logger.info("SpotiFLAC providers (in order): %s", provider_label)
 
-        # Trip after one full round of all workers failing plus a small buffer.
-        # MAX_CONCURRENT*5 (=60) was too lenient — a broken service would rack up
-        # 60 consecutive failures before the breaker opened.  MAX_CONCURRENT+5
-        # trips within two bad rounds, which is fast enough to matter.
-        circuit_threshold = MAX_CONCURRENT + 5
-        self._rate_limiter = ServiceRateLimiter(
-            circuit_breaker_threshold=circuit_threshold,
-            circuit_breaker_cooldown=300,
-        )
-        self._throttle = ServiceThrottle()
         self._provider_limiter = get_adaptive_provider_limiter()
         os.makedirs(TEMP_DIR, exist_ok=True)
 
@@ -593,10 +581,6 @@ class DownloadOrchestrator:
         failed = 0
         sweep_start = time.monotonic()
 
-        if not self._rate_limiter.is_healthy("librespot"):
-            logger.warning("librespot circuit breaker open; skipping Tier 0 pre-sweep entirely.")
-            return 0, 0
-
         _lib_tiers = [("tier0_librespot", self._tier0_librespot)]
 
         def _librespot_one(track_id: int) -> bool:
@@ -613,9 +597,6 @@ class DownloadOrchestrator:
                 if _shutting_down.is_set():
                     logger.warning("Shutdown requested; aborting librespot pre-sweep.")
                     break
-                if not self._rate_limiter.is_healthy("librespot"):
-                    logger.warning("librespot circuit breaker tripped; aborting pre-sweep.")
-                    break
                 if time.monotonic() - sweep_start > max_seconds:
                     logger.info("librespot pre-sweep: total time limit reached after %.0fs", max_seconds)
                     break
@@ -631,9 +612,6 @@ class DownloadOrchestrator:
                             "librespot per-track timeout (%.0fs) for track %d ('%s')",
                             per_track_timeout, track_id, track_title,
                         )
-                        # F1: timeouts are ALSO failures so the rate-limiter trips and
-                        # we stop hammering an already-rate-limited account (#325).
-                        self._rate_limiter.record_failure("librespot")
                         # Tell the worker THIS attempt was killed so its download_track
                         # loop skips recording — the main thread writes the single
                         # authoritative rate_limited row below. Single global is safe:
@@ -1032,14 +1010,14 @@ class DownloadOrchestrator:
             self._note_fail(te.NOT_AVAILABLE)
             return None
 
-        if not self._rate_limiter.is_healthy("spotiflac"):
-            logger.warning("SpotiFLAC circuit breaker open; skipping Tier 1.")
-            self._note_fail(te.CIRCUIT_OPEN)
-            return None
-
         if not track.spotify_id:
             logger.debug("Tier 1 skipped for track %d: no spotify_id (LB-only track)", track.id)
             self._note_fail(te.NO_SOURCE_ID)
+            return None
+
+        permit = self._provider_limiter_instance().acquire("spotiflac")
+        if permit is None:
+            self._note_fail(te.THROTTLE_SKIP)
             return None
 
         # SpotiFLAC needs a Spotify track URL, not a URI
@@ -1077,23 +1055,36 @@ class DownloadOrchestrator:
                                         ext = os.path.splitext(fname)[1]
                                         labeled = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}_{service}{ext}")
                                         os.rename(found, labeled)
-                                        self._rate_limiter.record_success("spotiflac")
+                                        self._provider_limiter_instance().complete(permit, success=True)
+                                        permit = None
                                         return labeled
                     except Exception as exc:
                         had_provider_error = True
                         logger.debug("SpotiFLAC service=%s failed for track %d: %s", service, track.id, exc)
                         continue
 
-            self._rate_limiter.record_failure("spotiflac")
+            self._provider_limiter_instance().complete(
+                permit, success=False,
+                failure_reason="provider_error" if had_provider_error else te.NO_CANDIDATES,
+            )
+            permit = None
             self._note_fail("provider_error" if had_provider_error else te.NO_CANDIDATES)
             return None
 
         except Exception as exc:
-            self._rate_limiter.record_failure("spotiflac")
+            self._provider_limiter_instance().complete(
+                permit, success=False, failure_reason=classify_provider_failure(exc),
+                retry_after_s=extract_retry_after(exc),
+            )
+            permit = None
             logger.debug("SpotiFLAC failed for track %d: %s", track.id, exc)
             self._note_fail(classify_provider_failure(exc))
             return None
         finally:
+            if permit is not None:
+                self._provider_limiter_instance().complete(
+                    permit, success=False, failure_reason="operation_aborted",
+                )
             # Always remove the per-call temp dir; success path already moved
             # the labeled file out to TEMP_DIR root, so this only cleans the
             # working directory and any leftover partials.
@@ -1140,11 +1131,6 @@ class DownloadOrchestrator:
         """
         if not LIBRESPOT_AVAILABLE:
             self._note_fail(te.NOT_AVAILABLE)
-            return None
-
-        if not self._rate_limiter.is_healthy("librespot"):
-            logger.warning("librespot circuit breaker open; skipping Tier 0.")
-            self._note_fail(te.CIRCUIT_OPEN)
             return None
 
         if not track.spotify_id:
@@ -1212,7 +1198,6 @@ class DownloadOrchestrator:
                     )
                     streaming_permit = None
                     logger.warning("librespot: empty stream for track %d ('%s')", track.id, track.title)
-                    self._rate_limiter.record_failure("librespot")
                     self._note_fail(te.EMPTY_STREAM)
                     return None
 
@@ -1246,7 +1231,6 @@ class DownloadOrchestrator:
                     "librespot: ffmpeg conversion failed for track %d (size=%d): %s",
                     track.id, mp3_size, ffmpeg_result.stderr.decode(errors="replace")[:200],
                 )
-                self._rate_limiter.record_failure("librespot")
                 self._note_fail(te.FFMPEG_FAIL)
                 return None
 
@@ -1256,7 +1240,6 @@ class DownloadOrchestrator:
             mp3_path = os.path.join(TEMP_DIR, f"librespot_{uuid.uuid4().hex}.mp3")
             shutil.move(mp3_in_workdir, mp3_path)
 
-            self._rate_limiter.record_success("librespot")
             logger.info("librespot: track %d ('%s') downloaded OK", track.id, track.title)
             return mp3_path
 
@@ -1299,7 +1282,6 @@ class DownloadOrchestrator:
                 self._note_fail(te.REGION_UNAVAIL)
                 return None
 
-            self._rate_limiter.record_failure("librespot")
             logger.warning("librespot failed for track %d ('%s'): %s", track.id, track.title, exc)
             # Only invalidate the session on auth failures or explicit auth signals.
             # Transient stream errors (IOError, empty chunk, decode error) don't
@@ -1330,11 +1312,6 @@ class DownloadOrchestrator:
         """
         if not YTMUSICAPI_AVAILABLE:
             self._note_fail(te.NOT_AVAILABLE)
-            return None
-
-        if not self._rate_limiter.is_healthy("ytmusicapi"):
-            logger.warning("ytmusicapi circuit breaker open; skipping Tier 2.")
-            self._note_fail(te.CIRCUIT_OPEN)
             return None
 
         # ytmusicapi returns YouTube Music video IDs.  Without cookies those
@@ -1377,12 +1354,10 @@ class DownloadOrchestrator:
                     retry_after_s=extract_retry_after(exc),
                 )
                 if bot_challenge:
-                    self._throttle.on_rate_limit("youtube")
                     self._note_fail(te.BOT_CHALLENGE)
                     logger.warning("YouTube Music bot challenge for track %d: %s", track.id, exc)
                     return None
                 search_failure_reason = search_failure_reason or failure_reason
-                self._rate_limiter.record_failure("ytmusicapi")
                 logger.warning("ytmusicapi search (filter=%s) failed: %s", search_filter, exc)
                 continue
 
@@ -1446,19 +1421,7 @@ class DownloadOrchestrator:
             track.id, len(candidates), scored_candidates[0][0],
         )
 
-        self._rate_limiter.record_success("ytmusicapi")
-
-        if not self._rate_limiter.is_healthy("youtube"):
-            logger.warning("YouTube circuit breaker open; skipping Tier 2 download.")
-            self._note_fail(te.CIRCUIT_OPEN)
-            return None
-
         for video_id in candidates:
-            if not self._throttle.wait("youtube"):
-                logger.info("Throttle skip: youtube tier 2 track %d — will retry next run", track.id)
-                self._note_fail(te.THROTTLE_SKIP)
-                return None
-
             permit = self._provider_limiter_instance().acquire("youtube")
             if permit is None:
                 self._note_fail(te.THROTTLE_SKIP)
@@ -1480,7 +1443,6 @@ class DownloadOrchestrator:
                     self._provider_limiter_instance().complete(
                         permit, success=False, failure_reason=te.CONTENT_MISS,
                     )
-                    self._rate_limiter.record_failure("youtube")
                     continue
 
                 # Duration validation ±5s
@@ -1501,8 +1463,6 @@ class DownloadOrchestrator:
                         continue
 
                 self._provider_limiter_instance().complete(permit, success=True)
-                self._rate_limiter.record_success("youtube")
-                self._throttle.on_success("youtube")
                 return downloaded
 
             except Exception as exc:
@@ -1512,8 +1472,6 @@ class DownloadOrchestrator:
                         permit, success=False, failure_reason=te.RATE_LIMITED,
                         retry_after_s=extract_retry_after(exc),
                     )
-                    self._rate_limiter.force_open("youtube", "session rate-limited")
-                    self._throttle.on_rate_limit("youtube")
                     logger.warning(
                         "YouTube session rate-limited for track %d; circuit breaker opened",
                         track.id,
@@ -1524,7 +1482,6 @@ class DownloadOrchestrator:
                         permit, success=False, failure_reason=te.BOT_CHALLENGE,
                         retry_after_s=extract_retry_after(exc),
                     )
-                    self._throttle.on_rate_limit("youtube")
                     self._note_fail(te.BOT_CHALLENGE)
                     logger.warning("YouTube bot challenge for track %d: %s", track.id, exc)
                     return None
@@ -1542,7 +1499,6 @@ class DownloadOrchestrator:
                         failure_reason=classify_provider_failure(exc),
                         retry_after_s=extract_retry_after(exc),
                     )
-                    self._rate_limiter.record_failure("youtube")
                     raise DownloadError(f"Tier 2 yt-dlp download failed: {exc}") from exc
             finally:
                 self._release_cookie_snapshot(cookie_snapshot)
@@ -1562,21 +1518,11 @@ class DownloadOrchestrator:
         The spotdl Python API has a process-wide SpotifyClient singleton that
         conflicts with ThreadPoolExecutor workers.
         """
-        if not self._rate_limiter.is_healthy("spotdl"):
-            logger.warning("spotdl circuit breaker open; skipping Tier 3.")
-            self._note_fail(te.CIRCUIT_OPEN)
-            return None
-
         client_id = os.environ.get("SPOTIFY_CLIENT_ID", "")
         client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
         if not client_id or not client_secret:
             logger.warning("SPOTIFY_CLIENT_ID/SECRET not set; skipping Tier 3 spotdl.")
             self._note_fail(te.NOT_AVAILABLE)
-            return None
-
-        if not self._throttle.wait("spotdl"):
-            logger.info("Throttle skip: spotdl track %d — will retry next run", track.id)
-            self._note_fail(te.THROTTLE_SKIP)
             return None
 
         spotdl_mode = os.environ.get("SPOTDL_MODE", "cli").lower()
@@ -1598,20 +1544,16 @@ class DownloadOrchestrator:
                         out_file = os.path.join(TEMP_DIR, f"spotdl_{track.id}_{uuid.uuid4().hex[:8]}.mp3")
                         with open(out_file, "wb") as f:
                             f.write(resp.content)
-                        self._rate_limiter.record_success("spotdl")
-                        self._throttle.on_success("spotdl")
                         logger.info("spotdl HTTP successfully downloaded track %d", track.id)
                         return out_file
                     else:
                         logger.warning("spotdl HTTP failed: %s - %s", resp.status_code, resp.text[:200])
                 except requests.exceptions.Timeout:
                     logger.warning("spotdl HTTP timeout for track %d", track.id)
-                    self._rate_limiter.record_failure("spotdl")
                     self._note_fail("timeout")
                     return None
                 except Exception as exc:
                     logger.warning("spotdl HTTP error: %s", exc)
-                    self._rate_limiter.record_failure("spotdl")
                     # Fall back to CLI if HTTP is broken? The spec says CLI fallback always available, meaning if mode=cli or HTTP fails, we could fallback, or maybe just if not configured. 
                     # Let's fallback to CLI for the PoC if HTTP fails.
                     logger.info("Falling back to spotdl CLI for track %d", track.id)
@@ -1628,7 +1570,6 @@ class DownloadOrchestrator:
                 spotdl_path = shutil.which("spotdl")
                 if not spotdl_path:
                     logger.warning("spotdl CLI not found; skipping Tier 3.")
-                    self._rate_limiter.record_failure("spotdl")
                     self._note_fail(te.NOT_AVAILABLE)
                     return None
 
@@ -1703,17 +1644,13 @@ class DownloadOrchestrator:
                     )
                     youtube_permit = None
                     if bot_challenge:
-                        self._throttle.on_rate_limit("youtube")
                         self._note_fail(te.BOT_CHALLENGE)
                         logger.warning("spotDL's YouTube backend hit a bot challenge for track %d", track.id)
                         return None
-                    if reason == te.RATE_LIMITED:
-                        self._throttle.on_rate_limit("youtube")
                     logger.warning(
                         "spotdl CLI failed for track %d ('%s'): returncode=%d, stderr=%s",
                         track.id, track.title, result.returncode, result.stderr[:200],
                     )
-                    self._rate_limiter.record_failure("spotdl")
                     self._note_fail(reason)
                     return None
 
@@ -1735,7 +1672,6 @@ class DownloadOrchestrator:
                     )
                     youtube_permit = None
                     logger.warning("spotdl CLI did not produce a file for track %d", track.id)
-                    self._rate_limiter.record_failure("spotdl")
                     self._note_fail(te.CONTENT_MISS)
                     return None
 
@@ -1748,8 +1684,6 @@ class DownloadOrchestrator:
 
                 self._provider_limiter_instance().complete(youtube_permit, success=True)
                 youtube_permit = None
-                self._rate_limiter.record_success("spotdl")
-                self._throttle.on_success("spotdl")
                 logger.info("spotdl CLI successfully downloaded track %d via %s", track.id, os.path.basename(promoted))
                 return promoted
 
@@ -1760,7 +1694,6 @@ class DownloadOrchestrator:
                     )
                     youtube_permit = None
                 logger.warning("spotdl CLI timeout for track %d", track.id)
-                self._rate_limiter.record_failure("spotdl")
                 self._note_fail("timeout")
                 return None
             except Exception as exc:
@@ -1774,7 +1707,6 @@ class DownloadOrchestrator:
                     youtube_permit = None
                     if reason == te.BOT_CHALLENGE:
                         self._note_fail(te.BOT_CHALLENGE)
-                        self._throttle.on_rate_limit("youtube")
                         logger.warning("spotDL's YouTube backend hit a bot challenge for track %d: %s", track.id, exc)
                         return None
                 if "rate" in msg.lower() or "limit" in msg.lower() or "retry will occur" in msg.lower():
@@ -1782,10 +1714,8 @@ class DownloadOrchestrator:
                         "spotdl rate-limited for track %d ('%s'): %s — skipping this run",
                         track.id, track.title, msg.splitlines()[0],
                     )
-                    self._throttle.on_rate_limit("spotdl")
                     self._note_fail(te.RATE_LIMITED)
                     return None
-                self._rate_limiter.record_failure("spotdl")
                 self._note_fail(classify_provider_failure(exc))
                 raise DownloadError(f"Tier 3 spotdl failed: {exc}") from exc
             finally:
@@ -1891,11 +1821,6 @@ class DownloadOrchestrator:
         flat-extract all results, score each via _score_youtube_candidate,
         download the highest-scoring candidate (must score >= 0).
         """
-        if not self._rate_limiter.is_healthy("youtube"):
-            logger.warning("YouTube circuit breaker open; skipping Tier 4.")
-            self._note_fail(te.CIRCUIT_OPEN)
-            return None
-
         queries = [
             f"ytsearch12:{track.title} {track.artist} audio",
             f"ytsearch12:{track.title} {track.artist} official audio",
@@ -1906,10 +1831,6 @@ class DownloadOrchestrator:
         seen_ids: set[str] = set()
         flat_failure_reason: Optional[str] = None
         for query in queries:
-            if not self._throttle.wait("youtube"):
-                logger.info("Throttle skip: youtube tier 4 track %d — will retry next run", track.id)
-                self._note_fail(te.THROTTLE_SKIP)
-                return None
             permit = self._provider_limiter_instance().acquire("youtube")
             if permit is None:
                 self._note_fail(te.THROTTLE_SKIP)
@@ -1936,8 +1857,6 @@ class DownloadOrchestrator:
                         permit, success=False, failure_reason=te.RATE_LIMITED,
                         retry_after_s=extract_retry_after(exc),
                     )
-                    self._rate_limiter.force_open("youtube", "session rate-limited")
-                    self._throttle.on_rate_limit("youtube")
                     self._note_fail(te.RATE_LIMITED)
                     logger.warning("YouTube session rate-limited (flat); CB opened")
                     return None
@@ -1946,7 +1865,6 @@ class DownloadOrchestrator:
                         permit, success=False, failure_reason=te.BOT_CHALLENGE,
                         retry_after_s=extract_retry_after(exc),
                     )
-                    self._throttle.on_rate_limit("youtube")
                     self._note_fail(te.BOT_CHALLENGE)
                     logger.warning("YouTube bot challenge during Tier 4 search for track %d: %s", track.id, exc)
                     return None
@@ -2006,10 +1924,6 @@ class DownloadOrchestrator:
                 continue
             url = f"https://www.youtube.com/watch?v={video_id}"
 
-            if not self._throttle.wait("youtube"):
-                logger.info("Throttle skip: youtube tier 4 track %d (score-loop) — will retry next run", track.id)
-                self._note_fail(te.THROTTLE_SKIP)
-                return None
             permit = self._provider_limiter_instance().acquire("youtube")
             if permit is None:
                 self._note_fail(te.THROTTLE_SKIP)
@@ -2031,8 +1945,6 @@ class DownloadOrchestrator:
                         permit, success=False, failure_reason=te.RATE_LIMITED,
                         retry_after_s=extract_retry_after(exc),
                     )
-                    self._rate_limiter.force_open("youtube", "session rate-limited")
-                    self._throttle.on_rate_limit("youtube")
                     self._note_fail(te.RATE_LIMITED)
                     logger.warning("YouTube session rate-limited; CB opened, stopping Tier 4")
                     return None
@@ -2041,12 +1953,9 @@ class DownloadOrchestrator:
                         permit, success=False, failure_reason=te.BOT_CHALLENGE,
                         retry_after_s=extract_retry_after(exc),
                     )
-                    self._throttle.on_rate_limit("youtube")
                     self._note_fail(te.BOT_CHALLENGE)
                     logger.warning("YouTube bot challenge for track %d: %s", track.id, exc)
                     return None
-                if reason != te.CONTENT_MISS:
-                    self._rate_limiter.record_failure("youtube")
                     flat_failure_reason = flat_failure_reason or reason
                 self._provider_limiter_instance().complete(
                     permit, success=False, failure_reason=reason,
@@ -2060,8 +1969,6 @@ class DownloadOrchestrator:
             downloaded = self._find_output_file(out_stem)
             if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 0:
                 self._provider_limiter_instance().complete(permit, success=True)
-                self._rate_limiter.record_success("youtube")
-                self._throttle.on_success("youtube")
                 logger.info(
                     "Tier 4: track %d delivered via official-filtered candidate (score=%d, vid=%s)",
                     track.id, score, video_id,
@@ -2083,16 +1990,6 @@ class DownloadOrchestrator:
         Always returns None on failure — scsearch is a known flaky extractor
         and should never raise into the tier chain or penalise the YouTube CB.
         """
-        if not self._rate_limiter.is_healthy("soundcloud"):
-            logger.warning("SoundCloud circuit breaker open; skipping Tier 5.")
-            self._note_fail(te.CIRCUIT_OPEN)
-            return None
-
-        if not self._throttle.wait("soundcloud"):
-            logger.info("Throttle skip: soundcloud track %d — will retry next run", track.id)
-            self._note_fail(te.THROTTLE_SKIP)
-            return None
-
         query = f"scsearch8:{track.title} {track.artist}"
         permit = self._provider_limiter_instance().acquire("soundcloud", enforce=False)
         assert permit is not None
@@ -2116,8 +2013,6 @@ class DownloadOrchestrator:
                 retry_after_s=extract_retry_after(exc),
             )
             permit = None
-            if reason != te.CONTENT_MISS:
-                self._rate_limiter.record_failure("soundcloud")
             self._note_fail(reason)
             logger.warning("Tier 5 SoundCloud failed for track %d ('%s'): %s", track.id, track.title, exc)
             return None
@@ -2164,13 +2059,9 @@ class DownloadOrchestrator:
                 downloaded = self._find_output_file(out_stem)
                 if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 0:
                     self._provider_limiter_instance().complete(permit, success=True)
-                    self._rate_limiter.record_success("soundcloud")
-                    self._throttle.on_success("soundcloud")
                     return downloaded
             except Exception as exc:
                 last_reason = te.CONTENT_MISS if self._is_content_error(exc) else classify_provider_failure(exc)
-                if last_reason != te.CONTENT_MISS:
-                    self._rate_limiter.record_failure("soundcloud")
                 logger.warning("Tier 5 SoundCloud candidate failed for track %d: %s", track.id, exc)
             finally:
                 self._release_cookie_snapshot(download_cookie_snapshot)

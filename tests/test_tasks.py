@@ -36,6 +36,23 @@ def _track(session, uri, status, attempt_count):
     return t
 
 
+def test_cleanup_stale_temp_files_removes_only_expired_regular_files(tmp_path, monkeypatch):
+    from src.ingestion import downloader
+    import os
+    import time
+
+    monkeypatch.setattr(downloader, "TEMP_DIR", str(tmp_path))
+    stale = tmp_path / "stale.txt"
+    fresh = tmp_path / "fresh.txt"
+    stale.write_text("stale")
+    fresh.write_text("fresh")
+    os.utime(stale, (time.time() - 3 * 3600, time.time() - 3 * 3600))
+
+    assert tasks.cleanup_stale_temp_files() == 1
+    assert not stale.exists()
+    assert fresh.exists()
+
+
 class TestResetFailedTracks:
     """reset_failed_tracks must requeue failed-family tracks AND clear
     attempt_count, or _should_give_up re-fails them on the first tier miss."""

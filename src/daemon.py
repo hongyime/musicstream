@@ -298,6 +298,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("DB initialization failed: %s", e)
         raise SystemExit(1) from e
+
+    tasks.cleanup_stale_temp_files()
     
     if os.environ.get("SKIP_BACKGROUND_STARTUP", "false").lower() in ("1", "true", "yes", "on"):
         logger.info("Background startup sequence skipped via SKIP_BACKGROUND_STARTUP.")
@@ -470,6 +472,8 @@ app = FastAPI(title="Musicstream API", lifespan=lifespan)
 
 def require_auth(authorization: Optional[str] = Header(default=None)) -> None:
     """FastAPI dependency: enforce DAEMON_API_TOKEN bearer auth."""
+    if os.environ.get("DAEMON_DEV_NOAUTH", "").lower() in ("1", "true", "yes", "on"):
+        return
     if not DAEMON_API_TOKEN:
         # Fail closed — refuse to mutate state without an operator-set token.
         raise HTTPException(
@@ -857,6 +861,7 @@ def _register_scheduler_jobs():
     # allowing the yt-dlp batch to process volume between librespot sweeps.
     scheduler.add_job(tasks.full_download_pipeline, "cron", hour="*/4", id="download_pipeline", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.requeue_stale_downloads, "interval", minutes=15, id="stale_download_requeue", replace_existing=True, misfire_grace_time=GRACE)
+    scheduler.add_job(tasks.cleanup_stale_temp_files, "interval", minutes=15, id="temp_file_cleanup", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.listenbrainz_discovery, "cron", hour=4, id="lb_discovery", replace_existing=True, misfire_grace_time=GRACE)
     scheduler.add_job(tasks.full_integrity_check, "cron", day_of_week="wed,sun", hour=5, id="integrity_check", replace_existing=True, misfire_grace_time=GRACE)
     # Daily (not weekly) backstop: even with Step 7's parallel fire-and-forget
@@ -981,6 +986,7 @@ async def health_deep():
 @app.get("/api/musicstream/health/timeline")
 async def health_timeline(limit: int = 50):
     try:
+        limit = min(max(limit, 1), 500)
         return ApiResponse(data={"items": await asyncio.to_thread(_read_health_snapshots, limit)})
     except Exception as e:
         return ApiResponse(error=str(e))
@@ -1065,6 +1071,7 @@ def get_tracks(status: str = "pending", limit: int = 100):
     from src.db import get_session
     from src.models import Track
     try:
+        limit = min(max(limit, 1), 500)
         with get_session() as session:
             query = session.query(Track)
             if status == "failed":
@@ -1235,7 +1242,6 @@ def reset_failed():
     try:
         with get_session() as session:
             count = tasks.reset_failed_tracks(session)
-            session.commit()
             return ApiResponse(data={"reset_count": count})
     except Exception as e:
         return ApiResponse(error=str(e))
@@ -1247,7 +1253,6 @@ def block_track_endpoint(track_id: int):
     try:
         with get_session() as session:
             ok = tasks.block_track(session, track_id)
-            session.commit()
             if not ok:
                 return ApiResponse(error=f"track {track_id} not found")
             return ApiResponse(data={"id": track_id, "blocked": True})
@@ -1275,7 +1280,6 @@ def upgrade_pass_endpoint():
     try:
         with get_session() as session:
             count = tasks.upgrade_pass(session)
-            session.commit()
             return ApiResponse(data={"requeued": count})
     except Exception as e:
         return ApiResponse(error=str(e))
@@ -1433,21 +1437,18 @@ async def spotify_callback(code: str = None, error: str = None):
         return RedirectResponse("/?error=no_code")
 
     auth_manager = _get_auth_manager()
-    print(f"[OAUTH] callback code received len={len(code)} verifier_present={hasattr(auth_manager, 'code_verifier') and bool(auth_manager.code_verifier)}", flush=True)
+    logger.info("Spotify callback code received; verifier_present=%s", bool(getattr(auth_manager, "code_verifier", None)))
     try:
         token = await asyncio.to_thread(auth_manager.get_access_token, code, False)
         if token:
             cached = auth_manager.get_cached_token() or {}
             scope = cached.get("scope", "") if isinstance(cached, dict) else ""
-            print(f"[OAUTH] exchange OK; cached_scope={scope!r}", flush=True)
+            logger.info("Spotify token exchange succeeded; cached_scope=%r", scope)
             logger.info("Spotify token successfully obtained via UI flow. scope=%r", scope)
             return RedirectResponse("/?auth=ok")
-        print("[OAUTH] exchange returned None", flush=True)
+        logger.error("Spotify token exchange returned no token")
         return RedirectResponse("/?error=token_none")
     except Exception as exc:
-        import traceback as _tb
-        tb_text = _tb.format_exc()
-        print(f"[OAUTH] EXCHANGE FAILED: {type(exc).__name__}: {exc}\n{tb_text}", flush=True)
         logger.error("Failed to exchange Spotify code: %s", exc, exc_info=True)
         msg = f"{type(exc).__name__}: {exc}"[:200]
         return RedirectResponse("/?error=" + _up.quote(msg))
@@ -1502,6 +1503,8 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
+        pass
+    finally:
         await manager.disconnect(websocket)
 
 # ── Static Files ──────────────────────────────────────────────────────────────

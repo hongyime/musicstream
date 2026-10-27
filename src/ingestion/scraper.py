@@ -1012,6 +1012,7 @@ class SpotifyScraper:
             )
 
         links_to_add: list[dict[str, int]] = []
+        new_tracks: list[Track] = []
 
         for data in parsed_items:
             spotify_uri = data["spotify_uri"]
@@ -1036,7 +1037,7 @@ class SpotifyScraper:
                     status=TrackStatus.PENDING.value,
                 )
                 session.add(track)
-                session.flush()  # populate track.id
+                new_tracks.append(track)
                 existing_by_uri[spotify_uri] = track
                 new_count += 1
                 logger.debug("Inserted new track: %s — %s", data["artist"], data["title"])
@@ -1057,6 +1058,11 @@ class SpotifyScraper:
                 # status is intentionally NOT touched here
                 track = existing
 
+        if new_tracks:
+            session.flush()
+
+        for data in parsed_items:
+            track = existing_by_uri[data["spotify_uri"]]
             # Link track ↔ source (idempotent — skip if already linked)
             if track.id is not None and track.id not in linked_track_ids:
                 links_to_add.append({"track_id": track.id, "source_id": source.id})
