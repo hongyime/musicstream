@@ -185,6 +185,8 @@ except ImportError:
 
 TEMP_DIR: str = os.environ.get("TEMP_DIR", "temp")
 _DURATION_TOLERANCE_S = 5  # ±5 seconds for duration validation
+# Candidate tiers validate duration only after downloading, so wrong-length candidates are expensive.
+_MAX_CANDIDATE_DURATION_REJECTIONS = 2
 _DEFAULT_CONTENT_FAILURE_PASSES = 6
 _DEFAULT_TRANSIENT_RETRY_BASE_MINUTES = 30
 _DEFAULT_TRANSIENT_RETRY_MAX_MINUTES = 1440
@@ -1332,7 +1334,7 @@ class DownloadOrchestrator:
 
         # OFFICIAL_SOURCE_FILTER_V1: collect candidates with metadata across
         # filters, score via _score_youtube_candidate, sort by score desc.
-        scored_candidates: list[tuple[int, str]] = []
+        scored_candidates: list[tuple[int, str, Optional[int]]] = []
         seen_vids: set[str] = set()
         search_failure_reason: Optional[str] = None
         for search_filter in ("songs", "videos"):
@@ -1398,7 +1400,7 @@ class DownloadOrchestrator:
                     # bonus +50 to prefer them over the videos filter
                     if search_filter == "songs":
                         score += 50
-                    scored_candidates.append((score, vid))
+                    scored_candidates.append((score, vid, duration_seconds))
             except Exception as exc:
                 logger.warning("Could not process ytmusicapi search results (filter=%s): %s", search_filter, exc)
 
@@ -1408,6 +1410,16 @@ class DownloadOrchestrator:
 
         # Sort by score desc, drop negatives
         scored_candidates.sort(key=lambda kv: kv[0], reverse=True)
+        # The "videos" filter returns no duration, so those candidates can only be
+        # rejected after a full download. Skip them when the expected length is known.
+        if track.duration_ms is not None:
+            unknown_duration = [c for c in scored_candidates if c[0] >= 0 and c[2] is None]
+            if unknown_duration:
+                logger.info(
+                    "Tier 2: skipping %d candidate(s) with unknown duration for track %d",
+                    len(unknown_duration), track.id,
+                )
+                scored_candidates = [c for c in scored_candidates if c[2] is not None]
         if scored_candidates and scored_candidates[0][0] < 0:
             logger.info(
                 "Tier 2: no official-grade candidate for track %d (best score=%d) — skipping tier",
@@ -1415,12 +1427,16 @@ class DownloadOrchestrator:
             )
             self._note_fail(search_failure_reason or te.NO_CANDIDATES)
             return None
-        candidates = [vid for score, vid in scored_candidates if score >= 0]
+        candidates = [vid for score, vid, _ in scored_candidates if score >= 0]
+        if not candidates:
+            self._note_fail(search_failure_reason or te.CONTENT_MISS)
+            return None
         logger.info(
             "Tier 2 [official-filter] track %d: %d candidates, top score=%d",
             track.id, len(candidates), scored_candidates[0][0],
         )
 
+        duration_rejections = 0
         for video_id in candidates:
             permit = self._provider_limiter_instance().acquire("youtube")
             if permit is None:
@@ -1460,6 +1476,13 @@ class DownloadOrchestrator:
                         self._provider_limiter_instance().complete(
                             permit, success=False, failure_reason=te.CONTENT_MISS,
                         )
+                        duration_rejections += 1
+                        if duration_rejections >= _MAX_CANDIDATE_DURATION_REJECTIONS:
+                            logger.info(
+                                "Tier 2: %d duration mismatches for track %d; abandoning tier",
+                                duration_rejections, track.id,
+                            )
+                            break
                         continue
 
                 self._provider_limiter_instance().complete(permit, success=True)
@@ -1910,6 +1933,7 @@ class DownloadOrchestrator:
             )
 
         # Try in score order; reject anything with score < 0 (hard fail)
+        duration_rejections = 0
         for score, cand in scored:
             if score < 0:
                 logger.info(
@@ -1934,8 +1958,8 @@ class DownloadOrchestrator:
             ydl_opts = self._build_mp3_opts(out_stem)
             cookie_snapshot = ydl_opts.get("cookiefile")
             try:
-                self._run_ytdlp_with_cookie_fallback(
-                    ydl_opts, lambda ydl: ydl.download([url]),
+                result = self._run_ytdlp_with_cookie_fallback(
+                    ydl_opts, lambda ydl: ydl.extract_info(url, download=True),
                 )
             except Exception as exc:
                 reason = te.CONTENT_MISS if self._is_content_error(exc) else classify_provider_failure(exc)
@@ -1967,16 +1991,41 @@ class DownloadOrchestrator:
                 self._release_cookie_snapshot(cookie_snapshot)
 
             downloaded = self._find_output_file(out_stem)
-            if downloaded and os.path.exists(downloaded) and os.path.getsize(downloaded) > 0:
-                self._provider_limiter_instance().complete(permit, success=True)
-                logger.info(
-                    "Tier 4: track %d delivered via official-filtered candidate (score=%d, vid=%s)",
-                    track.id, score, video_id,
+            if not downloaded or not os.path.exists(downloaded) or os.path.getsize(downloaded) == 0:
+                self._provider_limiter_instance().complete(
+                    permit, success=False, failure_reason=te.CONTENT_MISS,
                 )
-                return downloaded
-            self._provider_limiter_instance().complete(
-                permit, success=False, failure_reason=te.CONTENT_MISS,
+                continue
+
+            got_s = (result or {}).get("duration")
+            if track.duration_ms is not None and (
+                got_s is None or abs(float(got_s) - track.duration_ms / 1000.0) > _DURATION_TOLERANCE_S
+            ):
+                errors_logger.warning(
+                    "[DURATION_MISMATCH] %s | %s | expected=%.0fms | got=%s | tier=4 vid=%s",
+                    track.title, track.artist, track.duration_ms,
+                    f"{float(got_s):.0f}s" if got_s is not None else "unknown",
+                    video_id,
+                )
+                os.remove(downloaded)
+                self._provider_limiter_instance().complete(
+                    permit, success=False, failure_reason=te.CONTENT_MISS,
+                )
+                duration_rejections += 1
+                if duration_rejections >= _MAX_CANDIDATE_DURATION_REJECTIONS:
+                    logger.info(
+                        "Tier 4: %d duration mismatches for track %d; abandoning tier",
+                        duration_rejections, track.id,
+                    )
+                    break
+                continue
+
+            self._provider_limiter_instance().complete(permit, success=True)
+            logger.info(
+                "Tier 4: track %d delivered via official-filtered candidate (score=%d, vid=%s)",
+                track.id, score, video_id,
             )
+            return downloaded
 
         self._note_fail(flat_failure_reason or te.CONTENT_MISS)
         return None

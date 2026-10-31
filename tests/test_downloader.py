@@ -1211,3 +1211,120 @@ class TestYtDlpRemoteComponents:
         orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
         opts = orch._build_mp3_opts("/tmp/stem")
         assert opts["remote_components"] == ["ejs:github"]
+
+
+class TestTier2CandidateSelection:
+    """Tier 2 must not spend downloads on candidates it cannot validate."""
+
+    @staticmethod
+    def _orchestrator(tmp_path, search_results, download_duration=7200):
+        import types
+
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+        orch._fail_tls = types.SimpleNamespace(fail_reason=None, youtube_challenged=False)
+        orch._provider_limiter = MagicMock()
+        orch._build_mp3_opts = lambda stem: {}
+        orch.downloads = []
+
+        def fake_run(opts, action):
+            orch.downloads.append(action)
+            return {"duration": download_duration}
+
+        def fake_output_file(stem):
+            path = tmp_path / "candidate.mp3"
+            path.write_bytes(b"audio")
+            return str(path)
+
+        orch._run_ytdlp_with_cookie_fallback = fake_run
+        orch._find_output_file = fake_output_file
+        ytm = MagicMock()
+        ytm.search.side_effect = lambda query, filter, limit: search_results.get(filter, [])
+        return orch, ytm
+
+    def test_unknown_duration_candidates_are_not_downloaded(self, session, tmp_path):
+        track = _make_track(session, "spotify:track:tier2_unknown")
+        results = {
+            "songs": [],
+            "videos": [
+                {
+                    "videoId": "vid-unknown",
+                    "title": "Download Test (Official Audio)",
+                    "artists": [{"name": "Artist - Topic"}],
+                }
+            ],
+        }
+        orch, ytm = self._orchestrator(tmp_path, results)
+
+        with patch("src.ingestion.downloader.YTMusic", return_value=ytm):
+            assert orch._tier2_ytdlp_ytm(track) is None
+
+        assert orch.downloads == []
+        assert orch._fail_tls.fail_reason == te.CONTENT_MISS
+
+    def test_duration_mismatches_abandon_the_tier(self, session, tmp_path):
+        track = _make_track(session, "spotify:track:tier2_mismatch")
+        results = {
+            "songs": [
+                {
+                    "videoId": f"vid-{index}",
+                    "title": "Download Test",
+                    "artists": [{"name": "Artist"}],
+                    "duration_seconds": 180,
+                }
+                for index in range(3)
+            ],
+            "videos": [],
+        }
+        orch, ytm = self._orchestrator(tmp_path, results)
+
+        with patch("src.ingestion.downloader.YTMusic", return_value=ytm):
+            assert orch._tier2_ytdlp_ytm(track) is None
+
+        assert len(orch.downloads) == 2, "tier must stop after the mismatch cap"
+
+
+class TestTier4DurationValidation:
+    @staticmethod
+    def _orchestrator(tmp_path, download_duration, candidate_count=3):
+        import types
+
+        orch = DownloadOrchestrator.__new__(DownloadOrchestrator)
+        orch._fail_tls = types.SimpleNamespace(fail_reason=None, youtube_challenged=False)
+        orch._provider_limiter = MagicMock()
+        orch._build_mp3_opts = lambda stem: {}
+        orch.downloads = []
+        entries = [
+            {"id": f"vid-{index}", "title": "Download Test", "channel": "Artist", "duration": 180}
+            for index in range(candidate_count)
+        ]
+
+        def fake_run(opts, action):
+            if opts.get("extract_flat"):
+                return {"entries": entries}
+            orch.downloads.append(action)
+            return {"duration": download_duration}
+
+        def fake_output_file(stem):
+            path = tmp_path / "candidate.mp3"
+            path.write_bytes(b"audio")
+            return str(path)
+
+        orch._run_ytdlp_with_cookie_fallback = fake_run
+        orch._find_output_file = fake_output_file
+        return orch
+
+    def test_wrong_duration_candidate_is_deleted_and_rejected(self, session, tmp_path):
+        track = _make_track(session, "spotify:track:tier4_mismatch")
+        orch = self._orchestrator(tmp_path, download_duration=7200)
+
+        assert orch._tier4_ytdlp_youtube(track) is None
+
+        assert len(orch.downloads) == 2, "tier must stop after the mismatch cap"
+        assert not (tmp_path / "candidate.mp3").exists(), "rejected file must be removed"
+
+    def test_matching_duration_is_delivered(self, session, tmp_path):
+        track = _make_track(session, "spotify:track:tier4_match")
+        orch = self._orchestrator(tmp_path, download_duration=180)
+
+        assert orch._tier4_ytdlp_youtube(track) == str(tmp_path / "candidate.mp3")
+        assert len(orch.downloads) == 1
