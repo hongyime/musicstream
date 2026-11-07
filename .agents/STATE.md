@@ -2,7 +2,7 @@
 ## Compose recovery hardening (2026-11-07)
 - The production stack is healthy: `musicstream-daemon`, `musicstream-postgres`, and `musicstream-yt-pot-provider` all report healthy. `docker compose config --quiet` passes.
 - Daemon startup now waits for both PostgreSQL and the PO-token provider to pass their existing health checks; restart policies, bounded JSON logs, data volumes, ports, and the 30-second daemon drain were already correctly configured.
-- No live container was recreated: daemon startup runs migrations, which this task must not run. The dependency gate applies on the next normal container start or host reboot.
+- No live container was recreated: daemon startup runs migrations, which this task must not run. The dependency gate applies to the next Compose-controlled start or recreation; Docker restart-policy recovery after a host reboot does not enforce Compose dependency ordering.
 - Read-only probes pass: daemon `/health` and `/health/deep`, PostgreSQL `pg_isready`, and PO-token provider `/ping`. Deep health reports scheduler running, fresh progress, no stale downloads, and no degraded reasons.
 - Recent daemon logs still include Spotify API 401s and `EACCES` writes below `/media` for existing artist directories. These require credential/media ownership remediation outside this task's allowed boundary; downloads are otherwise making progress.
 - Committed and pushed to `main` as `23b94b2` (`fix(compose): wait for token provider health`).
