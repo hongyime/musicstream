@@ -1,4 +1,28 @@
 # STATE
+## Compose recovery hardening (2026-11-07)
+- The production stack is healthy: `musicstream-daemon`, `musicstream-postgres`, and `musicstream-yt-pot-provider` all report healthy. `docker compose config --quiet` passes.
+- Daemon startup now waits for both PostgreSQL and the PO-token provider to pass their existing health checks; restart policies, bounded JSON logs, data volumes, ports, and the 30-second daemon drain were already correctly configured.
+- No live container was recreated: daemon startup runs migrations, which this task must not run. The dependency gate applies on the next normal container start or host reboot.
+- Read-only probes pass: daemon `/health` and `/health/deep`, PostgreSQL `pg_isready`, and PO-token provider `/ping`. Deep health reports scheduler running, fresh progress, no stale downloads, and no degraded reasons.
+- Recent daemon logs still include Spotify API 401s and `EACCES` writes below `/media` for existing artist directories. These require credential/media ownership remediation outside this task's allowed boundary; downloads are otherwise making progress.
+
+## Clean stack stop for machine shutdown (2026-11-07 21:21 SGT)
+- Stopped `musicstream-daemon`, `musicstream-postgres`, and `musicstream-yt-pot-provider` gracefully via `docker compose stop`.
+- Daemon shutdown drain completed cleanly (31.5s drain period; in-flight claims reset); Postgres and token provider stopped cleanly.
+- Filesystem synced; ready for host reboot/shutdown.
+
+## Runtime check - read-only health probe (2026-11-05 19:33 SGT)
+- All three services healthy (`musicstream-daemon`, `musicstream-postgres`, `musicstream-yt-pot-provider`); `/health` and `/health/deep` return 200 with `reasons: []`, scheduler running, downloads enabled, 0 stale claims, 6 active downloads.
+- Database: 848,509 tracks total; 227,009 downloaded (26.75%), 621,494 pending, 0 failed.
+- Throughput: 196 downloads in the last 1h, 4,488 in the last 24h (~187.0/hr; ETA ≈ 132–138 days). Active deliveries flowing normally.
+- Storage: `/media/ultra-touch` has 1.9 TB free of 3.7 TB (49% used). (Note: host root `/` is at 99% with 7.6 GB free).
+
+## Runtime check - read-only health probe (2026-11-02 17:02 SGT)
+- All three services healthy (`musicstream-daemon`, `musicstream-postgres`, `musicstream-yt-pot-provider`); `/health` and `/health/deep` return 200 with `reasons: []`, scheduler running, downloads enabled, 0 stale claims, 6 active downloads.
+- Database: 848,509 tracks total; 213,639 downloaded (25.18%), 634,864 pending, 0 failed.
+- Throughput: 173 downloads in the last 1h, 4,136 in the last 24h (~172.3/hr; ETA ≈ 153 days). Last success 60s ago (track 858079 delivered).
+- Storage: `/media/ultra-touch` has 2.0 TB free of 3.7 TB (46% used).
+
 ## Runtime check - read-only health probe (2026-10-29 08:05 SGT)
 - All three services healthy; `/health` and `/health/deep` 200 with `reasons: []`, scheduler running, downloads enabled, 0 stale claims, zero tracebacks in 24h of logs.
 - Database: 848,505 tracks total; 196,775 downloaded (23.2%), 651,428 pending, 263 failed_validation, 39 failed. Last 24h: 6,334 successful attempts / 825 failed, ~264/hr (ETA for the pending backlog ≈ 103 days). 1,332 GB of tracked audio; `/media/ultra-touch` has 676 GB free of 3.7 TB (82% used).

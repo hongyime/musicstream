@@ -183,7 +183,7 @@ services:
       postgres:
         condition: service_healthy
       yt-pot-provider:
-        condition: service_started
+        condition: service_healthy
     # 2026-09-18: tightened from interval=60s/retries=3/timeout=10s.  A 16h
     # uptime run had the FastAPI socket hung while APScheduler jobs kept
     # running; Docker didn't mark unhealthy for over an hour because 60s x 3
