@@ -5,6 +5,7 @@
 - No live container was recreated: daemon startup runs migrations, which this task must not run. The dependency gate applies on the next normal container start or host reboot.
 - Read-only probes pass: daemon `/health` and `/health/deep`, PostgreSQL `pg_isready`, and PO-token provider `/ping`. Deep health reports scheduler running, fresh progress, no stale downloads, and no degraded reasons.
 - Recent daemon logs still include Spotify API 401s and `EACCES` writes below `/media` for existing artist directories. These require credential/media ownership remediation outside this task's allowed boundary; downloads are otherwise making progress.
+- Committed and pushed to `main` as `23b94b2` (`fix(compose): wait for token provider health`).
 
 ## Clean stack stop for machine shutdown (2026-11-07 21:21 SGT)
 - Stopped `musicstream-daemon`, `musicstream-postgres`, and `musicstream-yt-pot-provider` gracefully via `docker compose stop`.
