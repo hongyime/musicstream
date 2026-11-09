@@ -1,0 +1,14 @@
+[Unit]
+Description=Dedicated Musicstream YouTube Chrome CDP profile
+After=network-online.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+ExecStart=/usr/bin/google-chrome --user-data-dir=%h/.config/musicstream-youtube-cdp --remote-debugging-address=127.0.0.1 --remote-debugging-port=9224 --remote-allow-origins=http://127.0.0.1:9224 --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-renderer-backgrounding --new-window https://www.youtube.com
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

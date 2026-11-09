@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import stat
 import subprocess
 import threading
 import time
@@ -800,6 +801,206 @@ def log_orphan_file_inventory() -> dict[str, Any] | None:
         inventory["missing_file_samples"],
     )
     return inventory
+
+
+def _invalid_metadata_filter(Track):
+    """Return the shared definition of metadata that needs Spotify repair."""
+    from sqlalchemy import func, or_
+
+    return or_(
+        Track.artist.is_(None), func.trim(Track.artist) == "",
+        Track.album.is_(None), func.trim(Track.album) == "",
+    )
+
+
+def _spotify_metadata_client():
+    """Create the metadata client from environment credentials only."""
+    client_id = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        raise RuntimeError("SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET are required")
+
+    import spotipy
+    from spotipy.oauth2 import SpotifyClientCredentials
+
+    return spotipy.Spotify(
+        auth_manager=SpotifyClientCredentials(
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+    )
+
+
+def validate_invalid_tracks() -> dict[str, int]:
+    """Repair empty artist/album metadata, or mark confirmed Spotify misses."""
+    from src.db import get_session
+    from src.models import Track, TrackStatus
+
+    summary = {"checked": 0, "updated": 0, "marked_not_found": 0, "errors": 0}
+    with get_session() as session:
+        tracks = session.query(Track).filter(_invalid_metadata_filter(Track)).all()
+        if not tracks:
+            return summary
+        try:
+            spotify = _spotify_metadata_client()
+        except Exception as exc:
+            logger.warning("Invalid-track validation unavailable: %s", exc)
+            summary["errors"] = len(tracks)
+            return summary
+        for track in tracks:
+            summary["checked"] += 1
+            spotify_id = track.spotify_id or track.spotify_uri.rsplit(":", 1)[-1]
+            if not spotify_id:
+                summary["errors"] += 1
+                continue
+            try:
+                metadata = spotify.track(spotify_id)
+            except Exception as exc:  # A 404 is the only confirmed unavailable result.
+                if getattr(exc, "http_status", None) == 404:
+                    track.status = TrackStatus.MISSING.value
+                    summary["marked_not_found"] += 1
+                else:
+                    logger.warning("Spotify metadata lookup failed for track %d: %s", track.id, exc)
+                    summary["errors"] += 1
+                continue
+
+            if not metadata:
+                summary["errors"] += 1
+                continue
+            artists = metadata.get("artists") or []
+            artist = ", ".join(item.get("name", "") for item in artists if item.get("name"))
+            album = metadata.get("album") or {}
+            album_name = album.get("name") or ""
+            if artist:
+                track.artist = artist
+            if album_name:
+                track.album = album_name
+            if album.get("id"):
+                track.spotify_album_id = album["id"]
+            images = album.get("images") or []
+            if images and images[0].get("url"):
+                track.cover_art_url = images[0]["url"]
+            if (track.artist or "").strip() and (track.album or "").strip():
+                summary["updated"] += 1
+            else:
+                summary["errors"] += 1
+    return summary
+
+
+def _is_managed_path(path: str | os.PathLike[str], root: Path) -> bool:
+    try:
+        return Path(path).resolve().is_relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def _managed_regular_file(path: str | os.PathLike[str], root: Path) -> bool:
+    """True only for a non-symlink regular file physically below ``root``."""
+    try:
+        candidate = Path(path)
+        if not _is_managed_path(candidate, root):
+            return False
+        return stat.S_ISREG(candidate.lstat().st_mode)
+    except (OSError, ValueError):
+        return False
+
+
+def _managed_audio_file(path: str | os.PathLike[str], root: Path) -> bool:
+    return Path(path).suffix.lower() in _AUDIO_DOWNLOAD_EXTENSIONS and _managed_regular_file(path, root)
+
+
+def cleanup_invalid_tracks(*, dry_run: bool = True) -> dict[str, Any]:
+    """Remove validation-marked invalid rows and only their managed media files."""
+    from src.db import get_session
+    from src.models import Track, TrackStatus
+
+    root = Path(MEDIA_DIR)
+    result: dict[str, Any] = {
+        "dry_run": dry_run, "deleted": 0, "requeued": 0, "skipped": 0,
+        "errors": 0, "preserved_outside_media": [],
+    }
+    with get_session() as session:
+        tracks = session.query(Track).filter(
+            Track.status == TrackStatus.MISSING.value,
+            _invalid_metadata_filter(Track),
+        ).all()
+        for track in tracks:
+            path = track.file_path
+            managed_file = bool(path and _managed_audio_file(path, root))
+            if path and not _is_managed_path(path, root):
+                result["skipped"] += 1
+                result["preserved_outside_media"].append(path)
+            if dry_run:
+                result["deleted"] += 1
+                continue
+            try:
+                if managed_file:
+                    Path(path).unlink()
+                session.delete(track)
+                result["deleted"] += 1
+            except OSError as exc:
+                logger.warning("Could not remove invalid track %d file %s: %s", track.id, path, exc)
+                result["errors"] += 1
+    return result
+
+
+def cleanup_orphans(*, dry_run: bool = True, min_age_hours: int = 24) -> dict[str, Any]:
+    """Safely prune old unreferenced audio and requeue missing managed files."""
+    from src.db import get_session
+    from src.models import Track, TrackStatus
+
+    root = Path(MEDIA_DIR)
+    result: dict[str, Any] = {
+        "dry_run": dry_run, "deleted": 0, "requeued": 0, "skipped": 0,
+        "errors": 0, "younger_candidates": [], "preserved_outside_media": [],
+    }
+    if not root.is_dir():
+        raise FileNotFoundError(f"Media root is unavailable: {root}")
+
+    cutoff = time.time() - min_age_hours * 3600
+    root_key = root.resolve()
+    with get_session() as session:
+        rows = session.query(Track).filter(Track.file_path.isnot(None), Track.file_path != "").all()
+        referenced = {str(Path(track.file_path).resolve()) for track in rows if track.file_path}
+        for track in rows:
+            path = track.file_path
+            if not path:
+                continue
+            candidate = Path(path)
+            if _managed_regular_file(candidate, root_key):
+                continue
+            if candidate.exists() and not _is_managed_path(candidate, root_key):
+                result["preserved_outside_media"].append(path)
+                result["skipped"] += 1
+                continue
+            if track.blocked or candidate.exists():
+                continue
+            result["requeued"] += 1
+            if not dry_run:
+                track.status = TrackStatus.PENDING.value
+                track.file_path = None
+                track.file_sha256 = None
+
+        for directory, subdirectories, filenames in os.walk(root, followlinks=False):
+            subdirectories[:] = [name for name in subdirectories if not (Path(directory) / name).is_symlink()]
+            for filename in filenames:
+                candidate = Path(directory) / filename
+                if candidate.suffix.lower() not in _AUDIO_DOWNLOAD_EXTENSIONS:
+                    continue
+                if not _managed_regular_file(candidate, root_key) or str(candidate.resolve()) in referenced:
+                    continue
+                try:
+                    if candidate.stat().st_mtime > cutoff:
+                        result["skipped"] += 1
+                        result["younger_candidates"].append(str(candidate))
+                    else:
+                        result["deleted"] += 1
+                        if not dry_run:
+                            candidate.unlink()
+                except OSError as exc:
+                    logger.warning("Could not inspect orphan %s: %s", candidate, exc)
+                    result["errors"] += 1
+    return result
 
 
 def _expand_lb_track_artists(lookback_hours: int = 24, max_artists: int = 50) -> None:

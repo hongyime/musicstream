@@ -1,0 +1,18 @@
+[Unit]
+Description=Musicstream Compose stack
+Requires=docker.service
+After=network-online.target docker.service
+Wants=network-online.target
+RequiresMountsFor=/media/seagatefatgreenNADD1400music
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Template: change this to the checkout that contains docker-compose.yml.
+WorkingDirectory=/opt/musicstream
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose stop
+TimeoutStopSec=45s
+
+[Install]
+WantedBy=multi-user.target

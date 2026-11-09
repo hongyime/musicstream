@@ -19,6 +19,30 @@ def daemon_module(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_spotify_callback_persists_new_cache(daemon_module, monkeypatch, tmp_path):
+    cache_path = tmp_path / "spotify_token.json"
+    cached = {"access_token": "new-token", "refresh_token": "new-refresh", "expires_at": 12345}
+
+    class AuthManager:
+        def get_access_token(self, *, code, check_cache):
+            assert (code, check_cache) == ("oauth-code", False)
+            return "new-token"
+
+        def get_cached_token(self):
+            return cached
+
+    monkeypatch.setattr(daemon_module, "SPOTIFY_TOKEN_CACHE", str(cache_path))
+    monkeypatch.setattr(daemon_module, "_get_auth_manager", lambda: AuthManager())
+    monkeypatch.setattr("src.ingestion.scraper.clear_spotify_api_auth_failure", lambda: None)
+
+    response = await daemon_module.spotify_callback(code="oauth-code")
+
+    assert response.headers["location"] == "/?auth=ok"
+    assert json.loads(cache_path.read_text()) == cached
+    assert cache_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
 async def test_background_job_reports_completion(daemon_module):
     job = daemon_module._start_background_job("unit", lambda: {"ok": True})
     record = daemon_module._manual_jobs[job["job_id"]]
@@ -160,3 +184,52 @@ def test_build_deep_health_payload_degrades_on_stale_download_progress(daemon_mo
     assert payload["status"] == "degraded"
     assert "download-progress-stale" in payload["reasons"]
     assert payload["download_liveness"]["progress_fresh"] is False
+
+
+def test_build_deep_health_payload_reports_media_and_spotify_auth_failures(
+    daemon_module, monkeypatch, tmp_path,
+):
+    now = datetime.now(timezone.utc)
+
+    class _Query:
+        def scalar(self):
+            return now
+
+    class _Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, statement):
+            return None
+
+        def query(self, *args):
+            return _Query()
+
+    monkeypatch.setattr(daemon_module, "scheduler", SimpleNamespace(running=True))
+    monkeypatch.setattr("src.db.get_session", lambda: _Session())
+    monkeypatch.setattr(
+        daemon_module.tasks,
+        "get_download_liveness",
+        lambda daemon_uptime_seconds: {
+            "pending": 0,
+            "downloading": 0,
+            "stale_downloading": 0,
+            "progress_fresh": True,
+        },
+    )
+    monkeypatch.setattr(
+        "src.ingestion.spotify_auth.token_freshness",
+        lambda: {"present": True, "hours_left": 1.0},
+    )
+    monkeypatch.setattr(daemon_module, "MEDIA_DIR", tmp_path)
+    monkeypatch.setattr("src.ingestion.scraper.spotify_api_auth_failed", lambda: True)
+
+    payload = daemon_module._build_deep_health_payload()
+
+    assert payload["media_ready"] is False
+    assert payload["spotify_api_auth_failed"] is True
+    assert "media-not-ready" in payload["reasons"]
+    assert "spotify-api-auth-failed" in payload["reasons"]

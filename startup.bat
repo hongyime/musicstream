@@ -3,6 +3,10 @@ setlocal enabledelayedexpansion
 
 title MUSICSTREAM OPERATIONS
 set "PSQL=docker exec musicstream-postgres psql -X -U musicstream -d musicstream -v ON_ERROR_STOP=1 -P pager=off"
+set "DAEMON_API_TOKEN="
+for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0.env") do if /I "%%A"=="DAEMON_API_TOKEN" set "DAEMON_API_TOKEN=%%B"
+if not defined DAEMON_API_TOKEN echo [WARN] DAEMON_API_TOKEN missing from .env; mutating options will fail.
+set "API_AUTH=Authorization: Bearer !DAEMON_API_TOKEN!"
 
 if /I "%~1"=="status" (
     set "NONINTERACTIVE=1"
@@ -99,10 +103,7 @@ echo --- Container status ---
 docker compose ps
 echo.
 echo --- Daemon health ---
-curl -s http://localhost:9079/health 2>nul || echo [DOWN] Daemon not responding
-echo.
-echo --- Last 5 runs ---
-curl -s http://localhost:9079/status 2>nul
+curl -s http://localhost:9079/health/deep 2>nul || echo [DOWN] Daemon not responding
 echo.
 pause
 goto menu
@@ -112,7 +113,7 @@ goto menu
 :: ============================================================
 echo.
 echo [INFO] Triggering full sync...
-curl -sf -X POST http://localhost:9079/sync 2>nul && echo [OK] Queued || echo [ERROR] Daemon not reachable
+curl -sf -X POST -H "!API_AUTH!" http://localhost:9079/api/musicstream/sync 2>nul && echo [OK] Queued || echo [ERROR] Daemon not reachable or token rejected
 echo.
 pause
 goto menu
@@ -122,7 +123,7 @@ goto menu
 :: ============================================================
 echo.
 echo [INFO] Triggering integrity check...
-curl -sf -X POST http://localhost:9079/integrity 2>nul && echo [OK] Queued || echo [ERROR] Daemon not reachable
+curl -sf -X POST -H "!API_AUTH!" http://localhost:9079/api/musicstream/integrity 2>nul && echo [OK] Queued || echo [ERROR] Daemon not reachable or token rejected
 echo.
 pause
 goto menu
@@ -143,7 +144,7 @@ goto menu
 :: ============================================================
 echo.
 echo [INFO] Triggering backup...
-curl -sf -X POST http://localhost:9079/backup 2>nul && echo [OK] Done || echo [ERROR] Daemon not reachable
+curl -sf -X POST -H "!API_AUTH!" http://localhost:9079/api/musicstream/backup 2>nul && echo [OK] Queued || echo [ERROR] Daemon not reachable or token rejected
 echo.
 pause
 goto menu
@@ -163,14 +164,10 @@ goto menu
 :: ============================================================
 echo.
 echo [INFO] Resetting failed tracks to pending...
-docker exec musicstream-postgres psql -U musicstream -d musicstream -c "UPDATE tracks SET status='pending' WHERE status='failed';" 2>nul
+curl -sf -X POST -H "!API_AUTH!" http://localhost:9079/api/musicstream/tracks/reset-failed 2>nul
 if errorlevel 1 goto opt8_err
-docker exec musicstream-postgres psql -U musicstream -d musicstream -c "DELETE FROM download_attempts;" 2>nul
 echo.
-echo --- Track counts ---
-docker exec musicstream-postgres psql -U musicstream -d musicstream -c "SELECT status, COUNT(*) FROM tracks GROUP BY status ORDER BY status;" 2>nul
-echo.
-echo [OK] Done. Use option 3 to trigger a sync.
+echo [OK] Reset request completed. Use option 3 to trigger a sync.
 goto opt8_done
 :opt8_err
 echo [ERROR] Could not connect to postgres. Is the stack running?

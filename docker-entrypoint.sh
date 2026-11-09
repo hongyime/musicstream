@@ -21,6 +21,37 @@ set -e
 RUNTIME_USER="${RUNTIME_USER:-musicstream}"
 RUNTIME_UID="${RUNTIME_UID:-1000}"
 RUNTIME_GID="${RUNTIME_GID:-1000}"
+MEDIA_DIR="${MEDIA_DIR:-/media}"
+MEDIA_READY_MARKER="${MEDIA_READY_MARKER:-$MEDIA_DIR/.musicstream-ready}"
+DEPENDENCY_WAIT_SECONDS="${DEPENDENCY_WAIT_SECONDS:-90}"
+
+wait_for_dependency() {
+    local name="$1"
+    shift
+    local deadline=$((SECONDS + DEPENDENCY_WAIT_SECONDS))
+
+    until "$@" >/dev/null 2>&1; do
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "Timed out waiting for $name after ${DEPENDENCY_WAIT_SECONDS}s." >&2
+            return 1
+        fi
+        sleep 1
+    done
+}
+
+# A bind mount silently succeeds when the host path is only its empty mountpoint.
+# Do not let migrations or downloads run unless the intended media volume is present.
+if [ ! -f "$MEDIA_READY_MARKER" ]; then
+    echo "Media volume is not ready: required marker is missing." >&2
+    exit 1
+fi
+if ! gosu "$RUNTIME_USER" test -w "$MEDIA_DIR"; then
+    echo "Media volume is not writable by $RUNTIME_USER." >&2
+    exit 1
+fi
+
+wait_for_dependency "PostgreSQL" pg_isready -h "${POSTGRES_HOST:-postgres}" -U "${POSTGRES_USER:-musicstream}"
+wait_for_dependency "PO-token provider" curl -fsS --max-time 3 "${YTDLP_POT_PROVIDER_URL:-http://yt-pot-provider:4416}/ping"
 
 # Best-effort fix on writable mount targets + the in-container temp/ workdir.
 # /app/temp is NOT a bind mount; it must be writable by the runtime user or the

@@ -29,7 +29,7 @@ from src.rate_limiter import get_adaptive_provider_limiter
 from src.ws.manager import manager
 from src.core.config import (
     LOG_DIR, TIMEZONE, SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET,
-    SPOTIFY_TOKEN_CACHE, DAEMON_API_TOKEN, ORPHAN_INVENTORY_INTERVAL_DAYS,
+    SPOTIFY_TOKEN_CACHE, DAEMON_API_TOKEN, ORPHAN_INVENTORY_INTERVAL_DAYS, MEDIA_DIR,
 )
 import src.core.tasks as tasks
 
@@ -652,6 +652,11 @@ def _build_deep_health_payload() -> dict[str, Any]:
     from src.models import DaemonRun
 
     reasons = []
+    media_ready = (MEDIA_DIR.is_dir()
+                   and (MEDIA_DIR / ".musicstream-ready").is_file()
+                   and os.access(MEDIA_DIR, os.W_OK))
+    if not media_ready:
+        reasons.append("media-not-ready")
     db_ok = False
     try:
         with get_session() as s:
@@ -711,6 +716,10 @@ def _build_deep_health_payload() -> dict[str, Any]:
         spotify_token = {"present": False, "hours_left": None, "expired": True, "error": str(exc)[:500]}
 
     provider_limiter = get_adaptive_provider_limiter().compact_snapshot()
+    from src.ingestion.scraper import spotify_api_auth_failed
+    spotify_api_failed = spotify_api_auth_failed()
+    if spotify_api_failed:
+        reasons.append("spotify-api-auth-failed")
 
     degraded = bool(reasons)
     return {
@@ -721,7 +730,9 @@ def _build_deep_health_payload() -> dict[str, Any]:
         "last_run_age_seconds": int(run_age_s) if run_age_s is not None else None,
         "last_run_fresh": run_fresh,
         "download_liveness": download_liveness,
+        "media_ready": media_ready,
         "spotify_token": spotify_token,
+        "spotify_api_auth_failed": spotify_api_failed,
         "provider_limiter": provider_limiter,
         "reasons": reasons,
     }
@@ -731,28 +742,42 @@ def _build_deep_health_payload() -> dict[str, Any]:
 async def _broadcast_health():
     while True:
         try:
-            health = [
-                {
-                    "service": "Daemon",
-                    "status": "online",
-                    "latency_ms": 0,
-                    "updated_at": datetime.now(timezone.utc).isoformat()
-                },
-                {
-                    "service": "Database",
-                    "status": "online",
-                    "updated_at": datetime.now(timezone.utc).isoformat()
-                },
-                {
-                    "service": "Scheduler",
-                    "status": "online" if scheduler.running else "idle",
-                    "updated_at": datetime.now(timezone.utc).isoformat()
-                }
-            ]
+            health = await asyncio.to_thread(_health_services)
             await manager.broadcast(json.dumps(health))
         except Exception as e:
             logger.error("Health broadcast error: %s", e)
         await asyncio.sleep(5)
+
+
+def _health_services() -> list[dict[str, Any]]:
+    """Build websocket telemetry from a live DB probe and scheduler state."""
+    from src.db import get_session
+    import sqlalchemy as _sa
+
+    updated_at = datetime.now(timezone.utc).isoformat()
+    started = time.perf_counter()
+    try:
+        with get_session() as session:
+            session.execute(_sa.text("SELECT 1"))
+        database = {
+            "service": "Database", "status": "online",
+            "latency_ms": round((time.perf_counter() - started) * 1000, 1),
+            "updated_at": updated_at,
+        }
+    except Exception as exc:
+        logger.debug("Websocket database probe failed: %s", exc)
+        database = {
+            "service": "Database", "status": "offline", "latency_ms": None,
+            "updated_at": updated_at,
+        }
+    return [
+        {"service": "Daemon", "status": "online", "latency_ms": None, "updated_at": updated_at},
+        database,
+        {
+            "service": "Scheduler", "status": "online" if scheduler.running else "idle",
+            "latency_ms": None, "updated_at": updated_at,
+        },
+    ]
 
 
 async def _health_snapshot_loop():
@@ -1144,31 +1169,53 @@ def get_metrics():
 
 @app.post("/admin/validate-invalid-tracks", dependencies=[Depends(require_auth)])
 async def validate_invalid_tracks():
-    # Simple placeholder to satisfy T7 integration tests
-    return {"summary": {"checked": 0, "updated": 0, "marked_not_found": 0, "errors": 0}}
+    return {"summary": await asyncio.to_thread(tasks.validate_invalid_tracks)}
 
 @app.post("/admin/cleanup-orphans", dependencies=[Depends(require_auth)])
+async def cleanup_orphans(dry_run: bool = True):
+    return await asyncio.to_thread(tasks.cleanup_orphans, dry_run=dry_run)
+
+
 @app.post("/admin/cleanup-invalid-tracks", dependencies=[Depends(require_auth)])
 async def cleanup_invalid_tracks(dry_run: bool = True):
-    """Report orphaned media files and missing DB files without changing either."""
-    if not dry_run:
-        raise HTTPException(
-            status_code=400,
-            detail="Only dry-run orphan inventory is supported; no cleanup is performed.",
-        )
-    inventory = await asyncio.to_thread(tasks.orphan_file_inventory)
-    return {"deleted": 0, "dry_run": True, "inventory": inventory}
+    return await asyncio.to_thread(tasks.cleanup_invalid_tracks, dry_run=dry_run)
+
+
+def _artwork_report_data() -> dict[str, Any]:
+    from sqlalchemy import func, or_
+    from src.db import get_session
+    from src.models import Track
+
+    missing = or_(Track.cover_art_url.is_(None), func.trim(Track.cover_art_url) == "")
+    with get_session() as session:
+        total = session.query(Track).count()
+        missing_total = session.query(Track).filter(missing).count()
+        covered = total - missing_total
+        albums = session.query(
+            func.coalesce(Track.album, "Unknown album").label("album"),
+            func.count(Track.id).label("count"),
+        ).filter(missing).group_by(Track.album).order_by(func.count(Track.id).desc()).limit(20).all()
+        artists = session.query(
+            func.coalesce(Track.artist, "Unknown artist").label("artist"),
+            func.count(Track.id).label("count"),
+        ).filter(missing).group_by(Track.artist).order_by(func.count(Track.id).desc()).limit(20).all()
+    percentage = round(covered * 100 / total, 1) if total else 100.0
+    return {
+        "database": {
+            "total_tracks": total,
+            "with_cover_art": covered,
+            "missing_cover_art": missing_total,
+            "coverage_percentage": percentage,
+        },
+        "embedded_artwork": {"with_cover_art": covered, "missing_cover_art": missing_total},
+        "missing_by_album": [{"album": album, "count": count} for album, count in albums],
+        "missing_by_artist": [{"artist": artist, "count": count} for artist, count in artists],
+        "summary": {"artwork_health": "healthy" if not missing_total else "degraded"},
+    }
 
 @app.get("/api/artwork-report")
 async def artwork_report():
-    # Simple placeholder to satisfy T7 integration tests
-    return {
-        "database": {"coverage_percentage": 0},
-        "embedded_artwork": {},
-        "missing_by_album": [],
-        "missing_by_artist": [],
-        "summary": {"artwork_health": "unknown"}
-    }
+    return await asyncio.to_thread(_artwork_report_data)
 
 @app.post("/api/artwork-refresh", dependencies=[Depends(require_auth)])
 async def artwork_refresh(mode: str = "missing", limit: int = 10, dry_run: int = 0):
@@ -1233,8 +1280,14 @@ async def requeue_stale_tracks(stale_after_minutes: Optional[int] = None):
 
 @app.post("/api/musicstream/integrity", dependencies=[Depends(require_auth)])
 async def trigger_integrity():
-    await asyncio.to_thread(tasks.integrity_check)
-    return ApiResponse(data={"queued": True})
+    job = _start_background_job("integrity", tasks.integrity_check)
+    return ApiResponse(data={**job, "queued": True, "status_url": f"/api/musicstream/jobs/{job['job_id']}"})
+
+
+@app.post("/api/musicstream/backup", dependencies=[Depends(require_auth)])
+async def trigger_backup():
+    job = _start_background_job("backup", tasks.db_backup)
+    return ApiResponse(data={**job, "queued": True, "status_url": f"/api/musicstream/jobs/{job['job_id']}"})
 
 @app.post("/api/musicstream/tracks/reset-failed", dependencies=[Depends(require_auth)])
 def reset_failed():
@@ -1374,6 +1427,16 @@ _REDIRECT_URI = "http://127.0.0.1:9079/auth/spotify/callback"
 # manager and the exchange failed silently with code_verifier mismatch.
 _active_auth_manager: Optional[object] = None
 
+
+def _persist_spotify_token_cache(token: dict) -> None:
+    """Write in place so the single-file Docker bind mount keeps the new token."""
+    with open(SPOTIFY_TOKEN_CACHE, "w", encoding="utf-8") as cache_file:
+        json.dump(token, cache_file)
+        cache_file.flush()
+        os.fsync(cache_file.fileno())
+    os.chmod(SPOTIFY_TOKEN_CACHE, 0o600)
+
+
 def _get_auth_manager(*, fresh: bool = False):
     """Reuse the active auth manager unless *fresh* is set (login start)."""
     global _active_auth_manager
@@ -1439,9 +1502,23 @@ async def spotify_callback(code: str = None, error: str = None):
     auth_manager = _get_auth_manager()
     logger.info("Spotify callback code received; verifier_present=%s", bool(getattr(auth_manager, "code_verifier", None)))
     try:
-        token = await asyncio.to_thread(auth_manager.get_access_token, code, False)
+        # OAuth must exchange this callback's code even if a stale cache claims
+        # to be valid; otherwise Spotipy returns the old rejected access token.
+        token = await asyncio.to_thread(
+            auth_manager.get_access_token, code=code, check_cache=False,
+        )
         if token:
+            from src.ingestion.scraper import clear_spotify_api_auth_failure
             cached = auth_manager.get_cached_token() or {}
+            if not isinstance(cached, dict):
+                logger.error("Spotify token exchange returned an invalid cache payload")
+                return RedirectResponse("/?error=token_cache_invalid")
+            try:
+                _persist_spotify_token_cache(cached)
+            except OSError as exc:
+                logger.error("Could not persist Spotify token cache: %s", exc)
+                return RedirectResponse("/?error=token_cache_write_failed")
+            clear_spotify_api_auth_failure()
             scope = cached.get("scope", "") if isinstance(cached, dict) else ""
             logger.info("Spotify token exchange succeeded; cached_scope=%r", scope)
             logger.info("Spotify token successfully obtained via UI flow. scope=%r", scope)

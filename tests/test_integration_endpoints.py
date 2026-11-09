@@ -1,4 +1,5 @@
 import asyncio
+import os
 import subprocess
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
@@ -76,21 +77,134 @@ async def test_cleanup_invalid_tracks_is_dry_run_orphan_inventory(
     body = resp.json()
     assert body["deleted"] == 0
     assert body["dry_run"] is True
-    assert body["inventory"]["orphan_file_count"] == 0
-    assert body["inventory"]["missing_file_count"] == 0
+    assert body["requeued"] == 0
+    assert body["errors"] == 0
 
 
-async def test_orphan_cleanup_rejects_non_dry_run(api_client: AsyncClient) -> None:
+async def test_orphan_cleanup_allows_guarded_non_dry_run(
+    api_client: AsyncClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from src.core import tasks
+
+    monkeypatch.setattr(tasks, "MEDIA_DIR", tmp_path)
     resp = await api_client.post(
         "/admin/cleanup-orphans?dry_run=false", headers=get_headers(),
     )
-    assert resp.status_code == 400
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] == 0
 
 @pytest.mark.integration
 async def test_artwork_report(api_client: AsyncClient) -> None:
     resp = await api_client.get("/api/artwork-report", headers=get_headers())
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
-    assert resp.json()["summary"] == {"artwork_health": "unknown"}
+    assert resp.json()["summary"] == {"artwork_health": "healthy"}
+
+
+async def test_artwork_report_uses_live_track_metadata(api_client: AsyncClient) -> None:
+    from src.db import get_session
+
+    with get_session() as session:
+        session.add_all([
+            Track(spotify_uri="spotify:track:art-one", spotify_id="art-one", title="One", artist="Artist", album="Album", cover_art_url="https://example.test/cover.jpg"),
+            Track(spotify_uri="spotify:track:art-two", spotify_id="art-two", title="Two", artist="Artist", album="Album"),
+        ])
+    response = await api_client.get("/api/artwork-report")
+    report = response.json()
+    assert report["database"] == {
+        "total_tracks": 2, "with_cover_art": 1, "missing_cover_art": 1, "coverage_percentage": 50.0,
+    }
+    assert report["summary"] == {"artwork_health": "degraded"}
+    assert report["missing_by_album"] == [{"album": "Album", "count": 1}]
+
+
+async def test_orphan_cleanup_respects_dry_run_age_and_missing_reference(
+    api_client: AsyncClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from src.core import tasks
+    from src.db import get_session
+
+    monkeypatch.setattr(tasks, "MEDIA_DIR", tmp_path)
+    old_orphan = tmp_path / "old.mp3"
+    old_orphan.write_bytes(b"old")
+    os.utime(old_orphan, (1, 1))
+    young_orphan = tmp_path / "young.mp3"
+    young_orphan.write_bytes(b"young")
+    with get_session() as session:
+        session.add(Track(
+            spotify_uri="spotify:track:missing-file", spotify_id="missing-file", title="Missing",
+            artist="Artist", album="Album", status="downloaded", file_path=str(tmp_path / "gone.mp3"), file_sha256="stale",
+        ))
+
+    dry_run = await api_client.post("/admin/cleanup-orphans?dry_run=true", headers=get_headers())
+    assert dry_run.json()["deleted"] == 1
+    assert dry_run.json()["requeued"] == 1
+    assert old_orphan.exists()
+
+    applied = await api_client.post("/admin/cleanup-orphans?dry_run=false", headers=get_headers())
+    assert applied.json()["deleted"] == 1
+    assert not old_orphan.exists()
+    assert young_orphan.exists()
+    with get_session() as session:
+        track = session.query(Track).filter_by(spotify_id="missing-file").one()
+        assert track.status == "pending"
+        assert track.file_path is None
+        assert track.file_sha256 is None
+
+
+async def test_validate_invalid_tracks_updates_or_marks_missing(
+    api_client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.core import tasks
+    from src.db import get_session
+
+    class NotFound(Exception):
+        http_status = 404
+
+    class Spotify:
+        def track(self, spotify_id: str):
+            if spotify_id == "gone":
+                raise NotFound()
+            return {"artists": [{"name": "Repaired artist"}], "album": {"name": "Repaired album", "id": "album", "images": []}}
+
+    monkeypatch.setattr(tasks, "_spotify_metadata_client", Spotify)
+    with get_session() as session:
+        session.add_all([
+            Track(spotify_uri="spotify:track:repair", spotify_id="repair", title="Repair", artist="", album=""),
+            Track(spotify_uri="spotify:track:gone", spotify_id="gone", title="Gone", artist="", album=""),
+        ])
+    response = await api_client.post("/admin/validate-invalid-tracks", headers=get_headers())
+    assert response.json()["summary"] == {"checked": 2, "updated": 1, "marked_not_found": 1, "errors": 0}
+    with get_session() as session:
+        assert session.query(Track).filter_by(spotify_id="repair").one().artist == "Repaired artist"
+        assert session.query(Track).filter_by(spotify_id="gone").one().status == "missing"
+
+
+async def test_integrity_and_backup_are_tracked_jobs(
+    api_client: AsyncClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src import daemon
+    from src.core import tasks
+
+    daemon._manual_jobs.clear()
+    monkeypatch.setattr(tasks, "integrity_check", lambda: None)
+    monkeypatch.setattr(tasks, "db_backup", lambda: "backup.sql")
+    for route in ("/api/musicstream/integrity", "/api/musicstream/backup"):
+        response = await api_client.post(route, headers=get_headers())
+        payload = response.json()["data"]
+        assert payload["status_url"].endswith(payload["job_id"])
+    jobs = await api_client.get("/api/musicstream/jobs")
+    assert {job["kind"] for job in jobs.json()["data"]["items"]} >= {"integrity", "backup"}
+
+
+async def test_websocket_health_uses_live_database_probe(api_client: AsyncClient) -> None:
+    from src.daemon import _health_services
+
+    services = _health_services()
+    database = next(service for service in services if service["service"] == "Database")
+    scheduler = next(service for service in services if service["service"] == "Scheduler")
+    assert database["status"] == "online"
+    assert isinstance(database["latency_ms"], float)
+    assert scheduler["status"] in {"online", "idle"}
 
 @pytest.mark.integration
 async def test_refresh_artwork(api_client: AsyncClient) -> None:

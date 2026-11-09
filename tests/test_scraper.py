@@ -26,6 +26,7 @@ sys.modules.setdefault("spotipy.oauth2", _mock_spotipy.oauth2)
 sys.modules.setdefault("spotipy.cache_handler", MagicMock())
 
 from src.models import Source, SourceType, Track, TrackStatus  # noqa: E402
+from src.ingestion import scraper as scraper_module  # noqa: E402
 from src.ingestion.scraper import SpotifyScraper  # noqa: E402
 
 
@@ -35,12 +36,82 @@ from src.ingestion.scraper import SpotifyScraper  # noqa: E402
 # These fixtures are now provided by tests/conftest.py
 
 
+class _SpotifyApiError(Exception):
+    def __init__(self, status: int):
+        super().__init__(f"Spotify API status {status}")
+        self.http_status = status
+
+
 @pytest.fixture
-def scraper():
+def scraper(monkeypatch):
+    monkeypatch.setattr(scraper_module.spotipy, "SpotifyException", _SpotifyApiError)
+    scraper_module.clear_spotify_api_auth_failure()
     s = SpotifyScraper(client_id="fake-client-id")
     # Prevent real OAuth flow
     s._sp = MagicMock()
-    return s
+    yield s
+    scraper_module.clear_spotify_api_auth_failure()
+
+
+class _SpotifyClient:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+
+    def current_user(self):
+        if self.error:
+            raise self.error
+        return self.response
+
+
+def _spotify_error(status: int):
+    return _SpotifyApiError(status)
+
+
+class TestSpotifyApiAuthRecovery:
+    def test_401_refreshes_rebuilds_client_and_retries_once(self, scraper, monkeypatch):
+        first = _SpotifyClient(error=_spotify_error(401))
+        second = _SpotifyClient(response={"id": "recovered"})
+        scraper._sp = first
+        refreshes = []
+
+        def refresh():
+            refreshes.append(True)
+            scraper._sp = second
+            return True
+
+        monkeypatch.setattr(scraper, "_refresh_after_unauthorized", refresh)
+
+        assert scraper._spotify_call(scraper.sp.current_user) == {"id": "recovered"}
+        assert refreshes == [True]
+        assert scraper_module.spotify_api_auth_failed() is False
+
+    def test_non_401_does_not_refresh_or_retry(self, scraper, monkeypatch):
+        scraper._sp = _SpotifyClient(error=_spotify_error(500))
+        refresh = MagicMock(return_value=True)
+        monkeypatch.setattr(scraper, "_refresh_after_unauthorized", refresh)
+
+        with pytest.raises(_SpotifyApiError):
+            scraper._spotify_call(scraper.sp.current_user)
+
+        refresh.assert_not_called()
+        assert scraper_module.spotify_api_auth_failed() is False
+
+    def test_unrecoverable_401_sets_terminal_auth_state(self, scraper, monkeypatch):
+        scraper._sp = _SpotifyClient(error=_spotify_error(401))
+        monkeypatch.setattr(scraper, "_refresh_after_unauthorized", lambda: False)
+
+        with pytest.raises(_SpotifyApiError):
+            scraper._spotify_call(scraper.sp.current_user)
+
+        assert scraper_module.spotify_api_auth_failed() is True
+
+    def test_successful_api_call_clears_terminal_auth_state(self, scraper):
+        scraper_module._spotify_api_auth_failed.set()
+        scraper._sp = _SpotifyClient(response={"id": "healthy"})
+
+        assert scraper._spotify_call(scraper.sp.current_user) == {"id": "healthy"}
+        assert scraper_module.spotify_api_auth_failed() is False
 
 
 # ── Album artist rule ─────────────────────────────────────────────────────────

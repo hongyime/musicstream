@@ -113,9 +113,14 @@ Mutating endpoints require `Authorization: Bearer $DAEMON_API_TOKEN` (from `.env
 TOKEN=$(grep -E '^DAEMON_API_TOKEN=' .env | cut -d= -f2-)
 curl -X POST -H "Authorization: Bearer $TOKEN" http://localhost:9079/api/musicstream/sync
 # also: /integrity, /full-backfill, /saved-albums-sync, /followed-artists-sync,
-#       /liked-artists-expand?batch=N, /tracks/reset-failed
+#       /liked-artists-expand?batch=N, /tracks/reset-failed, /backup
 
-# Read-only media/DB orphan inventory (dry-run only; no deletion or quarantine):
+# Maintenance defaults to dry run. `cleanup-orphans` inventories unreferenced
+# managed audio and missing DB references; `cleanup-invalid-tracks` inventories
+# validation-marked rows. Set dry_run=false only after reviewing the result:
+# old (24h+) unreferenced regular audio under MEDIA_DIR may be deleted, missing
+# unblocked references are requeued, and validation-marked invalid rows are
+# removed. Paths outside MEDIA_DIR are preserved and reported.
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://localhost:9079/admin/cleanup-orphans?dry_run=true"
 ```
@@ -126,8 +131,25 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 
 T0 librespot (Spotify Premium, single-flight, serial pre-sweep) → T1 SpotiFLAC (lossless)
 → T2 yt-dlp+ytmusicapi → T3 spotdl → T4 yt-dlp YouTube → T5 yt-dlp SoundCloud.
-T0/T3 are serial sweeps; T1/T2/T4/T5 run in a `MAX_CONCURRENT_WORKERS` ThreadPool.
+T0 is an isolated serial pre-sweep; T1/T2/T3/T4/T5 run in a `MAX_CONCURRENT_WORKERS` ThreadPool.
 A track is marked `failed` after `_GIVE_UP_THRESHOLD` (20) failed attempts (tracked in `tracks.attempt_count`).
+
+### YouTube cookie refresh
+
+The host user service `musicstream-youtube-chrome.service` owns a dedicated Chrome
+profile and a loopback-only CDP endpoint at `127.0.0.1:9224`; it is separate from
+all other project browsers. After signing into the intended YouTube Premium account
+in that profile, enable `musicstream-youtube-cookie-sync.timer` to refresh
+`cookies.txt` every 15 minutes. Check it with:
+
+```bash
+systemctl --user status musicstream-youtube-cookie-sync.service
+systemctl --user list-timers musicstream-youtube-cookie-sync.timer
+```
+
+The browser must remain signed in to YouTube Premium. CDP exports the current session;
+it cannot complete a future Google login or 2FA prompt. Never expose the CDP port beyond
+loopback or copy `cookies.txt` into chat.
 
 ### Worker concurrency ramp
 
@@ -227,8 +249,9 @@ environment variable to another positive number to change the interval. All inte
 APScheduler intervals from scheduler startup. Cron jobs use Asia/Singapore time. `misfire_grace_time=3600`
 covers delayed jobs while the process is running; the default in-memory store does not replay jobs
 missed while the daemon is stopped.
-The `/admin/cleanup-orphans` endpoint (also available at the legacy
-`/admin/cleanup-invalid-tracks` path) returns the same kind of read-only inventory on demand.
+`/admin/cleanup-orphans` and `/admin/cleanup-invalid-tracks` are distinct,
+token-protected maintenance operations. Both default to dry run; neither follows
+symlinks or deletes outside `MEDIA_DIR`.
 
 ### Host-scheduled watchdogs
 
@@ -281,3 +304,24 @@ The file logger self-heals via a 60s watchdog after uvicorn's dictConfig wipes h
 ## 9. Boot autostart
 The whole stack autostarts via the self-heal scheduled task and the
 Startup-folder `.bat` wrapper (see `scripts/Musicstream_Startup.bat`).
+
+### Linux systemd
+
+For a Linux host, use `systemd/musicstream-compose.service` as a template.
+Set its `WorkingDirectory` to this checkout, then install and validate it:
+
+```bash
+sudo install -m 0644 systemd/musicstream-compose.service /etc/systemd/system/
+sudo systemctl edit --full musicstream-compose.service  # set WorkingDirectory
+sudo systemd-analyze verify /etc/systemd/system/musicstream-compose.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now musicstream-compose.service
+```
+
+The unit requires Docker and the configured music mount. It starts Compose only
+after those are available and runs `docker compose stop` at shutdown, preserving
+the daemon's 30-second drain. The daemon additionally rejects `/media` unless
+the mounted volume contains `.musicstream-ready` and is writable by `musicstream`.
+Create that empty marker once on the verified music volume; never create it in a
+host-directory fallback. A failed marker or dependency check exits non-zero so
+Docker's `unless-stopped` policy can retry safely.

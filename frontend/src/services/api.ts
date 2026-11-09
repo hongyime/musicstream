@@ -117,6 +117,26 @@ export async function fetchApi<T>(
   return result.data;
 }
 
+async function fetchRaw<T>(url: string, options?: RequestInit): Promise<T> {
+  const headers = new Headers(options?.headers || {});
+  const token = getDaemonToken();
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  const response = await fetch(url, { ...options, headers });
+  if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+  return response.json() as Promise<T>;
+}
+
+export interface BackgroundJob {
+  job_id: string;
+  kind: string;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  queued_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+  error: string | null;
+  result: unknown;
+}
+
 export const musicstreamService = {
   getStats: () =>
     fetchApi<{
@@ -143,13 +163,33 @@ export const musicstreamService = {
       }[]
     >('/metrics'),
 
-  getReport: () => fetchApi<any>('/report'),
-
   resetFailed: () => fetchApi<any>('/tracks/reset-failed', { method: 'POST' }),
 
   sync: () => fetchApi<any>('/sync', { method: 'POST' }),
 
   runIntegrityCheck: () => fetchApi<any>('/integrity', { method: 'POST' }),
+
+  backup: () => fetchApi<BackgroundJob>('/backup', { method: 'POST' }),
+
+  getJobs: () => fetchApi<{ items: BackgroundJob[] }>('/jobs'),
+
+  getBurnRate: () => fetchApi<{
+    rate_per_hour_recent: number;
+    rate_per_hour_24h_avg: number;
+    eta_days_at_recent_rate: number | null;
+    eta_days_at_24h_rate: number | null;
+  }>('/burn-rate'),
+
+  fullBackfill: () => fetchApi<BackgroundJob>('/full-backfill', { method: 'POST' }),
+  savedAlbumsSync: () => fetchApi<BackgroundJob>('/saved-albums-sync', { method: 'POST' }),
+  followedArtistsSync: () => fetchApi<BackgroundJob>('/followed-artists-sync', { method: 'POST' }),
+  likedArtistsExpand: () => fetchApi<BackgroundJob>('/liked-artists-expand', { method: 'POST' }),
+  requeueStale: () => fetchApi<{ requeued: number }>('/tracks/requeue-stale', { method: 'POST' }),
+  upgradePass: () => fetchApi<any>('/upgrade-pass', { method: 'POST' }),
+  discoverWeekly: () => fetchApi<any>('/discover-weekly', { method: 'POST' }),
+  validateInvalidTracks: () => fetchRaw('/admin/validate-invalid-tracks', { method: 'POST' }),
+  cleanupOrphansDryRun: () => fetchRaw('/admin/cleanup-orphans?dry_run=true', { method: 'POST' }),
+  cleanupInvalidTracksDryRun: () => fetchRaw('/admin/cleanup-invalid-tracks?dry_run=true', { method: 'POST' }),
 
   getAuthStatus: () =>
     fetchApi<{
@@ -160,18 +200,15 @@ export const musicstreamService = {
       token_degraded?: boolean;
     }>('/auth/status'),
 
-  getArtworkReport: () => fetch('/api/artwork-report', {
-    headers: {
-      ...(getDaemonToken() ? { 'Authorization': `Bearer ${getDaemonToken()}` } : {})
-    }
-  }).then(res => res.json()),
+  getArtworkReport: () => fetchRaw<{
+    database: { coverage_percentage: number };
+    missing_by_album: unknown[];
+    missing_by_artist: unknown[];
+    summary: { artwork_health: 'healthy' | 'degraded' };
+  }>('/api/artwork-report'),
 
-  refreshArtwork: (mode: string = "missing", limit: number = 10, dryRun: number = 0) => fetch(`/api/artwork-refresh?mode=${mode}&limit=${limit}&dry_run=${dryRun}`, {
-    method: 'POST',
-    headers: {
-      ...(getDaemonToken() ? { 'Authorization': `Bearer ${getDaemonToken()}` } : {})
-    }
-  }).then(res => res.json()),
+  refreshArtwork: (mode: string = "missing", limit: number = 10, dryRun: number = 0) =>
+    fetchRaw(`/api/artwork-refresh?mode=${mode}&limit=${limit}&dry_run=${dryRun}`, { method: 'POST' }),
 
   // ── §W3 T24/T25: Library search ──────────────────────────────────────
   getLibrary: (params: {

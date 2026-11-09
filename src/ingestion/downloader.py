@@ -5,9 +5,9 @@ Implements the full tier chain for downloading tracks:
   Tier 0: librespot serial pre-sweep
   Tier 1: SpotiFLAC — lossless provider chain
   Tier 2: yt-dlp + ytmusicapi
-  Tier 5: validated yt-dlp SoundCloud
   Tier 3: spotDL
-  Tier 4: yt-dlp direct YouTube search (last; skipped after a bot challenge)
+  Tier 4: yt-dlp direct YouTube search (skipped after a bot challenge)
+  Tier 5: validated yt-dlp SoundCloud
 
 After repeated complete content-miss passes: status='failed', log [DOWNLOAD_FAIL].
 MAX_CONCURRENT parallel workers via ThreadPoolExecutor.
@@ -272,7 +272,7 @@ logger.info("Worker concurrency set to: MAX_CONCURRENT=%d", MAX_CONCURRENT)
 
 # ── P0-2: cooperative drain-on-shutdown ──────────────────────────────────────
 # Lifespan shutdown (daemon.py) calls request_shutdown() on SIGTERM. The three
-# sweep loops below (download_pending batches, librespot pre-sweep, spotdl sweep)
+# loops below (download_pending batches and the librespot pre-sweep)
 # check _shutting_down between tracks and stop claiming new work, so an in-flight
 # row is the only one that can be left DOWNLOADING — and lifespan resets that.
 # threading.Event is used because the sweeps run in worker threads.
@@ -540,7 +540,7 @@ class DownloadOrchestrator:
             stream.read() is blocking, so we run each attempt in a thread and
             join with this timeout.  Prevents one hung connection blocking the sweep.
           max_seconds — total budget for the whole sweep.  Stops early so the
-            12-worker batch + spotdl sweep still run in the same cycle.
+            pooled fallback batch still runs in the same cycle.
             Default 0 means: read LIBRESPOT_SWEEP_MAX_SECONDS env (default 7200s).
             2026-09-18: made env-configurable so a rate-limited librespot phase
             can be capped short (30 min) instead of eating the whole 2h window
@@ -662,70 +662,6 @@ class DownloadOrchestrator:
         )
         return downloaded, failed
 
-    def download_pending_spotdl(self, session: Session, max_seconds: float = 3600.0) -> tuple[int, int]:
-        """
-        Single-worker spotdl sweep run after the main 12-worker batch.
-
-        Processes ALL still-PENDING tracks (not a fixed top-N — spotdl's
-        Spotify-metadata search has genuinely different coverage from tier2's
-        raw query, so every remaining track deserves an attempt).
-
-        Stops after max_seconds so the daemon cycle doesn't overrun.
-
-        Returns:
-            (downloaded, failed) counts.
-        """
-        from src.db import get_session
-
-        # P2-4 memory fix: hydrate only Track.id — the loop below re-fetches via
-        # session.get() in its own session anyway. Loading full rows for 100k+
-        # pending tracks OOM-killed the 128M Postgres container (2026-07-08).
-        candidate_ids = list(
-            session.execute(
-                select(Track.id).where(
-                    Track.status == TrackStatus.PENDING.value,
-                    Track.blocked.is_(False),  # §W3 V7
-                    or_(Track.next_retry_at.is_(None), Track.next_retry_at <= _utcnow()),
-                )
-            ).scalars()
-        )
-        session.commit()
-
-        if not candidate_ids:
-            logger.info("spotdl sweep: no pending tracks to process.")
-            return 0, 0
-
-        logger.info("spotdl sweep: %d tracks (max %.0fs)", len(candidate_ids), max_seconds)
-        downloaded = 0
-        failed = 0
-        sweep_start = time.monotonic()
-        _spotdl_tiers = [("tier3_spotdl", self._tier3_spotdl)]
-
-        for track_id in candidate_ids:
-            if _shutting_down.is_set():
-                logger.warning("Shutdown requested; aborting spotdl sweep.")
-                break
-            if time.monotonic() - sweep_start > max_seconds:
-                logger.info("spotdl sweep: time limit reached after %.0fs", max_seconds)
-                break
-            try:
-                with get_session() as ts:
-                    t = ts.get(Track, track_id)
-                    if t is None or t.status != TrackStatus.PENDING.value:
-                        continue
-                    success = self.download_track(t, ts, tiers_override=_spotdl_tiers)
-                    if success:
-                        downloaded += 1
-                    else:
-                        failed += 1
-            except Exception as exc:
-                logger.error("spotdl sweep unhandled error for track %d: %s", track_id, exc, exc_info=True)
-                failed += 1
-
-        elapsed = time.monotonic() - sweep_start
-        logger.info("spotdl sweep done: downloaded=%d failed=%d elapsed=%.0fs", downloaded, failed, elapsed)
-        return downloaded, failed
-
     def download_track(self, track: Track, session: Session, tiers_override=None) -> bool:
         """
         Run the tier chain for a single track.
@@ -791,9 +727,9 @@ class DownloadOrchestrator:
             tiers = [
                 ("tier1_spotiflac",        self._tier1_spotiflac),
                 ("tier2_ytdlp_ytm",        self._tier2_ytdlp_ytm),
-                ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),
                 ("tier3_spotdl",           self._tier3_spotdl),
                 ("tier4_ytdlp_youtube",    self._tier4_ytdlp_youtube),
+                ("tier5_ytdlp_soundcloud", self._tier5_ytdlp_soundcloud),
             ]
 
         # Filter out disabled tiers
@@ -1323,8 +1259,7 @@ class DownloadOrchestrator:
         cookies_ok = os.path.exists("cookies.txt") and os.path.getsize("cookies.txt") > 0
         if not cookies_ok:
             logger.info(
-                "Tier 2 skipped for track %d: cookies.txt empty — ytmusicapi IDs require YouTube auth. "
-                "Export browser cookies to cookies.txt to enable this tier.",
+                "Tier 2 skipped for track %d: CDP-synced cookies.txt is empty — YouTube auth is unavailable.",
                 track.id,
             )
             self._note_fail(te.NOT_AVAILABLE)

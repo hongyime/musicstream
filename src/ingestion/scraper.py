@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -44,10 +45,21 @@ _SCOPES = (
 
 # Sentinel spotify_id used for the liked-songs virtual source
 _LIKED_SONGS_ID = "__liked_songs__"
+_spotify_api_auth_failed = threading.Event()
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def spotify_api_auth_failed() -> bool:
+    """Whether the latest Spotify API 401 could not be recovered silently."""
+    return _spotify_api_auth_failed.is_set()
+
+
+def clear_spotify_api_auth_failure() -> None:
+    """Clear a terminal API-auth state after a successful API call or OAuth flow."""
+    _spotify_api_auth_failed.clear()
 
 
 class SpotifyScraper:
@@ -65,8 +77,34 @@ class SpotifyScraper:
         self._sp: Optional[spotipy.Spotify] = None
 
     def _spotify_call(self, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """Observe Spotify Web API calls without enforcing the new limiter yet."""
-        return self._provider_limiter.observe_call("spotify_api", callback, *args, **kwargs)
+        """Make one silent token-refresh retry for an otherwise valid-looking 401."""
+        try:
+            result = self._provider_limiter.observe_call("spotify_api", callback, *args, **kwargs)
+        except spotipy.SpotifyException as exc:
+            if getattr(exc, "http_status", None) != 401:
+                raise
+
+            logger.warning("Spotify API returned 401; refreshing the token and retrying once.")
+            self._sp = None
+            if not self._refresh_after_unauthorized():
+                _spotify_api_auth_failed.set()
+                raise
+
+            retry_callback = getattr(self.sp, callback.__name__)
+            try:
+                result = self._provider_limiter.observe_call("spotify_api", retry_callback, *args, **kwargs)
+            except Exception:
+                _spotify_api_auth_failed.set()
+                raise
+        _spotify_api_auth_failed.clear()
+        return result
+
+    @staticmethod
+    def _refresh_after_unauthorized() -> bool:
+        # Reuse the credential-aware refresher; it writes the bind-mounted cache in place.
+        from src.core.tasks import _default_token_refresher
+
+        return bool(_default_token_refresher())
 
     # ── Spotify client (lazy init) ─────────────────────────────────────────────
 

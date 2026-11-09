@@ -21,7 +21,7 @@ import { StatusBadge } from './components/StatusBadge';
 import { Button } from './components/Button';
 import { TokenPrompt } from './components/TokenPrompt';
 import { ArtworkCard } from './components/ArtworkCard';
-import { musicstreamService } from './services/api';
+import { musicstreamService, type BackgroundJob } from './services/api';
 import { useHealthWS, type ServiceHealth } from './hooks/useHealthWS';
 
 interface TrackItem {
@@ -235,7 +235,7 @@ function App() {
                   columns={[
                     { header: 'Process', accessor: 'service' },
                     { header: 'Status', accessor: (item) => <StatusBadge label={item.status} status={item.status as any} /> },
-                    { header: 'Latency', accessor: (item) => `${item.latency_ms ?? 0}ms` },
+                    { header: 'Latency', accessor: (item) => item.latency_ms == null ? '—' : `${item.latency_ms}ms` },
                     { header: 'Updated', accessor: (item) => new Date(item.updated_at).toLocaleTimeString() },
                   ]}
                   maxHeight="400px"
@@ -345,7 +345,7 @@ function App() {
 
       case 'settings':
         return (
-          <div className="max-w-2xl">
+          <div className="max-w-4xl">
             <h2 className="text-xs uppercase tracking-wider text-muted font-bold mb-4">Integrations</h2>
             <div className="card p-6 space-y-6">
               <div className="flex items-center justify-between">
@@ -386,6 +386,8 @@ function App() {
                   </Button>
                 </div>
               </div>
+
+              <OperationsPanel />
 
               <div className="pt-6 border-t border-border">
                 <h3 className="text-sm uppercase tracking-widest text-muted font-bold mb-4">Environment Status</h3>
@@ -446,6 +448,70 @@ function App() {
 }
 
 export default App;
+
+function OperationsPanel() {
+  const queryClient = useQueryClient();
+  const { data: burnRate } = useQuery({
+    queryKey: ['burn-rate'], queryFn: musicstreamService.getBurnRate, refetchInterval: 5000,
+  });
+  const { data: jobs } = useQuery({
+    queryKey: ['jobs'], queryFn: musicstreamService.getJobs, refetchInterval: 3000,
+  });
+  const action = useMutation({
+    mutationFn: ({ run }: { run: () => Promise<unknown> }) => run(),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['jobs'] }),
+  });
+  const operations: { label: string; run: () => Promise<unknown>; confirm?: string }[] = [
+    { label: 'Sync', run: musicstreamService.sync },
+    { label: 'Full backfill', run: musicstreamService.fullBackfill, confirm: 'Run the full Spotify backfill? This can take a long time.' },
+    { label: 'Saved albums', run: musicstreamService.savedAlbumsSync },
+    { label: 'Followed artists', run: musicstreamService.followedArtistsSync },
+    { label: 'Liked artists', run: musicstreamService.likedArtistsExpand },
+    { label: 'Integrity', run: musicstreamService.runIntegrityCheck, confirm: 'Run a full integrity scan in the background?' },
+    { label: 'Backup', run: musicstreamService.backup },
+    { label: 'Requeue stale', run: musicstreamService.requeueStale, confirm: 'Requeue stale downloading tracks?' },
+    { label: 'Reset failed', run: musicstreamService.resetFailed, confirm: 'Reset all failed tracks to pending?' },
+    { label: 'Upgrade pass', run: musicstreamService.upgradePass, confirm: 'Requeue eligible downloads for the quality upgrade pass?' },
+    { label: 'Discover weekly', run: musicstreamService.discoverWeekly },
+    { label: 'Validate metadata', run: musicstreamService.validateInvalidTracks },
+    { label: 'Inspect orphans', run: musicstreamService.cleanupOrphansDryRun },
+    { label: 'Inspect invalid', run: musicstreamService.cleanupInvalidTracksDryRun },
+  ];
+  const run = (operation: typeof operations[number]) => {
+    if (!operation.confirm || confirm(operation.confirm)) action.mutate(operation);
+  };
+
+  return (
+    <div className="pt-6 border-t border-border space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h3 className="text-sm uppercase tracking-widest text-muted font-bold">Operations</h3>
+          <p className="text-xs text-secondary mt-1">
+            {burnRate ? `${burnRate.rate_per_hour_recent}/hr recent · ${burnRate.rate_per_hour_24h_avg}/hr (24h) · ETA ${burnRate.eta_days_at_24h_rate ?? '—'} days` : 'Loading live burn rate…'}
+          </p>
+        </div>
+        {action.error && <span className="text-xs text-error">{action.error.message}</span>}
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {operations.map((operation) => (
+          <Button key={operation.label} variant="ghost" size="sm" onClick={() => run(operation)} isLoading={action.isPending}>
+            {operation.label}
+          </Button>
+        ))}
+      </div>
+      <div className="space-y-1 text-xs">
+        {(jobs?.items ?? []).slice(0, 8).map((job: BackgroundJob) => (
+          <div key={job.job_id} className="flex gap-2 border-t border-border/50 pt-1">
+            <span className="font-mono text-muted">{job.kind}</span>
+            <span className={job.status === 'failed' ? 'text-error' : 'text-secondary'}>{job.status}</span>
+            {job.error && <span className="text-error truncate">{job.error}</span>}
+          </div>
+        ))}
+        {!jobs?.items.length && <span className="text-muted">No manual jobs yet.</span>}
+      </div>
+    </div>
+  );
+}
 
 
 // ── §W3 T24/T25: Library browse/search ───────────────────────────────────────

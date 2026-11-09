@@ -25,7 +25,7 @@ from yt_dlp import YoutubeDL
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
 # Mock optional integrations before importing downloader.
-for _mod in ("spotipy", "spotipy.oauth2", "ytmusicapi", "spotdl"):
+for _mod in ("ytmusicapi", "spotdl"):
     sys.modules.setdefault(_mod, MagicMock())
 
 from src.models import Base, DownloadAttempt, Track, TrackStatus  # noqa: E402
@@ -324,9 +324,9 @@ class TestDownloadTrackIsolation:
         ).filter(DownloadAttempt.method != "pipeline_pass").all()]
         assert methods == [
             "tier2_ytdlp_ytm",
-            "tier5_ytdlp_soundcloud",
             "tier3_spotdl",
             "tier4_ytdlp_youtube",
+            "tier5_ytdlp_soundcloud",
         ]
 
     def test_bot_challenge_skips_later_youtube_backends_but_tries_soundcloud(self, session):

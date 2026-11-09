@@ -13,7 +13,6 @@ def pipeline_factory(monkeypatch: pytest.MonkeyPatch) -> Mock:
     orchestrator = Mock()
     orchestrator.download_pending_librespot.return_value = (0, 0)
     orchestrator.download_pending.return_value = (1, 0)
-    orchestrator.download_pending_spotdl.return_value = (0, 0)
     factory = Mock(return_value=orchestrator)
     monkeypatch.setattr("src.ingestion.downloader.DownloadOrchestrator", factory)
     monkeypatch.setattr("src.db.get_session", nullcontext)

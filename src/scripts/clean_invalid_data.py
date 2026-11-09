@@ -21,15 +21,17 @@ from sqlalchemy import or_
 
 
 def check_spotify_exists(spotify_id: str) -> bool:
-    """Check if a track exists on Spotify using spotipy (no credentials needed for public tracks)."""
+    """Check Spotify using only credentials supplied by the environment."""
     try:
         import spotipy
         from spotipy.oauth2 import SpotifyClientCredentials
-        
-        # Use public Spotify API (no credentials needed for metadata checks)
+        client_id = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
+        client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "").strip()
+        if not client_id or not client_secret:
+            raise RuntimeError("SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET are required")
         client_credentials_manager = SpotifyClientCredentials(
-            client_id="533aed5f09534e1db562d4955a337e82",
-            client_secret="020818b2458442aabea677356176ab54"
+            client_id=client_id,
+            client_secret=client_secret,
         )
         sp = spotipy.Spotify(client_credentials_manager=client_credentials_manager)
         

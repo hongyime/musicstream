@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh Musicstream YouTube cookies from local Chrome CDP
+Requires=musicstream-youtube-chrome.service
+After=musicstream-youtube-chrome.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Projects/musicstream
+Environment=YOUTUBE_CDP_URL=http://127.0.0.1:9224
+Environment=YOUTUBE_COOKIE_FILE=%h/Projects/musicstream/cookies.txt
+UMask=0077
+ExecStart=%h/.local/bin/uv run --with-requirements requirements.txt python -m src.scripts.sync_youtube_cookies
