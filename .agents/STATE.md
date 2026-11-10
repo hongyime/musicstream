@@ -1,4 +1,8 @@
 # STATE
+## Current task - 3410 memory-incident project hardening (2026-11-10)
+- Audit: CDP 9224 has one required YouTube page and no accumulated tabs; Chrome currently uses 1.80 GiB RSS across 15 processes under its new 2 GiB systemd cap. Its two extension service workers are unnecessary for cookie export. Compose and live Docker limits already agree: daemon 2 GiB, Postgres 1 GiB, PO-token provider 256 MiB. Daemon is 1.14 GiB/2 GiB with one 56 MiB ffmpeg child while `MAX_CONCURRENT_WORKERS=6`; 11 GiB of the 12 GiB project directory is 14-day-retained SQL dumps, while `temp/` is only 244 KiB.
+- Done: checked-in Chrome unit now preserves the 2 GiB/on-failure/30-second/3-per-300-second policy and disables extensions after the next normal recycle; cookie sync retries after 30 seconds of a CDP outage. Local production `.env` now sets two workers and two YouTube operations (takes effect on the next normal daemon restart; no container recreated). `docker compose config --quiet`, `systemd-analyze --user verify`, focused cookie/downloader tests (3 passed), dry-run CDP export (42 cookies), and diff checks pass.
+
 ## Current task - full red-flag repair batch (2026-11-09)
 - Began implementation from the approved repair plan. Existing recovery-hardening worktree changes are intentionally untouched.
 - Scope mapped: downloader tier ordering and obsolete spotdl sweep; admin validation/cleanup, live artwork and WS telemetry; tracked integrity/backup jobs; dashboard controls; Windows batch routes; credential script and obsolete test cleanup.

@@ -149,7 +149,9 @@ systemctl --user list-timers musicstream-youtube-cookie-sync.timer
 
 The browser must remain signed in to YouTube Premium. CDP exports the current session;
 it cannot complete a future Google login or 2FA prompt. Never expose the CDP port beyond
-loopback or copy `cookies.txt` into chat.
+loopback or copy `cookies.txt` into chat. The browser disables extensions because cookie
+export needs only the YouTube tab; the sync service retries a failed export after 30 seconds,
+so the daily 04:00 SGT browser recycle keeps the last known-good cookie snapshot until CDP is back.
 
 ### Worker concurrency ramp
 
