@@ -1,4 +1,9 @@
 # STATE
+## MusicBrainz 503 enrichment backfill (2026-11-11)
+- Reconstructed 424 unique failed tagger lookups from `logs/musicstream.log` (SGT `2026-11-10 09:41:02` through `2026-11-11 08:40:08`). All 424 were already downloaded with files and Spotify cover art; 423 initially lacked both MB IDs.
+- Added `src.scripts.backfill_musicbrainz` for explicit IDs only. It uses the existing MusicBrainz limiters, adds one second between calls to leave daemon headroom, writes only missing `mb_recording_id`/`mb_release_id`, and stops on a circuit-open state. It handles malformed ISRCs by using its existing title/artist lookup only in the isolated tool.
+- Applied two paced passes without restarting the daemon: 291 new recording IDs were recovered (292/424 total now have one); 282 have release IDs. 132 tracks have no MusicBrainz text-search match and 10 matched recordings have no release in the returned data. No audio/status/file path/tag mutation occurred; daemon remains healthy, 0 restarts/OOMs.
+
 ## Spotify source + MusicBrainz rate-limit repair (2026-11-11)
 - With user confirmation, removed only source `2315` (`drivin`, Spotify playlist `0LB9noJnY9495cZ9CsT6Us`) after authenticated API and public Spotify URLs both returned 404. The 49 `track_sources` links cascaded; tracks and media were not targets of the deletion.
 - Root cause of MusicBrainz 503s: the intended shared adaptive limiter was called through `observe_call()` in non-enforcing mode. Added opt-in enforcement and applied it to all four MusicBrainz paths (three tagger lookups plus ListenBrainz discovery), preserving every other provider's existing behaviour. The 1 req/s, one-in-flight MusicBrainz limit now serializes requests across workers.
