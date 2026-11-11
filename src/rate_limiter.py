@@ -772,9 +772,16 @@ class AdaptiveProviderLimiter:
             permit._finished = True
             self._condition.notify_all()
 
-    def observe_call(self, provider: str, callback: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """Observe a non-enforced provider call and capture HTTP/exception outcome."""
-        permit = self.acquire(provider, enforce=False)
+    def observe_call(
+        self,
+        provider: str,
+        callback: Callable[..., Any],
+        *args: Any,
+        enforce: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        """Call a provider while recording its outcome, optionally enforcing its limits."""
+        permit = self.acquire(provider, enforce=enforce)
         assert permit is not None
         try:
             result = callback(*args, **kwargs)

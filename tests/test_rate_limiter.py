@@ -149,6 +149,18 @@ class TestAdaptiveProviderLimiter:
         assert limiter.snapshot()["enabled"] is False
         assert limiter.snapshot()["mode"] == "shadow"
 
+    def test_observe_call_can_enforce_a_specific_provider(self, monkeypatch):
+        self._clear_youtube_env(monkeypatch)
+        limiter = AdaptiveProviderLimiter(
+            enabled=True,
+            provider_configs={"musicbrainz": ProviderLimitConfig(0, 0, 1)},
+        )
+
+        with patch.object(limiter, "acquire", wraps=limiter.acquire) as acquire:
+            assert limiter.observe_call("musicbrainz", lambda: "ok", enforce=True) == "ok"
+
+        assert acquire.call_args.kwargs["enforce"] is True
+
     def test_youtube_challenge_is_a_throttle_signal_not_content_miss(self):
         from src.ingestion.downloader import DownloadOrchestrator
 

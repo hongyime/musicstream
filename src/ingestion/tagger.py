@@ -588,7 +588,7 @@ class MetadataTagger:
         try:
             resp = self._provider_limiter.observe_call(
                 "musicbrainz", self._mb_session.get,
-                url, params={"inc": "releases", "fmt": "json"}, timeout=10,
+                url, params={"inc": "releases", "fmt": "json"}, timeout=10, enforce=True,
             )
         except requests.RequestException as exc:
             raise MusicBrainzError(f"ISRC lookup network error: {exc}") from exc
@@ -617,7 +617,7 @@ class MetadataTagger:
             resp = self._provider_limiter.observe_call(
                 "musicbrainz", self._mb_session.get,
                 url,
-                params={"inc": "releases artists", "fmt": "json"},
+                params={"inc": "releases artists", "fmt": "json"}, enforce=True,
                 timeout=10,
             )
         except requests.RequestException as exc:
@@ -639,7 +639,7 @@ class MetadataTagger:
             resp = self._provider_limiter.observe_call(
                 "musicbrainz", self._mb_session.get,
                 url,
-                params={"query": query, "limit": 1, "fmt": "json"},
+                params={"query": query, "limit": 1, "fmt": "json"}, enforce=True,
                 timeout=10,
             )
         except requests.RequestException as exc:

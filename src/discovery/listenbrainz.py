@@ -226,7 +226,7 @@ class ListenBrainzDiscovery:
             resp = self._provider_limiter.observe_call(
                 "musicbrainz", self._mb_session.get,
                 url,
-                params={"inc": "releases artists", "fmt": "json"},
+                params={"inc": "releases artists", "fmt": "json"}, enforce=True,
                 timeout=15,
             )
         except requests.RequestException as exc:
