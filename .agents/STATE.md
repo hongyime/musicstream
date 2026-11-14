@@ -1,4 +1,16 @@
 # STATE
+## Current task - security and reliability hardening batch (2026-11-14)
+- Verified all audit items: SPA containment guard, valid-ISRC regex and test, collision-safe MP3 transcode selection, one-per-playlist normalized discovery lookup, manual-job snapshot, cleanup-script import root, UTC export week, idle WebSocket skip, UI protocol use, dead throttle removal, and schema index/BigInteger migration `0012`.
+- Added script execute permissions on `scripts/dev-watch.py` and `scripts/migrate_downloads_to_music.py`.
+- Verified full test suite: `423 passed, 6 skipped, 1 warning, 9 subtests passed in 10.90s`. Alembic offline SQL generation verified clean.
+- Ready to push to main per user request.
+
+## Download path repair on seagatefatgreenNADD1400music (2026-11-11)
+- Root cause: On 2026-11-07, `EXTERNAL_MEDIA_DRIVE` in `.env` was configured as `/media/seagatefatgreenNADD1400music` instead of `/media/seagatefatgreenNADD1400music/music`. Because `docker-compose.yml` mounts `${EXTERNAL_MEDIA_DRIVE}:/media` and the organiser places files under `${MEDIA_DIR}/{Artist}/...`, all new downloads from Nov 8-11 were written directly to the root of the external drive (`/media/seagatefatgreenNADD1400music/{Artist}/...`) rather than the intended `music` directory (`M:\music`).
+- Safe migration: Gracefully stopped `musicstream-daemon`. Copied `.musicstream-ready` into `/media/seagatefatgreenNADD1400music/music/`. Ran `scripts/migrate_downloads_to_music.py` which safely moved all 14,245 files across 632 artist directories into `/media/seagatefatgreenNADD1400music/music/`: 225 artist directories were renamed directly; 407 were merged; 634 identical files were deduplicated; 2,758 older/differing versions in `music/` were quarantined as `<file>.orphan-<timestamp>` per project convention. The drive root is now clean (0 rogue files/artist dirs remaining). Added CLI options `--root`/`--target` and unit test suite `tests/test_migrate_downloads.py`.
+- Configuration & Recreate: Updated `.env` to `EXTERNAL_MEDIA_DRIVE=/media/seagatefatgreenNADD1400music/music`. Recreated only `musicstream-daemon` (`docker compose up -d --force-recreate daemon`); Postgres and the PO-token provider remained untouched and healthy.
+- Verification: `/health` (200) and `/health/deep` (200, `media_ready: true`, no degraded reasons) pass. Container inspect confirms `/media/seagatefatgreenNADD1400music/music -> /media`. Live downloads verified in real-time: track 703183 ('Army Of Two' by UMEK), 52802 ('Hallelujah' by Pentatonix), and others confirmed on host disk at `/media/seagatefatgreenNADD1400music/music/Various Artists/...` with 0 rogue files in root. Full test suite: 415 passed, 5 skipped, 9 subtests passed.
+
 ## MusicBrainz 503 enrichment backfill (2026-11-11)
 - Reconstructed 424 unique failed tagger lookups from `logs/musicstream.log` (SGT `2026-11-10 09:41:02` through `2026-11-11 08:40:08`). All 424 were already downloaded with files and Spotify cover art; 423 initially lacked both MB IDs.
 - Added `src.scripts.backfill_musicbrainz` for explicit IDs only. It uses the existing MusicBrainz limiters, adds one second between calls to leave daemon headroom, writes only missing `mb_recording_id`/`mb_release_id`, and stops on a circuit-open state. It handles malformed ISRCs by using its existing title/artist lookup only in the isolated tool.

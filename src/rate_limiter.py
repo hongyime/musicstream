@@ -9,7 +9,6 @@ Services covered (PRD §11):
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import random
@@ -32,24 +31,6 @@ class ServiceRateConfig:
     base: float       # Base backoff in seconds
     max: float        # Maximum backoff cap in seconds
     concurrent: int   # Maximum concurrent requests allowed
-
-
-# ── Throttle config (immutable, per service) ──────────────────────────────────
-
-@dataclass(frozen=True)
-class ThrottleConfig:
-    """Floor/ceiling for AIMD inter-call spacing with randomised jitter."""
-    floor: float          # minimum gap between calls (seconds)
-    ceiling: float        # maximum gap after AIMD backoff
-    jitter: float = 0.5   # upper-bound multiplier: actual gap ∈ [floor, floor × (1+jitter)]
-
-
-# ── Throttle state (mutable, per service) ─────────────────────────────────────
-
-@dataclass
-class _ThrottleState:
-    min_gap: float
-    last_call: float = 0.0   # monotonic timestamp of last reserved slot
 
 
 # ── Circuit-breaker state (mutable, per service) ───────────────────────────────
@@ -258,157 +239,6 @@ class ServiceRateLimiter:
         raw = cfg.base * (2 ** attempt)
         capped = min(raw, cfg.max)
         return capped + self._jitter(capped)
-
-
-# ── AIMD per-service throttle ─────────────────────────────────────────────────
-
-class ServiceThrottle:
-    """
-    Proactive inter-call spacing per service, shared across all worker threads.
-
-    Enforces a minimum gap between consecutive calls to the same service using
-    AIMD: 429/rate-limit → gap × 2 (up to ceiling); success → gap × 0.9 (down
-    to floor).  Slot reservation is atomic — workers queue at exactly min_gap
-    intervals rather than all firing simultaneously.
-
-    wait() returns False when the computed wait exceeds SKIP_THRESHOLD,
-    signalling the caller to skip the tier this pass and retry next run.
-    """
-
-    CONFIGS: Dict[str, ThrottleConfig] = {
-        "youtube":    ThrottleConfig(floor=4.5, ceiling=60.0),   # random(4.5, 6.75)
-        "soundcloud": ThrottleConfig(floor=1.5, ceiling=30.0),   # random(1.5, 2.25)
-        "spotdl":     ThrottleConfig(floor=4.5, ceiling=60.0),   # random(4.5, 6.75)
-        "spotiflac":   ThrottleConfig(floor=5.0, ceiling=60.0),   # random(5.0, 7.5)
-    }
-
-    SKIP_THRESHOLD: float = 30.0  # seconds; skip tier rather than block longer
-
-    # Persistence: where to snapshot the current min_gap per service so an
-    # AIMD backoff state survives daemon restarts. Without this, every
-    # restart drops back to the floor, hammering remote services straight
-    # into rate-limit responses again. (audit #13)
-    _PERSIST_PATH: str = os.environ.get(
-        "THROTTLE_STATE_PATH", "/app/data/throttle_state.json"
-    )
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._state: Dict[str, _ThrottleState] = {
-            svc: _ThrottleState(min_gap=cfg.floor)
-            for svc, cfg in self.CONFIGS.items()
-        }
-        self._restore()
-
-    def _restore(self) -> None:
-        """Best-effort load of last-known min_gap values from disk."""
-        try:
-            if not os.path.exists(self._PERSIST_PATH):
-                return
-            with open(self._PERSIST_PATH, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            for svc, payload in data.items():
-                if svc not in self._state:
-                    continue
-                gap = float(payload.get("min_gap", self.CONFIGS[svc].floor))
-                # Clamp to configured floor/ceiling in case the persisted file
-                # was written under a different config.
-                gap = max(self.CONFIGS[svc].floor, min(self.CONFIGS[svc].ceiling, gap))
-                self._state[svc].min_gap = gap
-            logger.info(
-                "Throttle: restored min_gap state from %s (%d services)",
-                self._PERSIST_PATH, len(data),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Throttle: failed to restore state from %s: %s",
-                           self._PERSIST_PATH, exc)
-
-    def _persist(self) -> None:
-        """Best-effort write of current min_gap values to disk.
-
-        Uses atomic-rename so a SIGKILL mid-write can't corrupt the file.
-        Caller MUST hold self._lock.
-        """
-        try:
-            os.makedirs(os.path.dirname(self._PERSIST_PATH) or ".", exist_ok=True)
-            payload = {
-                svc: {"min_gap": state.min_gap}
-                for svc, state in self._state.items()
-            }
-            tmp = f"{self._PERSIST_PATH}.tmp.{os.getpid()}"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, indent=2)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, self._PERSIST_PATH)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Throttle: persist failed (non-fatal): %s", exc)
-
-    def wait(self, service: str) -> bool:
-        """
-        Block until the inter-call gap for *service* is satisfied.
-
-        Atomically reserves a call slot so concurrent workers queue at
-        min_gap intervals.
-
-        Returns:
-            True  — slot reserved, caller should proceed.
-            False — computed wait > SKIP_THRESHOLD; caller should skip this tier.
-        """
-        with self._lock:
-            now = time.monotonic()
-            state = self._state[service]
-            cfg = self.CONFIGS[service]
-            # Randomise within [min_gap, min_gap × (1 + jitter)], capped at ceiling.
-            high = min(cfg.ceiling, state.min_gap * (1.0 + cfg.jitter))
-            actual_gap = random.uniform(state.min_gap, high)
-            elapsed = now - state.last_call
-            wait_time = max(0.0, actual_gap - elapsed)
-
-            if wait_time > self.SKIP_THRESHOLD:
-                logger.debug(
-                    "Throttle skip: service=%s wait=%.1fs exceeds %.1fs threshold",
-                    service, wait_time, self.SKIP_THRESHOLD,
-                )
-                return False
-
-            # Reserve with the randomised gap — next worker queues after this slot.
-            state.last_call = max(now, state.last_call) + actual_gap
-
-        if wait_time > 0:
-            logger.debug("Throttle wait: service=%s %.1fs (gap=%.1f–%.1f)", service, wait_time, state.min_gap, high)
-            time.sleep(wait_time)
-        return True
-
-    def on_success(self, service: str) -> None:
-        """Decay min_gap 10% toward floor on each success (additive decrease)."""
-        with self._lock:
-            state = self._state[service]
-            floor = self.CONFIGS[service].floor
-            state.min_gap = max(floor, state.min_gap * 0.9)
-
-    def on_rate_limit(self, service: str) -> None:
-        """Double min_gap up to ceiling on rate-limit signal (multiplicative increase)."""
-        with self._lock:
-            state = self._state[service]
-            ceiling = self.CONFIGS[service].ceiling
-            old = state.min_gap
-            state.min_gap = min(ceiling, state.min_gap * 2.0)
-            logger.warning(
-                "Throttle backoff: service=%s %.1fs → %.1fs",
-                service, old, state.min_gap,
-            )
-            # Persist on backoff only — successes are common (would be a hot
-            # path), backoffs are rare and important to survive restarts.
-            self._persist()
-
-    def status(self) -> Dict[str, Dict[str, float]]:
-        """Current throttle gaps for all services (monitoring/debug)."""
-        with self._lock:
-            return {
-                svc: {"min_gap": state.min_gap, "floor": self.CONFIGS[svc].floor}
-                for svc, state in self._state.items()
-            }
 
 
 # ── Adaptive provider limiter and rolling metrics ────────────────────────────

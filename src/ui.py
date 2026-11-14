@@ -83,7 +83,7 @@ def print_summary(stats: dict[str, int]) -> None:
     console.print(table)
 
 
-def print_sources_table(sources: Sequence[Any]) -> None:
+def print_sources_table(sources: Sequence[_SourceLike]) -> None:
     """Print sources as a rich Table with columns: Name, Type, Last Scraped.
 
     Format datetime as 'YYYY-MM-DD HH:MM' or 'never' if None.

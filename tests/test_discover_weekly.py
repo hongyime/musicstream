@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import pytest
 
-from src.discovery import discover_weekly as dw
 from src.discovery.discover_weekly import DiscoverWeekly
 from src.models import LbRecommendation, Track
 from tests.conftest import _make_track
@@ -136,6 +135,14 @@ def test_run_resolves_queues_and_exports(session, tmp_path, monkeypatch, seeded)
         "/playlist/aaaa1111": {"playlist": JSPF},
     })
     dwe = DiscoverWeekly(username="qa_user", http_session=http)
+    lookup_calls = []
+    build_lookup = DiscoverWeekly._downloaded_lookup
+
+    def record_lookup(active_session):
+        lookup_calls.append(active_session)
+        return build_lookup(active_session)
+
+    monkeypatch.setattr(DiscoverWeekly, "_downloaded_lookup", staticmethod(record_lookup))
 
     summary = dwe.run(session)
 
@@ -143,6 +150,7 @@ def test_run_resolves_queues_and_exports(session, tmp_path, monkeypatch, seeded)
     assert pl["entries"] == 3
     assert pl["resolved_local"] == 2          # exact MBID hit + fuzzy hit
     assert pl["queued_missing"] == 1          # synthetic track created
+    assert lookup_calls == [session]
 
     # Synthetic track follows repo convention: uri `mb:{mbid}`, pending, MBID set
     synth = (
@@ -176,11 +184,20 @@ def test_fuzzy_match_requires_duration_within_5s(session, seeded):
     assert miss is None
 
 
+def test_fuzzy_match_uses_prebuilt_lookup(session, seeded, monkeypatch):
+    dwe = DiscoverWeekly(username="qa_user")
+    lookup = dwe._downloaded_lookup(session)
+    monkeypatch.setattr(dwe, "_downloaded_lookup", lambda _session: pytest.fail("unexpected lookup rebuild"))
+
+    hit = dwe._fuzzy_match(session, "Known MBID Hit", "Alpha", 201_000, lookup)
+
+    assert hit is not None and hit.id == seeded.id
+
+
 def test_blocked_tracks_never_resolve(session, seeded):
     seeded.blocked = True
     session.flush()
 
-    hit = session.query(Track).filter(Track.id == seeded.id).first()
     dwe = DiscoverWeekly(username="qa_user")
     resolved = dwe._resolve_local(
         session,

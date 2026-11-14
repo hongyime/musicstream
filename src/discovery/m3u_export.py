@@ -93,7 +93,7 @@ def export_weekly_discovery(session, export_dir: Optional[str] = None) -> Option
     """
     from src.models import LbRecommendation, Track, TrackStatus
 
-    now = dt.now()
+    now = dt.now(timezone.utc)
     iso_year, week, _ = now.isocalendar()
     week_start = dt.fromisocalendar(iso_year, week, 1).replace(tzinfo=timezone.utc)
     week_end = week_start + timedelta(days=7)

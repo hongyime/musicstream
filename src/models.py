@@ -14,6 +14,7 @@ from typing import List, Optional
 
 from sqlalchemy import (
     Boolean,
+    BigInteger,
     Column,
     DateTime,
     Float,
@@ -147,8 +148,8 @@ class Track(Base):
 
     # File info
     format:          Mapped[Optional[str]] = mapped_column(String, nullable=True)   # 'flac' | 'mp3'
-    file_path:       Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    file_size_bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    file_path:       Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    file_size_bytes: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     file_sha256:     Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     # Wave 3 blocklist (SPEC §W3 T12, invariant V7): blocked tracks are inert —

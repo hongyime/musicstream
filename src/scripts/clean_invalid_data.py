@@ -11,9 +11,10 @@ This script:
 
 import os
 import sys
+from pathlib import Path
 
 # Add parent directory to path so we can import src modules
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.db import get_session
 from src.models import Track

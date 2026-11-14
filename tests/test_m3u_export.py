@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from src.core import config
 from tests.conftest import _make_source, _make_track
 
@@ -40,7 +38,7 @@ def test_export_writes_extm3u_with_entries(tmp_path, session):
     assert out is not None and out.exists()
     lines = out.read_text(encoding="utf-8").splitlines()
     assert lines[0] == "#EXTM3U"
-    extinf = [l for l in lines if l.startswith("#EXTINF")]
+    extinf = [line for line in lines if line.startswith("#EXTINF")]
     assert len(extinf) == 2
     assert "Artist A - Song A" in extinf[0]
     assert "210" in extinf[1]  # duration seconds
@@ -72,7 +70,7 @@ def test_backfill_exports_every_source_excluding_blocked(tmp_path, session):
         session, "spotify:track:m3u4", "Drop Me", "B",
         str(tmp_path / "drop.mp3"), blocked=True,
     )
-    empty_src = _make_source(session, "pl_w3_b", name="Empty Playlist")
+    _make_source(session, "pl_w3_b", name="Empty Playlist")
     src.tracks.extend([good, blocked])
     session.flush()
 
@@ -129,7 +127,8 @@ def test_weekly_export_uses_iso_year_at_new_year_boundary(tmp_path, session, mon
 
     class BoundaryDateTime:
         @staticmethod
-        def now():
+        def now(tz=None):
+            assert tz is __import__("datetime").timezone.utc
             return datetime(2021, 1, 1)
 
         @staticmethod

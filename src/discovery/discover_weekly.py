@@ -17,14 +17,12 @@ import logging
 import os
 import re
 import unicodedata
-from datetime import datetime, timezone
 from typing import Optional
 
 import requests
 from sqlalchemy.orm import Session
 
-from src.core import config
-from src.models import LbRecommendation, Track, TrackStatus
+from src.models import Track, TrackStatus
 from src.rate_limiter import ServiceRateLimiter, get_adaptive_provider_limiter
 
 logger = logging.getLogger(__name__)
@@ -139,6 +137,7 @@ class DiscoverWeekly:
         resolved_members = []   # (track, entry) already on disk
         queued_missing = 0
         unresolved_failures = 0
+        downloaded_lookup = self._downloaded_lookup(session)
 
         from src.discovery.listenbrainz import ListenBrainzDiscovery
         ingester = ListenBrainzDiscovery()
@@ -146,7 +145,7 @@ class DiscoverWeekly:
         for entry in tracks:
             mbid, etitle, eartist, edur = self._parse_track(entry)
 
-            local = self._resolve_local(session, mbid, etitle, eartist, edur)
+            local = self._resolve_local(session, mbid, etitle, eartist, edur, downloaded_lookup)
 
             if local is not None:
                 resolved_members.append((local, entry))
@@ -204,7 +203,13 @@ class DiscoverWeekly:
     # ── Resolution ────────────────────────────────────────────────────────────
 
     def _resolve_local(
-        self, session: Session, mbid: str, title: str, artist: str, duration_ms: Optional[int]
+        self,
+        session: Session,
+        mbid: str,
+        title: str,
+        artist: str,
+        duration_ms: Optional[int],
+        downloaded_lookup: Optional[dict[tuple[str, str], list[Track]]] = None,
     ) -> Optional[Track]:
         """Download-ready local hit? MBID exact first, then fuzzy ±5s (V7: skip blocked)."""
         if mbid:
@@ -221,29 +226,40 @@ class DiscoverWeekly:
             if t is not None:
                 return t
 
-        return self._fuzzy_match(session, title, artist, duration_ms)
+        return self._fuzzy_match(session, title, artist, duration_ms, downloaded_lookup)
+
+    @staticmethod
+    def _downloaded_lookup(session: Session) -> dict[tuple[str, str], list[Track]]:
+        """Index normalized local metadata once for weekly-playlist matching."""
+        lookup: dict[tuple[str, str], list[Track]] = {}
+        tracks = session.query(Track).filter(
+            Track.status == TrackStatus.DOWNLOADED.value,
+            Track.file_path.isnot(None),
+            Track.blocked.is_(False),
+        ).yield_per(500)
+        for track in tracks:
+            lookup.setdefault((_norm(track.title), _norm(track.artist)), []).append(track)
+        return lookup
 
     def _fuzzy_match(
-        self, session: Session, title: str, artist: str, duration_ms: Optional[int]
+        self,
+        session: Session,
+        title: str,
+        artist: str,
+        duration_ms: Optional[int],
+        downloaded_lookup: Optional[dict[tuple[str, str], list[Track]]] = None,
     ) -> Optional[Track]:
         if not title or not artist:
             return None
 
-        candidates = (
-            session.query(Track)
-            .filter(
-                Track.status == TrackStatus.DOWNLOADED.value,
-                Track.file_path.isnot(None),
-                Track.blocked.is_(False),
-            )
-            .yield_per(500)
-        )
         n_title = _norm(title)
         n_artist = _norm(artist)
+        if not n_title or not n_artist:
+            return None
+        if downloaded_lookup is None:
+            downloaded_lookup = self._downloaded_lookup(session)
 
-        for t in candidates:
-            if _norm(t.title) != n_title or _norm(t.artist) != n_artist:
-                continue
+        for t in downloaded_lookup.get((n_title, n_artist), []):
             if duration_ms and t.duration_ms:
                 if abs(t.duration_ms - duration_ms) > DURATION_TOLERANCE_MS:
                     continue
@@ -270,7 +286,16 @@ class DiscoverWeekly:
         if not title or not artist:
             return None
         n_title, n_artist = _norm(title), _norm(artist)
-        for t in session.query(Track).yield_per(500):
+        if not n_title or not n_artist:
+            return None
+        title_token = max(n_title.split(), key=len)
+        artist_token = max(n_artist.split(), key=len)
+        candidates = session.query(Track).filter(
+            Track.blocked.is_(False),
+            Track.title.ilike(f"%{title_token}%"),
+            Track.artist.ilike(f"%{artist_token}%"),
+        ).yield_per(500)
+        for t in candidates:
             if t.blocked:
                 continue
             if _norm(t.title) == n_title and _norm(t.artist) == n_artist:

@@ -126,3 +126,26 @@ def test_ffmpeg_failure_returns_original(session, tmp_path, flac_track, monkeypa
 
     assert new_path == flac and new_fmt is None
     assert os.path.isfile(flac), "source must survive failed transcode"
+
+
+def test_transcode_uses_a_suffix_when_mp3_path_is_already_owned(session, tmp_path, flac_track, monkeypatch):
+    monkeypatch.setattr(config, "QUALITY_CUTOFF", "mp3_320")
+    t, _flac = flac_track
+    existing_path = tmp_path / "song.mp3"
+    existing_path.write_bytes(b"do not overwrite")
+    _make_track(
+        session,
+        "spotify:track:existing-mp3",
+        status="downloaded",
+        title="Existing MP3",
+        artist="Other Artist",
+        format="mp3",
+        file_path=str(existing_path),
+        download_method="ytdlp_ytm",
+    )
+
+    new_path, new_fmt = apply_quality_cutoff(t.file_path, t, session)
+
+    assert new_fmt == "mp3"
+    assert new_path == str(tmp_path / "song (2).mp3")
+    assert existing_path.read_bytes() == b"do not overwrite"

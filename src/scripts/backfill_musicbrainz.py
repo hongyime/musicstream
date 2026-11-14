@@ -22,7 +22,7 @@ from src.ingestion.tagger import MetadataTagger
 from src.models import Track
 
 logger = logging.getLogger(__name__)
-_ISRC_RE = re.compile(r"[A-Z]{2}[A-Z0-9]{3}\\d{7}", re.IGNORECASE)
+_ISRC_RE = re.compile(r"[A-Z]{2}[A-Z0-9]{3}\d{7}", re.IGNORECASE)
 
 
 def enrich_track(tagger: MetadataTagger, track: Track, *, apply: bool) -> str:

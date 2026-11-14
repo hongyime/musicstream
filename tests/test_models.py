@@ -25,7 +25,6 @@ from src.models import (
     SourceType,
     Track,
     TrackStatus,
-    track_sources,
 )
 
 
@@ -116,6 +115,29 @@ class TestTrackModel:
         }
         missing = required - cols
         assert not missing, f"Missing columns: {missing}"
+
+    def test_file_path_is_indexed(self, engine):
+        indexes = inspect(engine).get_indexes("tracks")
+        assert any(index["column_names"] == ["file_path"] for index in indexes)
+
+    def test_file_size_uses_bigint(self):
+        from sqlalchemy import BigInteger
+
+        assert isinstance(Track.__table__.c.file_size_bytes.type, BigInteger)
+
+    def test_transcode_collision_resolver_checks_disk_and_database(self, session, tmp_path):
+        from types import SimpleNamespace
+
+        from src.services.transcode import _resolve_mp3_collision
+
+        base = tmp_path / "song.mp3"
+        base.write_bytes(b"existing file")
+        database_path = tmp_path / "song (2).mp3"
+        _make_track(session, spotify_uri="spotify:track:mp3-collision", file_path=str(database_path))
+
+        path = _resolve_mp3_collision(str(tmp_path / "song.flac"), SimpleNamespace(id=-1), session)
+
+        assert path == str(tmp_path / "song (3).mp3")
 
     def test_spotify_uri_is_unique(self, session):
         uri = "spotify:track:unique_test_001"

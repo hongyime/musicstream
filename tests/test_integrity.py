@@ -14,7 +14,6 @@ import hashlib
 import os
 import sys
 import tempfile
-from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -165,7 +164,7 @@ class TestIntegrityCheckerRun:
         session.flush()
 
         checker = IntegrityChecker()
-        result = checker.run(session)
+        checker.run(session)
         # Pending track should not appear in total_checked
         # (we can't assert exact count due to other tests, but pending track
         #  should still be pending after the check)
@@ -197,3 +196,25 @@ class TestIntegrityCheckerRun:
         assert result.corrupt == 0
         sess.rollback()
         sess.close()
+
+    def test_commits_each_integrity_batch(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        session = sessionmaker(bind=engine, expire_on_commit=False)()
+        try:
+            for number in range(501):
+                _make_downloaded_track(
+                    session,
+                    f"spotify:track:batch{number}",
+                    f"/missing/batch-{number}.mp3",
+                    "deadbeef" * 8,
+                )
+            commits = []
+            original_commit = session.commit
+            session.commit = lambda: commits.append(True) or original_commit()
+
+            IntegrityChecker().run(session)
+
+            assert len(commits) == 2
+        finally:
+            session.close()

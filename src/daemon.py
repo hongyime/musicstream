@@ -599,12 +599,13 @@ def _health_snapshot_paths() -> tuple[Path, Path]:
 def _write_health_snapshot(payload: dict[str, Any]) -> None:
     snapshot_path, latest_path = _health_snapshot_paths()
     max_bytes = _int_env("HEALTH_SNAPSHOT_MAX_BYTES", 1024 * 1024, minimum=1024)
+    manual_jobs = list(_manual_jobs.values())
     snapshot = {
         **payload,
         "snapshot_at": _utc_iso(),
         "manual_jobs": {
-            "total": len(_manual_jobs),
-            "active": sum(1 for job in _manual_jobs.values() if job.get("status") in ("queued", "running")),
+            "total": len(manual_jobs),
+            "active": sum(1 for job in manual_jobs if job.get("status") in ("queued", "running")),
         },
     }
 
@@ -741,6 +742,9 @@ def _build_deep_health_payload() -> dict[str, Any]:
 
 async def _broadcast_health():
     while True:
+        if not manager.active_connections:
+            await asyncio.sleep(5)
+            continue
         try:
             health = await asyncio.to_thread(_health_services)
             await manager.broadcast(json.dumps(health))
@@ -1594,8 +1598,9 @@ if (static_path / "assets").exists():
 
 @app.get("/{full_path:path}")
 async def serve_spa(full_path: str):
-    file_path = static_path / full_path
-    if file_path.is_file():
+    static_root = static_path.resolve()
+    file_path = (static_path / full_path).resolve()
+    if file_path.is_relative_to(static_root) and file_path.is_file():
         return FileResponse(file_path)
     index_path = static_path / "index.html"
     if index_path.exists():

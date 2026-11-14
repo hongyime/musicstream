@@ -37,3 +37,21 @@ def test_enrich_track_falls_back_to_search_for_an_invalid_isrc():
     assert enrich_track(tagger, track, apply=True) == "enriched"
     assert track.mb_recording_id == "recording-id"
     assert track.mb_release_id == "release-id"
+
+
+def test_enrich_track_uses_musicbrainz_lookup_for_a_valid_isrc():
+    track = SimpleNamespace(
+        id=9,
+        isrc="USRC17607839",
+        mb_recording_id=None,
+        mb_release_id=None,
+    )
+    limiter = SimpleNamespace(is_healthy=lambda service: True, record_success=lambda service: None)
+    calls = []
+    tagger = SimpleNamespace(
+        _rl=limiter,
+        _fetch_musicbrainz=lambda value: calls.append(value) or MBData(recording_id="recording-id"),
+    )
+
+    assert enrich_track(tagger, track, apply=True) == "enriched"
+    assert calls == [track]

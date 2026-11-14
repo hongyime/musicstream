@@ -15,10 +15,29 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+from pathlib import Path
 
 from src.core import config
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_mp3_collision(file_path: str, track, session) -> str:
+    """Return an unclaimed MP3 path without overwriting another track's file."""
+    from src.models import Track
+
+    proposed = Path(file_path).with_suffix(".mp3")
+    stem, suffix, parent = proposed.stem, proposed.suffix, proposed.parent
+    candidate = proposed
+    counter = 2
+    while True:
+        query = session.query(Track.id).filter(Track.file_path == str(candidate))
+        if getattr(track, "id", None) is not None:
+            query = query.filter(Track.id != track.id)
+        if not candidate.exists() and query.first() is None:
+            return str(candidate)
+        candidate = parent / f"{stem} ({counter}){suffix}"
+        counter += 1
 
 
 def ffmpeg_available() -> bool:
@@ -46,11 +65,10 @@ def apply_quality_cutoff(file_path: str, track, session) -> tuple[str, str | Non
     if not file_path.lower().endswith(".flac"):
         return file_path, None
 
-    base, _ = os.path.splitext(file_path)
-    mp3_path = base + ".mp3"
+    mp3_path = _resolve_mp3_collision(file_path, track, session)
 
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-n",
         "-i", file_path,
         "-codec:a", "libmp3lame", "-b:a", "320k",
         "-map_metadata", "0",
@@ -73,12 +91,6 @@ def apply_quality_cutoff(file_path: str, track, session) -> tuple[str, str | Non
             getattr(proc, "returncode", -1), getattr(track, "id", -1),
             (proc.stderr or b"")[-200:],
         )
-        # Clean up a zero-byte/partial artifact if ffmpeg left one behind.
-        try:
-            if os.path.isfile(mp3_path):
-                os.remove(mp3_path)
-        except OSError:
-            pass
         return file_path, None
 
     # ── Success: repoint the track at the MP3 ────────────────────────────────

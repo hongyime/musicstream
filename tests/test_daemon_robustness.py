@@ -142,6 +142,43 @@ def test_write_health_snapshot_creates_timeline_and_latest(daemon_module, tmp_pa
     assert json.loads(latest.read_text(encoding="utf-8"))["snapshot_at"] == payload["snapshot_at"]
 
 
+@pytest.mark.asyncio
+async def test_spa_does_not_serve_paths_outside_static(daemon_module, tmp_path, monkeypatch):
+    static_dir = tmp_path / "static"
+    static_dir.mkdir()
+    index = static_dir / "index.html"
+    index.write_text("dashboard", encoding="utf-8")
+    secret = tmp_path / ".env"
+    secret.write_text("secret", encoding="utf-8")
+    monkeypatch.setattr(daemon_module, "static_path", static_dir)
+
+    response = await daemon_module.serve_spa("../.env")
+
+    assert response.path == index
+
+
+@pytest.mark.asyncio
+async def test_health_broadcast_skips_database_probe_without_connections(daemon_module, monkeypatch):
+    calls = []
+
+    async def fake_to_thread(func, *args):
+        calls.append(func)
+        return []
+
+    async def cancel_after_sleep(seconds):
+        assert seconds == 5
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(daemon_module.manager, "active_connections", [])
+    monkeypatch.setattr(daemon_module.asyncio, "to_thread", fake_to_thread)
+    monkeypatch.setattr(daemon_module.asyncio, "sleep", cancel_after_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await daemon_module._broadcast_health()
+
+    assert calls == []
+
+
 def test_build_deep_health_payload_degrades_on_stale_download_progress(daemon_module, monkeypatch):
     now = datetime.now(timezone.utc)
 

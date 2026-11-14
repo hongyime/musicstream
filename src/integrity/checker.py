@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 # Dedicated errors logger — matches the RotatingFileHandler configured in daemon.py
 errors_logger = logging.getLogger("musicstream.errors")
+COMMIT_BATCH_SIZE = 500
 
 
 @dataclasses.dataclass
@@ -68,8 +69,8 @@ class IntegrityChecker:
         Parameters
         ----------
         session:
-            Active SQLAlchemy session.  The caller is responsible for
-            committing or rolling back.
+            Active SQLAlchemy session. Completed 500-track batches are
+            committed immediately; the caller rolls back on an exception.
 
         Returns
         -------
@@ -79,14 +80,7 @@ class IntegrityChecker:
         result = IntegrityResult()
         now = datetime.now(timezone.utc)
 
-        tracks = (
-            session.query(Track)
-            .filter(
-                Track.status == TrackStatus.DOWNLOADED.value,
-                Track.file_path.isnot(None),
-            )
-            .yield_per(500)
-        )
+        tracks = self._tracks_in_batches(session)
 
         for track in tracks:
             result.total_checked += 1
@@ -261,3 +255,26 @@ class IntegrityChecker:
             except Exception as exc:
                 logger.debug("integrity webhook skipped: %s", exc)
         return result
+
+    @staticmethod
+    def _tracks_in_batches(session: Session):
+        """Yield downloaded tracks in independently committed batches."""
+        last_id = 0
+        while True:
+            batch = (
+                session.query(Track)
+                .filter(
+                    Track.id > last_id,
+                    Track.status == TrackStatus.DOWNLOADED.value,
+                    Track.file_path.isnot(None),
+                )
+                .order_by(Track.id)
+                .limit(COMMIT_BATCH_SIZE)
+                .all()
+            )
+            if not batch:
+                return
+            for track in batch:
+                yield track
+            last_id = batch[-1].id
+            session.commit()
