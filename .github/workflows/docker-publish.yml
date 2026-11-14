@@ -95,7 +95,7 @@ jobs:
           COMPONENT: ${{ matrix.name }}
         run: echo "name=${REPOSITORY,,}/$COMPONENT" >> "$GITHUB_OUTPUT"
       - name: Verify package visibility
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PACKAGE_NAME: ${{ steps.package.outputs.name }}
         with:
@@ -110,7 +110,7 @@ jobs:
             if (pkg.visibility !== 'public') core.warning('Set this package to public in GitHub package settings, then verify anonymous access.');
       - name: Verify manifests and select old tagged versions
         id: retention
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PACKAGE_NAME: ${{ steps.package.outputs.name }}
         with:
