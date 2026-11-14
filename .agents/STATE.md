@@ -1,9 +1,11 @@
 # STATE
-## Current task - security and reliability hardening batch (2026-11-14)
-- Verified all audit items: SPA containment guard, valid-ISRC regex and test, collision-safe MP3 transcode selection, one-per-playlist normalized discovery lookup, manual-job snapshot, cleanup-script import root, UTC export week, idle WebSocket skip, UI protocol use, dead throttle removal, and schema index/BigInteger migration `0012`.
+## Current task - security and reliability hardening batch & live deploy (2026-11-14)
+- Verified and pushed all audit fixes to `origin/main` in commit `275199d`: SPA containment guard, valid-ISRC regex and test, collision-safe MP3 transcode selection, one-per-playlist normalized discovery lookup, manual-job snapshot, cleanup-script import root, UTC export week, idle WebSocket skip, UI protocol use, dead throttle removal, and schema index/BigInteger migration `0012`.
 - Added script execute permissions on `scripts/dev-watch.py` and `scripts/migrate_downloads_to_music.py`.
 - Verified full test suite: `423 passed, 6 skipped, 1 warning, 9 subtests passed in 10.90s`. Alembic offline SQL generation verified clean.
-- Ready to push to main per user request.
+- Rebuilt daemon Docker image with latest code and recreated only `musicstream-daemon` (`docker compose up -d --force-recreate daemon`); Postgres and PO-token provider remained untouched and healthy throughout.
+- Startup executed Alembic migration `0012` successfully live on production database (`0011 -> 0012`): altered `tracks.file_size_bytes` to `bigint` and created index `ix_tracks_file_path`.
+- Post-deploy live health verified: all 3 containers healthy, `/health` 200 OK (`{"status":"ok","db":true}`), `/health/deep` 200 OK (`reasons: []`, `media_ready: true`, active Tier 0 librespot and Tier 2 downloads proceeding).
 
 ## Download path repair on seagatefatgreenNADD1400music (2026-11-11)
 - Root cause: On 2026-11-07, `EXTERNAL_MEDIA_DRIVE` in `.env` was configured as `/media/seagatefatgreenNADD1400music` instead of `/media/seagatefatgreenNADD1400music/music`. Because `docker-compose.yml` mounts `${EXTERNAL_MEDIA_DRIVE}:/media` and the organiser places files under `${MEDIA_DIR}/{Artist}/...`, all new downloads from Nov 8-11 were written directly to the root of the external drive (`/media/seagatefatgreenNADD1400music/{Artist}/...`) rather than the intended `music` directory (`M:\music`).
