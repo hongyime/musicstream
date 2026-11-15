@@ -1146,7 +1146,9 @@ def _prune_backups() -> None:
         )
         for idx, backup_file in enumerate(backups):
             try:
-                if backup_file.stat().st_mtime < cutoff or idx >= keep_limit:
+                # Always preserve at least the latest backup (idx > 0) against age expiration,
+                # while strictly enforcing keep_limit on older backups.
+                if (backup_file.stat().st_mtime < cutoff and idx > 0) or idx >= keep_limit:
                     backup_file.unlink()
                     logger.info("Pruned expired backup: %s", backup_file)
             except FileNotFoundError:

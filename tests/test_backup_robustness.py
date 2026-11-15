@@ -92,6 +92,20 @@ def test_backup_retention_enforces_keep_count(tmp_path, monkeypatch):
     assert not b3.exists()
 
 
+def test_backup_retention_never_prunes_only_remaining_backup_on_age(tmp_path, monkeypatch):
+    monkeypatch.setattr(tasks, "BACKUP_DIR", tmp_path)
+    monkeypatch.setattr(tasks, "BACKUP_RETENTION_DAYS", 2)
+    monkeypatch.setattr(tasks, "BACKUP_KEEP_COUNT", 2)
+    now = tasks.time.time()
+    only_backup = tmp_path / "musicstream_only.sql"
+    only_backup.write_text("only", encoding="utf-8")
+    os.utime(only_backup, (now - 30 * 86400, now - 30 * 86400))
+
+    tasks._prune_backups()
+
+    assert only_backup.exists()
+
+
 def test_restore_verification_stops_on_restore_error_and_cleans_database(tmp_path, monkeypatch):
     monkeypatch.setattr(tasks, "BACKUP_DIR", tmp_path)
     monkeypatch.setenv("DATABASE_URL", "postgresql://user:pw@db/musicstream")

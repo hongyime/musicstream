@@ -2,8 +2,8 @@
 ## Current task - backup retention adjustment and host disk reclamation (2026-11-15)
 - User authorized pruning accumulated database backups to reclaim host disk space and requested keeping only 1-2 backups going forward.
 - Pruned 28 older uncompressed SQL backups in `backups/`, keeping the 2 newest (`musicstream_20261114_210000_...sql` and `musicstream_20261114_003922_...sql`). Reclaimed ~10.8 GB on host root filesystem `/` (free space increased from 49 GB to 59 GB).
-- Adjusted backup retention in `src/core/config.py` and `src/core/tasks.py`: added `BACKUP_KEEP_COUNT` (default 2, configurable via env) and lowered default `BACKUP_RETENTION_DAYS` from 14 to 2 (configurable via env). `_prune_backups()` now sorts backups and actively enforces both age cutoff and maximum keep count.
-- Added unit test `test_backup_retention_enforces_keep_count` to `tests/test_backup_robustness.py`. Full test suite: 424 passed, 6 skipped, 1 warning.
+- Adjusted backup retention in `src/core/config.py` and `src/core/tasks.py`: added `BACKUP_KEEP_COUNT` (default 2, configurable via env) and lowered default `BACKUP_RETENTION_DAYS` from 14 to 2 (configurable via env). `_prune_backups()` now sorts backups and actively enforces both age cutoff and maximum keep count, while guaranteeing the latest backup is never pruned on age.
+- Added unit tests `test_backup_retention_enforces_keep_count` and `test_backup_retention_never_prunes_only_remaining_backup_on_age` to `tests/test_backup_robustness.py`. Full test suite: 425 passed.
 
 ## Current task - security and reliability hardening batch & live deploy (2026-11-14)
 - Verified and pushed all audit fixes to `origin/main` in commit `275199d`: SPA containment guard, valid-ISRC regex and test, collision-safe MP3 transcode selection, one-per-playlist normalized discovery lookup, manual-job snapshot, cleanup-script import root, UTC export week, idle WebSocket skip, UI protocol use, dead throttle removal, and schema index/BigInteger migration `0012`.
