@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional, Callable, Any
 
 from src.core.config import (
-    LOG_DIR, BACKUP_DIR, BACKUP_RETENTION_DAYS, DISABLE_DOWNLOADS,
+    LOG_DIR, BACKUP_DIR, BACKUP_RETENTION_DAYS, BACKUP_KEEP_COUNT, DISABLE_DOWNLOADS,
     MEDIA_DIR, SPOTIFY_CLIENT_ID,
 )
 
@@ -1137,10 +1137,16 @@ def _db_backup_locked() -> Optional[str]:
 
 def _prune_backups() -> None:
     cutoff = time.time() - BACKUP_RETENTION_DAYS * 24 * 60 * 60
+    keep_limit = max(1, int(globals().get("BACKUP_KEEP_COUNT", BACKUP_KEEP_COUNT)))
     try:
-        for backup_file in BACKUP_DIR.glob("musicstream_*.sql"):
+        backups = sorted(
+            [f for f in BACKUP_DIR.glob("musicstream_*.sql") if f.is_file()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for idx, backup_file in enumerate(backups):
             try:
-                if backup_file.stat().st_mtime < cutoff:
+                if backup_file.stat().st_mtime < cutoff or idx >= keep_limit:
                     backup_file.unlink()
                     logger.info("Pruned expired backup: %s", backup_file)
             except FileNotFoundError:

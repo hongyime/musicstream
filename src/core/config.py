@@ -15,7 +15,15 @@ BACKUP_COUNT = 3
 
 # ── Backups ───────────────────────────────────────────────────────────────────
 
-BACKUP_RETENTION_DAYS = 14
+try:
+    BACKUP_KEEP_COUNT = max(1, int(os.environ.get("BACKUP_KEEP_COUNT", "2")))
+except ValueError:
+    BACKUP_KEEP_COUNT = 2
+
+try:
+    BACKUP_RETENTION_DAYS = max(1, int(os.environ.get("BACKUP_RETENTION_DAYS", "2")))
+except ValueError:
+    BACKUP_RETENTION_DAYS = 2
 
 try:
     DOWNLOAD_ATTEMPT_RETENTION_DAYS = max(1, int(os.environ.get("DOWNLOAD_ATTEMPT_RETENTION_DAYS", "30")))

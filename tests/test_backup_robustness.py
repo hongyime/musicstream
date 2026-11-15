@@ -70,6 +70,28 @@ def test_backup_retention_uses_age_not_file_count(tmp_path, monkeypatch):
     assert recent.exists()
 
 
+def test_backup_retention_enforces_keep_count(tmp_path, monkeypatch):
+    monkeypatch.setattr(tasks, "BACKUP_DIR", tmp_path)
+    monkeypatch.setattr(tasks, "BACKUP_RETENTION_DAYS", 14)
+    monkeypatch.setattr(tasks, "BACKUP_KEEP_COUNT", 2)
+    now = tasks.time.time()
+    b1 = tmp_path / "musicstream_1.sql"
+    b2 = tmp_path / "musicstream_2.sql"
+    b3 = tmp_path / "musicstream_3.sql"
+    b1.write_text("b1", encoding="utf-8")
+    b2.write_text("b2", encoding="utf-8")
+    b3.write_text("b3", encoding="utf-8")
+    os.utime(b1, (now - 100, now - 100))
+    os.utime(b2, (now - 200, now - 200))
+    os.utime(b3, (now - 300, now - 300))
+
+    tasks._prune_backups()
+
+    assert b1.exists()
+    assert b2.exists()
+    assert not b3.exists()
+
+
 def test_restore_verification_stops_on_restore_error_and_cleans_database(tmp_path, monkeypatch):
     monkeypatch.setattr(tasks, "BACKUP_DIR", tmp_path)
     monkeypatch.setenv("DATABASE_URL", "postgresql://user:pw@db/musicstream")
