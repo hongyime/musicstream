@@ -3,7 +3,7 @@
 - Rebuilt `musicstream-daemon` from the current checkout at `e0fe566` (`main`, equal to `origin/main`) plus its current local changes. The first clean build hit a transient GitHub TLS read error downloading Deno; retry completed.
 - Recreated only the daemon (`docker compose up -d --no-deps --force-recreate daemon`). New image `sha256:7189856d140809366c641b165cbfa922052a4cb2c2534fa3c70073787c362071` includes the organiser ownership/checksum guard and durable download recovery code. Postgres and yt-pot-provider were not restarted.
 - Verified daemon healthy; `/health` and `/health/deep` return 200 with DB/scheduler/media ready and no degraded reasons. Alembic reports `0013 (head)`.
-- Deployment uses current uncommitted working-tree changes, including backup/download-recovery changes; they remain uncommitted in the checkout.
+- Committed and pushed as `1355165` on `main`; local `main` and `origin/main` are aligned. The deployed image was built from the same source tree.
 
 ## Current task - prevent organiser from quarantining its own track file (2026-11-15)
 - `FileOrganiser.organise()` now recognizes a destination already owned by the current track: matching recorded checksum reuses it and finalizes downloaded state; mismatch raises before creating an intent or moving either file. Unowned destination files still use the existing quarantine path.
