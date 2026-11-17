@@ -24,7 +24,7 @@ cron jobs and break librespot single-flight (which locks the Spotify account 1�
 
 ### Where state lives
 - **Postgres volume** `postgres_data` — tracks, sources, download_attempts, daemon_runs, lb_recommendations (the source of truth).
-- **`./data`** — librespot credential blob, throttle state. **`./logs`** — `musicstream.log`, `errors.log`. **`./backups`** — `pg_dump` snapshots (14-day retention).
+- **`./data`** — librespot credential blob, throttle state. **`./logs`** — `musicstream.log`, `errors.log`. **`./backups`** — `pg_dump` snapshots (newest plus newest verified, at most two).
 - **Media drive** (`EXTERNAL_MEDIA_DRIVE` → `/media`) — the FLAC/MP3 files.
 - Credentials: `.env`, `cookies.txt`, `spotify_token.json`, `data/librespot_credentials.json` (all gitignored; entrypoint enforces `0600`).
 
@@ -223,13 +223,13 @@ and let boot recovery reset in-flight rows before workers start.
 ## 6. Backups
 
 ```bash
-ls -lt backups/*.sql                                    # newest first; 14-day retention, pg_dump'd daily at 05:00 + on boot
-bash scripts/verify_backup_restore.sh                   # restore newest into a scratch DB and verify (run monthly)
+ls -lt backups/*.sql                                    # newest first; at most two retained, pg_dump'd daily at 05:00 + on boot
+bash scripts/verify_backup_restore.sh                   # scratch-restore check: expected tables and nonempty tracks (run monthly)
 ```
 > The daemon's `pg_dump` is v17 while the server is v16, so dumps carry cosmetic v17
 > directives (`\restrict`, `SET transaction_timeout`); restore with `psql` WITHOUT
 > `ON_ERROR_STOP` (they warn but skip) — `verify_backup_restore.sh` does this and asserts
-> on restored row counts.
+> on restored row counts. A successful check marks the dump verified; it checks basic restoreability, not logical completeness. Restores remain operator-controlled.
 
 Manual restore to a fresh server:
 ```bash

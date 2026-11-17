@@ -106,6 +106,30 @@ def test_backup_retention_never_prunes_only_remaining_backup_on_age(tmp_path, mo
     assert only_backup.exists()
 
 
+def test_backup_retention_preserves_latest_and_verified_and_removes_pruned_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr(tasks, "BACKUP_DIR", tmp_path)
+    monkeypatch.setattr(tasks, "BACKUP_RETENTION_DAYS", 1)
+    monkeypatch.setattr(tasks, "BACKUP_KEEP_COUNT", 2)
+    now = tasks.time.time()
+    old_verified = tmp_path / "musicstream_verified.sql"
+    latest = tmp_path / "musicstream_latest.sql"
+    middle = tmp_path / "musicstream_middle.sql"
+    for path, age in ((old_verified, 5), (latest, 0), (middle, 2)):
+        path.write_text("dump", encoding="utf-8")
+        os.utime(path, (now - age * 86400, now - age * 86400))
+    marker = tmp_path / (old_verified.name + ".verified")
+    marker.touch()
+    pruned_marker = tmp_path / (middle.name + ".verified")
+    pruned_marker.touch()
+    os.utime(pruned_marker, (now - 2 * 86400, now - 2 * 86400))
+
+    tasks._prune_backups()
+
+    assert old_verified.exists() and latest.exists()
+    assert not middle.exists()
+    assert not pruned_marker.exists()
+
+
 def test_restore_verification_stops_on_restore_error_and_cleans_database(tmp_path, monkeypatch):
     monkeypatch.setattr(tasks, "BACKUP_DIR", tmp_path)
     monkeypatch.setenv("DATABASE_URL", "postgresql://user:pw@db/musicstream")
@@ -124,6 +148,7 @@ def test_restore_verification_stops_on_restore_error_and_cleans_database(tmp_pat
 
     monkeypatch.setattr(tasks.subprocess, "run", fake_run)
     assert tasks.verify_backup_restore() is False
+    assert not (dump.with_name(dump.name + ".verified")).exists()
     assert any("DROP DATABASE IF EXISTS" in command for args in calls for command in args)
 
 
@@ -150,6 +175,7 @@ def test_restore_verification_checks_all_tables_and_track_data(tmp_path, monkeyp
 
     monkeypatch.setattr(tasks.subprocess, "run", fake_run)
     assert tasks.verify_backup_restore() is True
+    assert (tmp_path / "musicstream_test.sql.verified").exists()
 
 
 def test_monthly_restore_verification_is_scheduled():

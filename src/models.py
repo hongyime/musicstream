@@ -174,6 +174,17 @@ class Track(Base):
         )
 
 
+class DownloadIntent(Base):
+    """Durable record bridging a staged audio file and its final path."""
+    __tablename__ = "download_intents"
+
+    track_id: Mapped[int] = mapped_column(ForeignKey("tracks.id", ondelete="CASCADE"), primary_key=True)
+    staged_path: Mapped[str] = mapped_column(String, nullable=False)
+    target_path: Mapped[str] = mapped_column(String, nullable=False)
+    expected_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    format: Mapped[str] = mapped_column(String, nullable=False)
+
+
 # ── Source Model ──────────────────────────────────────────────────────────────
 
 class Source(Base):

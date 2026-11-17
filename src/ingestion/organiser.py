@@ -33,7 +33,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from src.exceptions import OrganiserError
-from src.models import Track, TrackStatus
+from src.models import DownloadIntent, Track, TrackStatus
 from src.utils import compute_sha256
 
 logger = logging.getLogger(__name__)
@@ -96,6 +96,28 @@ class FileOrganiser:
 
         final_path = self._build_path(track, ext)
         final_path = self._resolve_collision(final_path, track.id, session)
+        if os.path.exists(final_path) and track.file_path == final_path:
+            sha256 = self._compute_sha256(final_path)
+            if not track.file_sha256 or sha256 != track.file_sha256:
+                raise OrganiserError(
+                    f"Track {track.id} owns {final_path!r}, but its checksum does not match"
+                )
+            self._update_db(session, track, final_path, sha256,
+                            os.path.getsize(final_path), fmt)
+            intent = session.get(DownloadIntent, track.id)
+            if intent:
+                session.delete(intent)
+            session.commit()
+            try:
+                self._write_sidecar_artwork(final_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Sidecar artwork write failed (non-fatal): %s", exc)
+            return final_path
+
+        sha256 = self._compute_sha256(temp_path)
+        session.merge(DownloadIntent(track_id=track.id, staged_path=temp_path,
+                                     target_path=final_path, expected_sha256=sha256, format=fmt))
+        session.commit()
 
         # Create parent directories
         try:
@@ -133,10 +155,8 @@ class FileOrganiser:
         # file at final_path with the DB row still pointing at the temp path
         # (or with stale state) — orphan + duplicate-download on retry.
         #
-        # New ordering: move → compute sha → update_db → flush → commit. If
-        # ANY step before flush raises, we move the file BACK to temp_path
-        # so the next run sees a clean retry. If flush+commit fails, we ALSO
-        # move it back. Only after a successful commit is the move "real".
+        # The durable intent allows startup recovery if the process exits between
+        # moving the file and committing its database path. Tags remain best-effort.
         #
         # Cross-filesystem move pitfall: `shutil.move()` falls back to
         # copy2() + unlink() when src/dst are on different mounts.  Both
@@ -155,9 +175,11 @@ class FileOrganiser:
             ) from exc
 
         try:
-            sha256 = self._compute_sha256(final_path)
+            if self._compute_sha256(final_path) != sha256:
+                raise OrganiserError(f"Checksum changed while moving {temp_path!r}")
             size = os.path.getsize(final_path)
             self._update_db(session, track, final_path, sha256, size, fmt)
+            session.delete(session.get(DownloadIntent, track.id))
             # Force the SQL UPDATE to flush so we know the DB will accept it
             # while the file is still recoverable.
             session.flush()

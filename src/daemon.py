@@ -295,6 +295,9 @@ async def lifespan(app: FastAPI):
         engine = wait_for_db()
         init_db(engine=engine)
         run_migrations()
+        recovered = tasks.reconcile_download_intents()
+        if recovered:
+            logger.warning("Recovered %d interrupted download move(s).", recovered)
     except Exception as e:
         logger.error("DB initialization failed: %s", e)
         raise SystemExit(1) from e

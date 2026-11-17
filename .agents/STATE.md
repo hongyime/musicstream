@@ -1,4 +1,20 @@
 # STATE
+## Current task - deploy organiser ownership fix (2026-11-17)
+- Rebuilt `musicstream-daemon` from the current checkout at `e0fe566` (`main`, equal to `origin/main`) plus its current local changes. The first clean build hit a transient GitHub TLS read error downloading Deno; retry completed.
+- Recreated only the daemon (`docker compose up -d --no-deps --force-recreate daemon`). New image `sha256:7189856d140809366c641b165cbfa922052a4cb2c2534fa3c70073787c362071` includes the organiser ownership/checksum guard and durable download recovery code. Postgres and yt-pot-provider were not restarted.
+- Verified daemon healthy; `/health` and `/health/deep` return 200 with DB/scheduler/media ready and no degraded reasons. Alembic reports `0013 (head)`.
+- Deployment uses current uncommitted working-tree changes, including backup/download-recovery changes; they remain uncommitted in the checkout.
+
+## Current task - prevent organiser from quarantining its own track file (2026-11-15)
+- `FileOrganiser.organise()` now recognizes a destination already owned by the current track: matching recorded checksum reuses it and finalizes downloaded state; mismatch raises before creating an intent or moving either file. Unowned destination files still use the existing quarantine path.
+- Added regression coverage for owned match, owned checksum mismatch, and unowned orphan behavior. Focused organiser/integrity tests: `36 passed`; changed-file Ruff and `git diff --check` pass.
+- Restored track `153982` from its checksum-matching `.orphan-1790676531` file after confirming the canonical destination was absent; status is now downloaded. Checked all 28,257 non-null recorded media paths on the configured drive; none are missing. No daemon deployment was performed.
+
+## Current task - protect verified backups and recover interrupted downloads (2026-11-15)
+- Implemented backup restore markers and pruning that preserves the newest and newest verified dump (maximum two); failed restore checks do not create markers. Verification is explicitly documented as basic restoreability, not logical completeness.
+- Added migration `0013` and durable download move intents. Startup reconciles before stale-temp cleanup: checksum match finalizes the track; otherwise candidate files are quarantined and the track is requeued. No candidate is deleted and no automatic restore was added.
+- Updated RUNBOOK safety/retention wording. Focused suite: `34 passed`; Ruff, `git diff --check`, and Alembic offline SQL generation through `0013` passed. Applied migration `0013` to the configured database; `alembic current` confirms `0013 (head)`. No live restore or daemon deployment was performed.
+
 ## Current task - backup retention adjustment and host disk reclamation (2026-11-15)
 - User authorized pruning accumulated database backups to reclaim host disk space and requested keeping only 1-2 backups going forward.
 - Pruned 28 older uncompressed SQL backups in `backups/`, keeping the 2 newest (`musicstream_20261114_210000_...sql` and `musicstream_20261114_003922_...sql`). Reclaimed ~10.8 GB on host root filesystem `/` (free space increased from 49 GB to 59 GB).

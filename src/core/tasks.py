@@ -370,6 +370,42 @@ def requeue_stale_downloads(stale_after_minutes: Optional[int] = None) -> int:
     return count
 
 
+def reconcile_download_intents() -> int:
+    """Finalize complete interrupted moves, or requeue them without deleting candidates."""
+    import shutil
+    from src.db import get_session
+    from src.models import DownloadIntent, Track, TrackStatus
+    from src.utils import compute_sha256
+
+    recovered = 0
+    with get_session() as session:
+        for intent in session.query(DownloadIntent).all():
+            track = session.get(Track, intent.track_id)
+            candidate = Path(intent.target_path)
+            if candidate.is_file() and compute_sha256(str(candidate)) == intent.expected_sha256:
+                track.file_path = intent.target_path
+                track.file_sha256 = intent.expected_sha256
+                track.file_size_bytes = candidate.stat().st_size
+                track.format = intent.format
+                track.status = TrackStatus.DOWNLOADED.value
+                recovered += 1
+            else:
+                # Retain partial or staged files as recovery candidates.
+                for path in (candidate, Path(intent.staged_path)):
+                    if path.is_file():
+                        quarantine = path.with_name(f"{path.name}.orphan-{int(time.time())}")
+                        suffix = 1
+                        while quarantine.exists():
+                            quarantine = path.with_name(f"{path.name}.orphan-{int(time.time())}-{suffix}")
+                            suffix += 1
+                        shutil.move(str(path), str(quarantine), copy_function=shutil.copyfile)
+                track.status = TrackStatus.PENDING.value
+                track.file_path = track.file_sha256 = track.file_size_bytes = None
+                track.claimed_at = track.heartbeat_at = track.claim_owner = track.daemon_run_id = None
+            session.delete(intent)
+    return recovered
+
+
 def get_download_liveness(
     *,
     stale_after_minutes: Optional[int] = None,
@@ -1144,12 +1180,20 @@ def _prune_backups() -> None:
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
-        for idx, backup_file in enumerate(backups):
+        verified = sorted(
+            (p for p in BACKUP_DIR.glob("musicstream_*.sql.verified") if p.is_file()),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+        protected = {backups[0]} if backups else set()
+        if verified:
+            protected.add(BACKUP_DIR / verified[0].name.removesuffix(".verified"))
+        keep = set(protected)
+        keep.update(path for path in backups if len(keep) < min(2, keep_limit))
+        for backup_file in backups:
             try:
-                # Always preserve at least the latest backup (idx > 0) against age expiration,
-                # while strictly enforcing keep_limit on older backups.
-                if (backup_file.stat().st_mtime < cutoff and idx > 0) or idx >= keep_limit:
+                if backup_file not in keep or (backup_file.stat().st_mtime < cutoff and backup_file not in protected):
                     backup_file.unlink()
+                    backup_file.with_name(backup_file.name + ".verified").unlink(missing_ok=True)
                     logger.info("Pruned expired backup: %s", backup_file)
             except FileNotFoundError:
                 continue
@@ -1217,6 +1261,7 @@ _EXPECTED_RESTORE_TABLES = (
     "daemon_runs",
     "download_attempts",
     "download_attempt_aggregates",
+    "download_intents",
     "lb_recommendations",
     "sources",
     "track_sources",
@@ -1225,7 +1270,7 @@ _EXPECTED_RESTORE_TABLES = (
 
 
 def verify_backup_restore() -> bool:
-    """Restore the latest SQL dump into a scratch DB and verify the schema."""
+    """Check basic restoreability: expected tables and a nonempty tracks table."""
     if not _BACKUP_VERIFY_LOCK.acquire(blocking=False):
         logger.info("Backup restore verification skipped: another verification is running.")
         return False
@@ -1303,6 +1348,8 @@ def verify_backup_restore() -> bool:
             "Backup restore verified: %s restored %s tracks and all %d expected tables",
             latest.name, count_result.stdout.strip(), len(_EXPECTED_RESTORE_TABLES),
         )
+        marker = latest.with_name(latest.name + ".verified")
+        marker.touch(exist_ok=True)
         return True
     except Exception as exc:
         logger.error("Backup restore verification failed: %s", exc, exc_info=True)

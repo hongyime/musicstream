@@ -27,6 +27,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from src.models import Base, Track, TrackStatus
+from src.exceptions import OrganiserError
 from src.ingestion.organiser import FileOrganiser
 
 
@@ -224,6 +225,73 @@ class TestResolveCollision:
 # ── organise() integration ────────────────────────────────────────────────────
 
 class TestOrganise:
+    def test_reuses_matching_file_already_owned_by_track(self, session, tmp_path):
+        content = b"already organised audio"
+        org = FileOrganiser(str(tmp_path / "media"))
+        track = Track(spotify_uri="spotify:track:owned_file", title="Owned Song",
+                      artist="Artist", album_artist="Artist", album="Album",
+                      year="2024", track_number=1, status=TrackStatus.PENDING.value,
+                      file_path=None, file_sha256=None, cover_art_source="none")
+        session.add(track)
+        session.flush()
+        destination = org._build_path(track, ".mp3")
+        os.makedirs(os.path.dirname(destination))
+        Path(destination).write_bytes(content)
+        track.file_path = destination
+        track.file_sha256 = hashlib.sha256(content).hexdigest()
+        source = tmp_path / "source.mp3"
+        source.write_bytes(b"new download")
+
+        assert org.organise(str(source), track, session) == destination
+
+        assert Path(destination).read_bytes() == content
+        assert Path(source).exists()
+        assert not list(Path(destination).parent.glob("*.orphan-*"))
+        assert track.status == TrackStatus.DOWNLOADED.value
+
+    def test_owned_file_checksum_mismatch_stops_without_moving_files(self, session, tmp_path):
+        org = FileOrganiser(str(tmp_path / "media"))
+        track = Track(spotify_uri="spotify:track:owned_mismatch", title="Owned Song",
+                      artist="Artist", album_artist="Artist", album="Album",
+                      year="2024", track_number=1, status=TrackStatus.PENDING.value,
+                      file_path=None, file_sha256="0" * 64, cover_art_source="none")
+        session.add(track)
+        session.flush()
+        destination = org._build_path(track, ".mp3")
+        os.makedirs(os.path.dirname(destination))
+        Path(destination).write_bytes(b"existing data")
+        track.file_path = destination
+        source = tmp_path / "source.mp3"
+        source.write_bytes(b"new download")
+
+        with pytest.raises(OrganiserError, match="checksum does not match"):
+            org.organise(str(source), track, session)
+
+        assert Path(destination).read_bytes() == b"existing data"
+        assert source.read_bytes() == b"new download"
+        assert not list(Path(destination).parent.glob("*.orphan-*"))
+
+    def test_unowned_existing_file_is_still_quarantined(self, session, tmp_path):
+        org = FileOrganiser(str(tmp_path / "media"))
+        track = Track(spotify_uri="spotify:track:unowned_orphan", title="Orphan Song",
+                      artist="Artist", album_artist="Artist", album="Album",
+                      year="2024", track_number=1, status=TrackStatus.PENDING.value,
+                      cover_art_source="none")
+        session.add(track)
+        session.flush()
+        destination = org._build_path(track, ".mp3")
+        os.makedirs(os.path.dirname(destination))
+        Path(destination).write_bytes(b"old unowned file")
+        source = tmp_path / "source.mp3"
+        source.write_bytes(b"new download")
+
+        assert org.organise(str(source), track, session) == destination
+
+        quarantined = list(Path(destination).parent.glob("*.orphan-*"))
+        assert len(quarantined) == 1
+        assert quarantined[0].read_bytes() == b"old unowned file"
+        assert Path(destination).read_bytes() == b"new download"
+
     def test_file_moved_and_db_updated(self, session):
         """P3: downloaded track has non-null file_path and file_sha256."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -301,4 +369,119 @@ class TestOrganise:
             org.organise(src_file, track, session)
 
             assert track.file_sha256 == expected_sha
+
+    def test_intent_recovers_complete_move_and_requeues_missing_candidate(self, tmp_path, monkeypatch):
+        from contextlib import contextmanager
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from src.core import tasks
+        from src.models import Base, DownloadIntent
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'recovery.db'}")
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(engine, expire_on_commit=False)
+        with factory() as db:
+            track = Track(spotify_uri="spotify:track:recovery", title="Recovery", artist="Artist")
+            db.add(track)
+            db.flush()
+            payload = b"complete audio"
+            target = tmp_path / "complete.mp3"
+            target.write_bytes(payload)
+            import hashlib
+            db.add(DownloadIntent(track_id=track.id, staged_path=str(tmp_path / "staged.mp3"),
+                                  target_path=str(target), expected_sha256=hashlib.sha256(payload).hexdigest(),
+                                  format="mp3"))
+            db.commit()
+
+        @contextmanager
+        def test_session():
+            with factory() as db:
+                yield db
+                db.commit()
+
+        import src.db
+        monkeypatch.setattr(src.db, "get_session", test_session)
+        assert tasks.reconcile_download_intents() == 1
+        with factory() as db:
+            assert db.query(Track).one().status == TrackStatus.DOWNLOADED.value
+            assert db.query(DownloadIntent).count() == 0
+        engine.dispose()
+
+    def test_intent_quarantines_partial_move_without_deleting_candidate(self, tmp_path, monkeypatch):
+        from contextlib import contextmanager
+        import hashlib
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from src.core import tasks
+        from src.models import Base, DownloadIntent
+        import src.db
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'partial.db'}")
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(engine, expire_on_commit=False)
+        partial = tmp_path / "partial.mp3"
+        partial.write_bytes(b"partial")
+        with factory() as db:
+            track = Track(spotify_uri="spotify:track:partial", title="Partial", artist="Artist",
+                          status=TrackStatus.DOWNLOADING.value)
+            db.add(track)
+            db.flush()
+            db.add(DownloadIntent(track_id=track.id, staged_path=str(tmp_path / "staged.mp3"),
+                                  target_path=str(partial), expected_sha256=hashlib.sha256(b"complete").hexdigest(),
+                                  format="mp3"))
+            db.commit()
+
+        @contextmanager
+        def test_session():
+            with factory() as db:
+                yield db
+                db.commit()
+
+        monkeypatch.setattr(src.db, "get_session", test_session)
+        assert tasks.reconcile_download_intents() == 0
+        assert not partial.exists()
+        quarantined = list(tmp_path.glob("partial.mp3.orphan-*"))
+        assert len(quarantined) == 1 and quarantined[0].read_bytes() == b"partial"
+        with factory() as db:
+            assert db.query(Track).one().status == TrackStatus.PENDING.value
+            assert db.query(DownloadIntent).count() == 0
+        engine.dispose()
+
+    def test_intent_before_move_requeues_and_preserves_staged_file(self, tmp_path, monkeypatch):
+        from contextlib import contextmanager
+        import hashlib
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from src.core import tasks
+        from src.models import Base, DownloadIntent
+        import src.db
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'before-move.db'}")
+        Base.metadata.create_all(engine)
+        factory = sessionmaker(engine, expire_on_commit=False)
+        staged = tmp_path / "staged.mp3"
+        staged.write_bytes(b"staged candidate")
+        with factory() as db:
+            track = Track(spotify_uri="spotify:track:before-move", title="Before", artist="Artist",
+                          status=TrackStatus.DOWNLOADING.value)
+            db.add(track)
+            db.flush()
+            db.add(DownloadIntent(track_id=track.id, staged_path=str(staged),
+                                  target_path=str(tmp_path / "not-yet-moved.mp3"),
+                                  expected_sha256=hashlib.sha256(b"staged candidate").hexdigest(), format="mp3"))
+            db.commit()
+
+        @contextmanager
+        def test_session():
+            with factory() as db:
+                yield db
+                db.commit()
+
+        monkeypatch.setattr(src.db, "get_session", test_session)
+        assert tasks.reconcile_download_intents() == 0
+        quarantined = list(tmp_path.glob("staged.mp3.orphan-*"))
+        assert len(quarantined) == 1 and quarantined[0].read_bytes() == b"staged candidate"
+        with factory() as db:
+            assert db.query(Track).one().status == TrackStatus.PENDING.value
+        engine.dispose()
 
